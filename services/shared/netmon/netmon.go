@@ -24,7 +24,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +94,11 @@ func Enumerate() Snapshot {
 	s := Snapshot{LocalIPs: map[string]bool{}, IfaceV4: map[int][]net.IP{}}
 	ifaces, err := net.Interfaces()
 	if err != nil {
+		if IsAndroid() {
+			if snapshot, ok := androidSnapshotFromEnvironment(os.Getenv); ok {
+				return snapshot
+			}
+		}
 		return s
 	}
 	for _, ifi := range ifaces {
@@ -99,9 +106,7 @@ func Enumerate() Snapshot {
 		if err != nil {
 			continue
 		}
-		mcastV4 := ifi.Flags&net.FlagUp != 0 &&
-			ifi.Flags&net.FlagMulticast != 0 &&
-			ifi.Flags&net.FlagLoopback == 0
+		mcastV4 := isMulticastInterface(ifi.Flags, platformOS())
 		var v4 []net.IP
 		for _, a := range addrs {
 			var ip net.IP
@@ -125,7 +130,86 @@ func Enumerate() Snapshot {
 			s.IfaceV4[ifi.Index] = v4
 		}
 	}
+	if IsAndroid() && len(s.IfaceV4) == 0 {
+		if snapshot, ok := androidSnapshotFromEnvironment(os.Getenv); ok {
+			return snapshot
+		}
+	}
 	return s
+}
+
+func isMulticastInterface(flags net.Flags, goos string) bool {
+	if goos == "android" {
+		// Android's interface ioctl may omit both IFF_MULTICAST and IFF_UP;
+		// the unicast IPv4 address check in each caller excludes loopback and
+		// unconfigured interfaces, and actual multicast joins still report errors.
+		return flags&net.FlagLoopback == 0
+	}
+	if flags&net.FlagUp == 0 || flags&net.FlagLoopback != 0 {
+		return false
+	}
+	return flags&net.FlagMulticast != 0
+}
+
+// MulticastInterfaces returns up, non-loopback interfaces with a non-loopback
+// IPv4 address. Android may omit IFF_MULTICAST and IFF_UP on a usable Wi-Fi
+// interface, so mDNS callers pass address-bearing interfaces explicitly to
+// libraries that otherwise filter by those flags.
+func MulticastInterfaces() []net.Interface {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		if iface, ok := androidInterfaceFromEnvironment(os.Getenv); IsAndroid() && ok {
+			return []net.Interface{iface}
+		}
+		return nil
+	}
+	selected := make([]net.Interface, 0, len(interfaces))
+	for _, iface := range interfaces {
+		if !isMulticastInterface(iface.Flags, platformOS()) {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err == nil && ip.To4() != nil && !ip.IsLoopback() {
+				selected = append(selected, iface)
+				break
+			}
+		}
+	}
+	if IsAndroid() && len(selected) == 0 {
+		if iface, ok := androidInterfaceFromEnvironment(os.Getenv); ok {
+			selected = append(selected, iface)
+		}
+	}
+	return selected
+}
+
+func IsAndroid() bool { return isAndroidBuild() }
+
+func androidInterfaceFromEnvironment(getenv func(string) string) (net.Interface, bool) {
+	index, err := strconv.Atoi(getenv("NVPAIR_MDNS_INTERFACE_INDEX"))
+	name := getenv("NVPAIR_MDNS_INTERFACE_NAME")
+	ip := net.ParseIP(getenv("NVPAIR_MDNS_IPV4"))
+	if err != nil || index <= 0 || name == "" || ip == nil || ip.To4() == nil || ip.IsLoopback() {
+		return net.Interface{}, false
+	}
+	return net.Interface{Index: index, Name: name, Flags: net.FlagUp | net.FlagMulticast}, true
+}
+
+func androidSnapshotFromEnvironment(getenv func(string) string) (Snapshot, bool) {
+	iface, ok := androidInterfaceFromEnvironment(getenv)
+	if !ok {
+		return Snapshot{}, false
+	}
+	ip := net.ParseIP(getenv("NVPAIR_MDNS_IPV4")).To4()
+	return Snapshot{
+		LocalIPs: map[string]bool{ip.String(): true},
+		IfaceV4:  map[int][]net.IP{iface.Index: {ip}},
+	}, true
 }
 
 // fingerprint reduces a Snapshot to a stable string so two snapshots can be

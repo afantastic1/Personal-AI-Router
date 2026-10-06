@@ -4,11 +4,85 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestManagerRunPreservesClusterWhenBrokerClosesInput(t *testing.T) {
+	portListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve peer port: %v", err)
+	}
+	peerPort := portListener.Addr().(*net.TCPAddr).Port
+	if err := portListener.Close(); err != nil {
+		t.Fatalf("release peer port: %v", err)
+	}
+
+	peer := newTestManagerPort(t, peerPort)
+	peerContext, stopPeer := context.WithCancel(context.Background())
+	defer stopPeer()
+	go func() { _ = peer.runHTTP(peerContext) }()
+	waitForTCPListener(t, peerPort)
+
+	leaving := newTestManagerPort(t, 0)
+	pinTrusted(t, leaving, peer.identity.NodeUUID, string(peer.identity.CertPEM), peer.identity.CertFingerprint)
+	pinTrusted(t, peer, leaving.identity.NodeUUID, string(leaving.identity.CertPEM), leaving.identity.CertFingerprint)
+	leaving.upsertMember(&ClusterNode{
+		NodeUUID: peer.identity.NodeUUID, ID: "peer", IPAddress: "127.0.0.1", Port: peerPort,
+		AdmissionEpoch: 1, State: stateMember,
+	})
+	peer.upsertMember(&ClusterNode{
+		NodeUUID: leaving.identity.NodeUUID, ID: "leaving", IPAddress: "127.0.0.1", Port: 1,
+		AdmissionEpoch: 1, State: stateMember,
+	})
+
+	leaving.codec = NewCodec(struct {
+		io.Reader
+		io.Writer
+	}{strings.NewReader(""), io.Discard})
+	if err := leaving.Run(context.Background()); err != nil {
+		t.Fatalf("manager run after broker EOF: %v", err)
+	}
+
+	if clusterID, _ := leaving.clusterIdentity(); clusterID != "cluster-1" {
+		t.Fatalf("manager cluster id after broker EOF = %q, want cluster-1 for restart recovery", clusterID)
+	}
+	if _, trusted := peer.trust.Get(leaving.identity.NodeUUID); !trusted {
+		t.Fatal("online peer no longer trusts the manager after a broker-only restart")
+	}
+	foundMember := false
+	for _, member := range peer.snapshotNodes() {
+		if member.NodeUUID == leaving.identity.NodeUUID {
+			foundMember = true
+			break
+		}
+	}
+	if !foundMember {
+		t.Fatal("online peer no longer lists the manager after a broker-only restart")
+	}
+}
+
+func waitForTCPListener(t *testing.T, port int) {
+	t.Helper()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		connection, err := net.DialTimeout("tcp", address, 50*time.Millisecond)
+		if err == nil {
+			if closeErr := connection.Close(); closeErr != nil {
+				t.Fatalf("close readiness connection: %v", closeErr)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("peer cluster manager did not listen on %s before timeout", address)
+}
 
 // TestHandleLeave_NotBlockedByUnreachableMember verifies that a member reachable
 // at the TCP layer but never completing a request must

@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => {
         }),
         start: vi.fn((): void => {}),
         waitUntilReady: vi.fn((_timeoutMs: number): Promise<void> => Promise.resolve()),
+        callProcess: vi.fn(
+            (_name: string, _method: string): Promise<undefined> => Promise.resolve(undefined)
+        ),
         stop: vi.fn((): Promise<void> => Promise.resolve())
     }
 
@@ -61,7 +64,8 @@ import {
     didWeSpawnCli,
     getConnectorError,
     getConnectorStatus,
-    initializeConnector
+    initializeConnector,
+    leaveClusterBeforeShutdown
 } from '@/electron/connector'
 
 describe('service startup failure handling', () => {
@@ -71,6 +75,7 @@ describe('service startup failure handling', () => {
             (_timeoutMs: number): Promise<void> => Promise.resolve()
         )
         mocks.supervisor.stop.mockResolvedValue()
+        mocks.supervisor.callProcess.mockClear()
         await destroyConnector({ force: true })
     })
 
@@ -87,6 +92,14 @@ describe('service startup failure handling', () => {
         expect(mocks.notifyBrokerStartupFailure).toHaveBeenCalledWith(
             'Required broker binary is missing'
         )
+    })
+
+    it('leaves the cluster before an app shutdown', async () => {
+        await initializeConnector()
+
+        await leaveClusterBeforeShutdown()
+
+        expect(mocks.supervisor.callProcess).toHaveBeenCalledWith('broker', 'cluster:leave')
     })
 
     it('surfaces a readiness timeout and recovers if readiness arrives later', async () => {

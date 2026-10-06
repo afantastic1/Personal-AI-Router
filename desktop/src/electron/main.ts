@@ -21,7 +21,12 @@ import { migrateAppData } from '@/electron/path'
 import { macPrivilege } from '@/electron/services/mac-privilege-service'
 
 import { registerAllIpc } from '@/electron/ipc'
-import { destroyConnector, destroyConnectorSync, initializeConnector } from '@/electron/connector'
+import {
+    destroyConnector,
+    destroyConnectorSync,
+    initializeConnector,
+    leaveClusterBeforeShutdown
+} from '@/electron/connector'
 import { initializeUpdater } from '@/electron/updater'
 import { ensureNvpairOnPath } from '@/electron/nvpair-command'
 import { isAppDataWipeScheduled } from '@/electron/app-data-wipe-orchestrator'
@@ -217,7 +222,14 @@ if (!gotTheLock || exitRequested) {
         // Cancel any pending demo submissions before we start tearing down.
         // Requests already in flight are reaped by destroyInferenceDemoSync on exit.
         stopInferenceDemo()
-        destroyConnector()
+        leaveClusterBeforeShutdown()
+            .catch(() => {
+                log.warn({
+                    sublevel: 'lifecycle',
+                    message: 'Could not announce cluster departure before app shutdown'
+                })
+            })
+            .then(() => destroyConnector())
             .catch(() => {})
             .finally(() => {
                 log.info({ sublevel: 'lifecycle', message: 'App shut down' })
@@ -231,7 +243,14 @@ if (!gotTheLock || exitRequested) {
             log.info({ sublevel: 'lifecycle', message: `Received ${signal}` })
             destroyTray()
             stopInferenceDemo()
-            destroyConnector()
+            leaveClusterBeforeShutdown()
+                .catch(() => {
+                    log.warn({
+                        sublevel: 'lifecycle',
+                        message: 'Could not announce cluster departure before app shutdown'
+                    })
+                })
+                .then(() => destroyConnector())
                 .catch(() => {})
                 .finally(() => {
                     log.info({ sublevel: 'lifecycle', message: 'App shut down' })

@@ -199,3 +199,9 @@ export const destroyConnectorSync = (): void => {
 
     weSpawned = false
 }
+
+/** Announce cluster departure for an intentional app quit, not a service restart. */
+export const leaveClusterBeforeShutdown = async (): Promise<void> => {
+    if (!weSpawned) return
+    await getModularSupervisor().callProcess('broker', 'cluster:leave')
+}

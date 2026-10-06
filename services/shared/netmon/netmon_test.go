@@ -6,9 +6,67 @@ package netmon
 import (
 	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
+
+func TestAndroidInterfaceWithoutMulticastFlagIsEligible(t *testing.T) {
+	flags := net.FlagUp
+	if isMulticastInterface(flags, "android") {
+		return
+	}
+	t.Fatal("Android Wi-Fi interface without FlagMulticast should remain eligible for mDNS")
+}
+
+func TestAndroidInterfaceWithUnavailableFlagsIsEligible(t *testing.T) {
+	if isMulticastInterface(0, "android") {
+		return
+	}
+	t.Fatal("Android can omit interface capability flags; address-bearing interface should be considered")
+}
+
+func TestDesktopInterfaceWithoutMulticastFlagIsRejected(t *testing.T) {
+	if isMulticastInterface(net.FlagUp, runtime.GOOS) {
+		t.Fatalf("interface without FlagMulticast should be rejected on %s", runtime.GOOS)
+	}
+}
+
+func TestLoopbackInterfaceIsRejectedOnAndroid(t *testing.T) {
+	flags := net.FlagLoopback
+	if isMulticastInterface(flags, "android") {
+		t.Fatal("loopback interface should not be eligible for mDNS")
+	}
+}
+
+func TestAndroidSnapshotUsesProvidedInterfaceWhenNetlinkIsDenied(t *testing.T) {
+	values := map[string]string{
+		"NVPAIR_MDNS_INTERFACE_INDEX": "17",
+		"NVPAIR_MDNS_INTERFACE_NAME":  "wlan0",
+		"NVPAIR_MDNS_IPV4":            "192.168.1.8",
+	}
+	snapshot, ok := androidSnapshotFromEnvironment(func(key string) string { return values[key] })
+	if !ok {
+		t.Fatal("expected valid Android interface environment to produce a snapshot")
+	}
+	if !snapshot.LocalIPs["192.168.1.8"] {
+		t.Fatal("provided Wi-Fi IPv4 address is missing from local address set")
+	}
+	if got := snapshot.IfaceV4[17]; len(got) != 1 || got[0].String() != "192.168.1.8" {
+		t.Fatalf("unexpected mDNS interface addresses: %v", snapshot.IfaceV4)
+	}
+}
+
+func TestAndroidSnapshotRejectsLoopbackAddress(t *testing.T) {
+	values := map[string]string{
+		"NVPAIR_MDNS_INTERFACE_INDEX": "17",
+		"NVPAIR_MDNS_INTERFACE_NAME":  "wlan0",
+		"NVPAIR_MDNS_IPV4":            "127.0.0.1",
+	}
+	if _, ok := androidSnapshotFromEnvironment(func(key string) string { return values[key] }); ok {
+		t.Fatal("loopback address must not be used for multicast discovery")
+	}
+}
 
 func TestFingerprintOrderInsensitive(t *testing.T) {
 	a := Snapshot{

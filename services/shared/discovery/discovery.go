@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"nvpair-shared/netmon"
 	"strings"
 	"sync"
 	"time"
@@ -534,7 +535,13 @@ func (b *Browser) probeLiveness(nodes []Node) []verdict {
 func (b *Browser) browse(ctx context.Context) map[string]Node {
 	seen := make(map[string]Node)
 
-	resolver, err := zeroconf.NewResolver(nil)
+	var resolver *zeroconf.Resolver
+	var err error
+	if netmon.IsAndroid() {
+		resolver, err = zeroconf.NewResolver(zeroconf.SelectIfaces(netmon.MulticastInterfaces()))
+	} else {
+		resolver, err = zeroconf.NewResolver(nil)
+	}
 	if err != nil {
 		slog.Warn("failed to create mDNS resolver", "err", err)
 		return seen
