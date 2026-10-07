@@ -69,6 +69,70 @@ func TestValidateAcceptsCommandModeAndCmdAction(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsHostedRuntime(t *testing.T) {
+	m := validManifest()
+	p := m.Platforms["linux/amd64"]
+	p.Detect = nil
+	p.Install = nil
+	p.Runtime = Runtime{
+		Mode:   "hosted",
+		Port:   14325,
+		Ready:  &Probe{HTTP: "http://127.0.0.1:{port}/healthz", Status: 200},
+		Health: &Probe{HTTP: "http://127.0.0.1:{port}/healthz", Status: 200},
+	}
+	m.Platforms["linux/amd64"] = p
+	m.Actions = map[string]Action{
+		"list_models":   {HTTP: &ActionHTTP{Method: "GET", Path: "/v1/models"}},
+		"loaded_models": {HTTP: &ActionHTTP{Method: "GET", Path: "/internal/models/loaded"}},
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("hosted manifest rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsHostedLifecycleConfiguration(t *testing.T) {
+	m := validManifest()
+	p := m.Platforms["linux/amd64"]
+	p.Runtime.Mode = "hosted"
+	p.Runtime.Bin = ""
+	p.Runtime.Start = nil
+	p.Runtime.Stop = &StopSpec{Signal: "term"}
+	p.Runtime.Ready = &Probe{HTTP: "http://127.0.0.1:{port}/healthz"}
+	p.Install = nil
+	p.Uninstall = nil
+	m.Platforms["linux/amd64"] = p
+	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "hosted mode cannot declare") {
+		t.Fatalf("hosted lifecycle configuration error = %v, want explicit rejection", err)
+	}
+}
+
+func TestBundledMNNManifestUsesHostedRuntimeAndModelActions(t *testing.T) {
+	reg := NewRegistry()
+	if err := reg.LoadFS(bundledManifests, "manifests"); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := reg.Get("mnn")
+	if !ok {
+		t.Fatal("MNN manifest missing")
+	}
+	p, ok := m.PlatformFor("android", "arm64")
+	if !ok {
+		t.Fatal("MNN android/arm64 platform missing")
+	}
+	if p.Runtime.modeOrDefault() != "hosted" || p.Runtime.Port != 14325 || p.Runtime.Ready == nil || p.Runtime.Ready.HTTP != "http://127.0.0.1:{port}/healthz" {
+		t.Fatalf("MNN runtime = %+v, want hosted health probe on :14325/healthz", p.Runtime)
+	}
+	for name, want := range map[string]ActionResult{
+		"list_models":   {Array: "data", Field: "id"},
+		"loaded_models": {Array: "models", Field: "id"},
+	} {
+		action, ok := m.Actions[name]
+		if !ok || action.Result == nil || action.Result.Array != want.Array || action.Result.Field != want.Field || action.Result.Match != nil {
+			t.Errorf("MNN %s action result = %+v, want %+v", name, action.Result, want)
+		}
+	}
+}
+
 func TestValidateAcceptsUnpinnedFetch(t *testing.T) {
 	m := validManifest()
 	p := m.Platforms["linux/amd64"]

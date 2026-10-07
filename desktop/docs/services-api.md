@@ -39,6 +39,7 @@
 - ⚠️ nvpair-node-settings → settings/set-cluster-auto-sync
 - ⚠️ nvpair-node-settings → settings/set-force-ports
 - ⚠️ nvpair-proxy → facade/enable
+- ⚠️ nvpair-proxy → gateway/enable
 - ⚠️ nvpair-proxy → node/selected
 - ⚠️ nvpair-proxy → node/set-local-backend
 - ⚠️ nvpair-ui-broker → discovery:unsubscribe
@@ -215,6 +216,7 @@
 | `proxy/request-started` | notification (we consume) | ➖ ignored |
 | `ready` | notification (we consume) | ✅ yes |
 | `facade/enable` | request (we call) | ⚠️ not called |
+| `gateway/enable` | request (we call) | ⚠️ not called |
 | `node/add-manual` | request (we call) | ✅ yes |
 | `node/remove-manual` | request (we call) | ✅ yes |
 | `node/select` | request (we call) | ✅ yes |

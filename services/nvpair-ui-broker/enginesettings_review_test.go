@@ -18,6 +18,9 @@ import (
 
 func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 	for _, profile := range engineProxyProfiles {
+		if profile.Name == "mnn" {
+			continue // Hosted MNN cannot be rebound by engine settings.
+		}
 		t.Run(profile.Name, func(t *testing.T) {
 			h := newSettingsHarness(t)
 			p := h.b.getProxy()
@@ -50,6 +53,9 @@ func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 
 func TestExplicitSettingsBindFailurePreservesChosenPort(t *testing.T) {
 	for _, profile := range engineProxyProfiles {
+		if profile.Name == "mnn" {
+			continue // Hosted MNN cannot be rebound by engine settings.
+		}
 		t.Run(profile.Name, func(t *testing.T) {
 			const requested = 25000
 			b := &Broker{codec: NewCodec(&bytes.Buffer{}), engineSettingsLoaded: true,

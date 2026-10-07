@@ -345,8 +345,10 @@ type Proxy struct {
 	// Keyed by engine because one process hosts every enabled engine's facade.
 	// Each owns its own listeners, ports and dialect; what they share is this
 	// host's transports, workload stream, and reservation map. See facade.go.
-	facadeMu sync.Mutex
-	facades  map[string]*facade
+	facadeMu  sync.Mutex
+	facades   map[string]*facade
+	gatewayMu sync.Mutex
+	gateway   *gatewayServer
 
 	// serveCtx is the process lifetime, and is what a facade's HTTP servers use
 	// as their BaseContext. It must not be an enable request's context: that one
@@ -782,6 +784,7 @@ var modelListClient = &http.Client{
 // because it is shared: closing it per facade would drop another engine's
 // pooled connections to every peer.
 func (p *Proxy) shutdown(ctx context.Context) {
+	p.stopGateway()
 	// Every facade, then the shared transports: the pool is process-wide, so
 	// closing it before a facade has drained would cut that facade's own
 	// in-flight upstream connections.
@@ -2542,7 +2545,8 @@ func subscribedToNode(p engineProfile, n noderec.DirectoryNode) (Node, bool) {
 		// a model that a dual-engine node serves solely via LM Studio isn't
 		// accepted as an Ollama owner here (falls back to the union for a peer
 		// that sends no attribution — see DirectoryNode.EngineModels).
-		Models: append([]string(nil), n.EngineModels(p.Name)...),
+		Models:       append([]string(nil), n.EngineModels(p.Name)...),
+		LoadedModels: append([]string(nil), n.LoadedByEngine[p.Name]...),
 	}, true
 }
 
@@ -2656,6 +2660,23 @@ func (p *Proxy) handleMessage(msg *Message) {
 		slog.Info("facade enabled", "engine", result.Engine, "port", result.Port)
 		if err := p.codec.Respond(msg.ID, result); err != nil {
 			log.Printf("failed to respond to facade/enable: %v", err)
+		}
+
+	case "gateway/enable":
+		var params struct {
+			Port int `json:"port"`
+		}
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			p.codec.RespondError(msg.ID, -32602, "invalid params: expected {\"port\":14326}")
+			return
+		}
+		port, err := p.enableGateway(params.Port)
+		if err != nil {
+			p.codec.RespondError(msg.ID, -32000, err.Error())
+			return
+		}
+		if err := p.codec.Respond(msg.ID, map[string]int{"port": port}); err != nil {
+			log.Printf("failed to respond to gateway/enable: %v", err)
 		}
 
 	case "nodes/list":

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 [CmdletBinding()]
@@ -18,6 +18,11 @@ $androidRoot = Split-Path -Parent $PSScriptRoot
 $repoRoot = Split-Path -Parent $androidRoot
 $cacheRoot = Join-Path $androidRoot 'build/cache/mnn'
 $artifactRoot = Join-Path $androidRoot 'build/generated/mnn/arm64-v8a'
+$requestSamplerPatch = Join-Path $androidRoot 'patches/mnn-request-sampler.patch'
+if (-not (Test-Path -LiteralPath $requestSamplerPatch -PathType Leaf)) {
+    throw "Required MNN request sampler patch is missing: $requestSamplerPatch"
+}
+$requestSamplerPatchId = (Get-FileHash -LiteralPath $requestSamplerPatch -Algorithm SHA256).Hash.Substring(0, 12).ToLowerInvariant()
 
 function ConvertTo-BashArgument([string] $Value) {
     return "'" + $Value.Replace("'", "'\''") + "'"
@@ -139,7 +144,7 @@ if ($windowsRevision -notmatch '27\.2\.12479018') {
     throw "Android SDK NDK revision mismatch at $windowsNdk; expected 27.2.12479018."
 }
 
-$packageCheck = "command -v cmake >/dev/null && command -v ninja >/dev/null && command -v g++ >/dev/null && command -v python3 >/dev/null"
+$packageCheck = "command -v cmake >/dev/null && command -v ninja >/dev/null && command -v g++ >/dev/null && command -v patch >/dev/null && command -v python3 >/dev/null"
 $previousErrorAction = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 & wsl.exe -d Ubuntu-24.04 -- /bin/bash -lc $packageCheck
@@ -162,7 +167,7 @@ $sourceRepo = Get-ExactGitSource $SourceDir
 New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 $sourceArchive = Join-Path $cacheRoot "$pinnedRevision.tar"
-$sourceExtract = Join-Path $cacheRoot "source-$pinnedRevision"
+$sourceExtract = Join-Path $cacheRoot "source-$pinnedRevision-$requestSamplerPatchId"
 if ($Force -or -not (Test-Path -LiteralPath (Join-Path $sourceExtract 'CMakeLists.txt') -PathType Leaf)) {
     & git -C $sourceRepo archive --format=tar --output=$sourceArchive $pinnedRevision
     if ($LASTEXITCODE -ne 0) { throw "Unable to archive pinned MNN source revision $pinnedRevision." }
@@ -171,13 +176,23 @@ if ($Force -or -not (Test-Path -LiteralPath (Join-Path $sourceExtract 'CMakeList
     Invoke-Wsl "mkdir -p $(ConvertTo-BashArgument $sourceWsl) && tar -xf $(ConvertTo-BashArgument $archiveWsl) -C $(ConvertTo-BashArgument $sourceWsl)" 'Unable to materialize pinned MNN source into the ignored Android build cache.'
 }
 
+if (-not (Select-String -LiteralPath (Join-Path $sourceExtract 'transformers/llm/engine/include/llm/llm.hpp') -SimpleMatch 'reset_sampler' -Quiet)) {
+    $sourcePatchWsl = ConvertTo-WslPath $sourceExtract
+    $requestSamplerPatchWsl = ConvertTo-WslPath $requestSamplerPatch
+    $patchCommand = 'cd ' + (ConvertTo-BashArgument $sourcePatchWsl) +
+        ' && patch --dry-run -p1 < ' + (ConvertTo-BashArgument $requestSamplerPatchWsl) +
+        ' && patch -p1 < ' + (ConvertTo-BashArgument $requestSamplerPatchWsl)
+    Invoke-Wsl $patchCommand 'Pinned MNN request sampler patch no longer applies cleanly.'
+}
+
 $artifactWsl = ConvertTo-WslPath $artifactRoot
 $sourceWsl = ConvertTo-WslPath $sourceExtract
-$cpuBuild = ConvertTo-WslPath (Join-Path $cacheRoot 'build-cpu')
+$cpuBuildDirectory = Join-Path $cacheRoot "build-cpu-$requestSamplerPatchId"
+$cpuBuild = ConvertTo-WslPath $cpuBuildDirectory
 $cpuLibraryDir = $artifactWsl
 Invoke-MnnBuild $sourceWsl $cpuBuild $cpuLibraryDir $ndkWsl $false
 
-$cpuExpressLibrary = Join-Path (Join-Path $cacheRoot 'build-cpu') 'libMNN_Express.so'
+$cpuExpressLibrary = Join-Path $cpuBuildDirectory 'libMNN_Express.so'
 if (-not (Test-Path -LiteralPath $cpuExpressLibrary -PathType Leaf)) {
     throw "Required MNN dependency was not produced: $cpuExpressLibrary"
 }
@@ -200,10 +215,10 @@ if ($IncludeOpenCL) {
     $openclRoot = Join-Path $artifactRoot 'opencl'
     New-Item -ItemType Directory -Path $openclRoot -Force | Out-Null
     $openclWsl = ConvertTo-WslPath $openclRoot
-    $openclBuild = ConvertTo-WslPath (Join-Path $cacheRoot 'build-opencl')
+    $openclBuild = ConvertTo-WslPath (Join-Path $cacheRoot "build-opencl-$requestSamplerPatchId")
     Invoke-MnnBuild $sourceWsl $openclBuild $openclWsl $ndkWsl $true
     foreach ($libraryName in @('libMNN_CL.so', 'libMNN_Express.so')) {
-        $builtLibrary = Join-Path (Join-Path $cacheRoot 'build-opencl') $libraryName
+        $builtLibrary = Join-Path (Join-Path $cacheRoot "build-opencl-$requestSamplerPatchId") $libraryName
         if (-not (Test-Path -LiteralPath $builtLibrary -PathType Leaf)) {
             throw "Required OpenCL MNN dependency was not produced: $builtLibrary"
         }

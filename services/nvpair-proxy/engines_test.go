@@ -60,6 +60,28 @@ func TestRoleForClassifiesOnlyDeclaredRoutes(t *testing.T) {
 	}
 }
 
+func TestMNNDeclaresOnlyOpenAIModelAndChatRoutes(t *testing.T) {
+	mnn, ok := profileFor("mnn")
+	if !ok {
+		t.Fatal("MNN proxy profile missing")
+	}
+	if mnn.ModelNaming != exactID {
+		t.Fatalf("MNN model naming = %v, want exactID", mnn.ModelNaming)
+	}
+	want := []route{
+		{Path: "/v1/models", Role: roleModelListOpenAIGET},
+		{Path: "/v1/chat/completions", Role: roleInferencePOST},
+	}
+	if len(mnn.Routes) != len(want) {
+		t.Fatalf("MNN routes = %+v, want %+v", mnn.Routes, want)
+	}
+	for i := range want {
+		if mnn.Routes[i] != want[i] {
+			t.Errorf("MNN route[%d] = %+v, want %+v", i, mnn.Routes[i], want[i])
+		}
+	}
+}
+
 func TestIsInferenceRequestFollowsTheProfile(t *testing.T) {
 	ollama, _ := profileFor("ollama")
 	lmstudio, _ := profileFor("lmstudio")

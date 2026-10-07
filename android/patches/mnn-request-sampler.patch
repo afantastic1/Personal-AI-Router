@@ -1,0 +1,41 @@
+diff --git a/transformers/llm/engine/include/llm/llm.hpp b/transformers/llm/engine/include/llm/llm.hpp
+index 1124f4d..43ec88a 100644
+--- a/transformers/llm/engine/include/llm/llm.hpp
++++ b/transformers/llm/engine/include/llm/llm.hpp
+@@ -197,6 +197,7 @@ public:
+     void syncPromptCache(const ChatMessages& chat_prompts);
+     // config function
+     std::string dump_config();
++    void reset_sampler(int64_t seed = -1);
+     bool set_config(const std::string& content);
+     void setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after);
+     Llm* create_lora(const std::string& lora_path);
+diff --git a/transformers/llm/engine/src/llm.cpp b/transformers/llm/engine/src/llm.cpp
+index 87f2f12..30fb989 100644
+--- a/transformers/llm/engine/src/llm.cpp
++++ b/transformers/llm/engine/src/llm.cpp
+@@ -136,6 +136,13 @@ void Llm::setChatTemplate() {
+     }
+ }
+ 
++void Llm::reset_sampler(int64_t seed) {
++    mSampler.reset(Sampler::createSampler(mContext, mConfig));
++    if (seed >= 0) {
++        mSampler->setSeed(static_cast<unsigned int>(seed));
++    }
++}
++
+ bool Llm::set_config(const std::string& content) {
+     mConfig->config_.merge(ujson::json::parse(content));
+     mConfig->mllm_config_ = mConfig->config_.contains("mllm") ? mConfig->config_["mllm"] : ujson::json();
+diff --git a/transformers/llm/engine/src/sampler.hpp b/transformers/llm/engine/src/sampler.hpp
+index 68f6ff5..b7bf67d 100644
+--- a/transformers/llm/engine/src/sampler.hpp
++++ b/transformers/llm/engine/src/sampler.hpp
+@@ -70,6 +70,7 @@ public:
+     static Sampler* createSampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
+     Sampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
+     int sample(MNN::Express::VARP logits);
++    void setSeed(unsigned int seed) { mRng.seed(seed); }
+ private:
+     std::shared_ptr<LlmContext> mContext;

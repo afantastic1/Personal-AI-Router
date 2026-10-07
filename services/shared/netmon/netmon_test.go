@@ -68,6 +68,27 @@ func TestAndroidSnapshotRejectsLoopbackAddress(t *testing.T) {
 	}
 }
 
+func TestAndroidInterfaceAddressesUseParentProvidedIPv4(t *testing.T) {
+	values := map[string]string{
+		"NVPAIR_MDNS_INTERFACE_INDEX": "17",
+		"NVPAIR_MDNS_INTERFACE_NAME":  "wlan0",
+		"NVPAIR_MDNS_IPV4":            "192.168.1.8",
+	}
+	addresses, ok := androidInterfaceAddressesFromEnvironment(
+		net.Interface{Index: 17, Name: "wlan0"},
+		func(key string) string { return values[key] },
+	)
+	if !ok || len(addresses) != 1 || addresses[0].String() != "192.168.1.8/32" {
+		t.Fatalf("Android multicast interface addresses = (%v, %v), want 192.168.1.8/32", addresses, ok)
+	}
+	if _, ok := androidInterfaceAddressesFromEnvironment(
+		net.Interface{Index: 18, Name: "eth0"},
+		func(key string) string { return values[key] },
+	); ok {
+		t.Fatal("Android Wi-Fi address must not be assigned to another interface")
+	}
+}
+
 func TestFingerprintOrderInsensitive(t *testing.T) {
 	a := Snapshot{
 		LocalIPs: map[string]bool{"10.0.0.1": true, "192.168.1.2": true},

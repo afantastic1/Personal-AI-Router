@@ -109,6 +109,13 @@ func (e *Executor) RestoreEnabled(ctx context.Context) error {
 	var wg sync.WaitGroup
 	errs := make(chan error, len(e.reg.Names()))
 	for _, engine := range e.reg.Names() {
+		manifest, ok := e.reg.Get(engine)
+		if ok {
+			platform, ok := manifest.HostPlatform()
+			if ok && platform.Runtime.isHosted() {
+				continue
+			}
+		}
 		enabled, known, err := e.desired.get(engine)
 		if err != nil {
 			errs <- fmt.Errorf("restore %s: %w", engine, err)

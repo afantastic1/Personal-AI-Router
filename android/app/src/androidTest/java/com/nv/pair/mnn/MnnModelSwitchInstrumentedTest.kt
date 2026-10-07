@@ -33,11 +33,11 @@ class MnnModelSwitchInstrumentedTest {
 
         try {
             assertTrue("Primary fixture failed to load.", runtime.loadModel(primary, MnnBackend.CPU) is MnnResult.Success)
-            assertGenerated(runtime, 501)
+            assertGenerated(runtime, 501, "qwen-primary")
             assertTrue("Secondary fixture failed to replace the primary model.", runtime.loadModel(secondary, MnnBackend.CPU) is MnnResult.Success)
-            assertGenerated(runtime, 502)
+            assertGenerated(runtime, 502, "qwen-secondary")
             assertTrue("Primary fixture failed to reload after model switching.", runtime.loadModel(primary, MnnBackend.CPU) is MnnResult.Success)
-            assertGenerated(runtime, 503)
+            assertGenerated(runtime, 503, "qwen-primary")
             assertTrue("Final model unload failed.", runtime.unloadModel() is MnnResult.Success)
         } finally {
             runtime.close()
@@ -64,11 +64,11 @@ class MnnModelSwitchInstrumentedTest {
         displayName = modelId
     )
 
-    private fun assertGenerated(runtime: NativeMnn, requestId: Long) {
+    private fun assertGenerated(runtime: NativeMnn, requestId: Long, modelId: String) {
         val chunks = mutableListOf<String>()
         val result = runtime.generate(
             requestId = requestId,
-            request = MnnGenerationRequest("Reply with one short word.", maxTokens = 4)
+            request = MnnChatRequest(modelId, listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")), maxTokens = 4)
         ) { chunk -> chunks.add(chunk) }
         assertTrue("Generation failed after model switch.", result is MnnResult.Success)
         assertTrue("Generation emitted no tokens after model switch.", chunks.isNotEmpty())

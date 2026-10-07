@@ -92,6 +92,9 @@ func (e *Executor) StartWith(ctx context.Context, engine string, opts startOpts)
 	if err != nil {
 		return err
 	}
+	if err := st.plat.Runtime.rejectHostedLifecycle("start"); err != nil {
+		return err
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	if err := e.doStart(ctx, st, engine, opts); err != nil {
@@ -413,6 +416,9 @@ func (e *Executor) Stop(engine string) error {
 	if err != nil {
 		return err
 	}
+	if err := st.plat.Runtime.rejectHostedLifecycle("stop"); err != nil {
+		return err
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	stopErr := e.doStop(st, engine)
@@ -428,6 +434,9 @@ func (e *Executor) Stop(engine string) error {
 // doStop performs the stop. Callers must hold st.opMu.
 func (e *Executor) doStop(st *engineState, engine string) error {
 	rt := st.plat.Runtime
+	if rt.isHosted() {
+		return nil
+	}
 	mode := rt.modeOrDefault()
 	st.mu.Lock()
 	if !st.running {
@@ -736,6 +745,9 @@ func (e *Executor) Restart(ctx context.Context, engine string) error {
 	if err != nil {
 		return err
 	}
+	if err := st.plat.Runtime.rejectHostedLifecycle("restart"); err != nil {
+		return err
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	if err := e.doStop(st, engine); err != nil {
@@ -768,6 +780,9 @@ func (e *Executor) StopAll() {
 	for _, n := range names {
 		st, err := e.state(n)
 		if err != nil {
+			continue
+		}
+		if st.plat.Runtime.isHosted() {
 			continue
 		}
 		wg.Add(1)

@@ -19,6 +19,12 @@ listener; the broker asks for each engine's facade with `facade/enable`, which
 carries that engine's port and alias addresses. A flag cannot express this,
 because the broker plans a different port for each engine.
 
+The Android MNN facade is enabled at `:14324` and fronts the parent-owned MNN
+runtime at `:14325`. Desktop PAIR hosts the same MNN routing facade so clients
+can reach an Android runtime through discovery and cluster mTLS. The facade
+serves only `GET /v1/models` and `POST /v1/chat/completions`; only Android
+advertises a hosted MNN runtime under service key `mn`.
+
 They share a process on purpose. Between scheduler snapshots a facade takes
 short-lived reservations for work it has dispatched, and those live in the
 process — a process per engine split that picture, so simultaneous bursts on
@@ -57,6 +63,28 @@ bound — enable is a request, and the child's persisted-port restore can overri
 the port asked for. Enabling an engine that is already up is an idempotent
 success, so a redelivered enable never tears down a working listener.
 
+The broker also enables the process-scoped OpenAI gateway once per proxy
+incarnation:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"gateway/enable","params":{"port":14326}}
+```
+
+It binds only `127.0.0.1:14326` and serves `GET /v1/models` plus
+`POST /v1/chat/completions`. The directory unions the enabled facades' current
+discovery inventories. Chat requests resolve their explicit model to an engine
+and then enter that facade's existing routing handler, preserving scheduler
+selection, cancellation, streaming, and workload attribution. The gateway is
+not an engine facade or a LAN-advertised service.
+
+The directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
+`auto-best`. These aliases select an eligible model and engine from current
+runtime inventory; `auto` uses the balanced policy. The shared model selector
+scores model metadata and runtime signals, then sends the selected model through
+the same facade handler and its existing node scheduler. Catalog entries absent
+from runtime inventory are never candidates. The gateway does not provide
+catalog search or download operations.
+
 ### Flags
 
 Only process-scoped settings are flags. Anything per-engine is a `facade/enable`
@@ -73,7 +101,7 @@ parameter, because one flag cannot carry two engines' plans.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `engine` | *(required)* | Which engine to front: `ollama` or `lmstudio`. An unknown name is rejected with the accepted values. |
+| `engine` | *(required)* | Which engine to front: `ollama`, `lmstudio`, or hosted `mnn`. An unknown name is rejected with the accepted values. |
 | `port` | per engine, see below | HTTP listen port for request forwarding. Must be 1–65535, or omitted for the engine's standalone default. `0` means "the default" rather than "pick an ephemeral port", and any other out-of-range value is rejected, because the facade announces the requested port in its `ready` notification and the broker would be told `0`. |
 | `aliasAddresses` | *(empty)* | Optional secondary `host:port` values for the same routing handler, one per loopback family so `localhost` resolves either way. Only literal loopback addresses are accepted; the broker uses this for a safe inherited local `OLLAMA_HOST`, and the aliases are not advertised to peers. Accepted only for an engine with an inherited host variable — today Ollama alone — and rejected for any other. |
 | `ignorePersistedPort` | `false` | Use `port` even when a saved port exists (used by broker-managed startup) |

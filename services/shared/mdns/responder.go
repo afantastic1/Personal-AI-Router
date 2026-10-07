@@ -259,12 +259,12 @@ func (r *Responder) Run(ctx context.Context) error {
 	}
 
 	var joined int
-	for ifIdx := range r.ifaces() {
-		ifi, err := net.InterfaceByIndex(ifIdx)
+	for ifIndex := range r.ifaces() {
+		ifi, err := responderInterfaceByIndex(ifIndex)
 		if err != nil {
 			continue
 		}
-		if err := pc.JoinGroup(ifi, &net.UDPAddr{IP: mdnsGroupV4}); err != nil {
+		if err := pc.JoinGroup(&ifi, &net.UDPAddr{IP: mdnsGroupV4}); err != nil {
 			slog.Debug("mdns: JoinGroup failed", "iface", ifi.Name, "err", err)
 			continue
 		}
@@ -578,13 +578,33 @@ func (r *Responder) sendOnInterface(buf []byte, ifIndex int, target *net.UDPAddr
 		return errors.New("no addresses on interface")
 	}
 	src := addrs[0]
-	ifi, err := net.InterfaceByIndex(ifIndex)
+	ifi, err := responderInterfaceByIndex(ifIndex)
 	if err != nil {
 		return err
 	}
-	if err := SendFromInterface(buf, ifi, src, target); err != nil {
+	if err := SendFromInterface(buf, &ifi, src, target); err != nil {
 		slog.Debug("mdns: send failed", "iface", ifi.Name, "ip", src.String(), "target", target.String(), "err", err)
 		return err
 	}
 	return nil
+}
+
+func responderInterfaceByIndex(index int) (net.Interface, error) {
+	ifi, err := net.InterfaceByIndex(index)
+	if err == nil {
+		return *ifi, nil
+	}
+	if fallback, ok := multicastInterfaceByIndex(index, netmon.MulticastInterfaces()); ok {
+		return fallback, nil
+	}
+	return net.Interface{}, err
+}
+
+func multicastInterfaceByIndex(index int, interfaces []net.Interface) (net.Interface, bool) {
+	for _, ifi := range interfaces {
+		if ifi.Index == index {
+			return ifi, true
+		}
+	}
+	return net.Interface{}, false
 }

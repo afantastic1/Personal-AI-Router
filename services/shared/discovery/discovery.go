@@ -616,12 +616,6 @@ func sendMulticastQuery(service, domain string) map[string]bool {
 		return outcomes
 	}
 
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		slog.Warn("mdns send: enumerate interfaces failed", "err", err)
-		return outcomes
-	}
-
 	var sent int
 	// Why each interface could not carry the query, for the warning below. The
 	// count on its own cannot separate a host with no usable interface from one
@@ -629,12 +623,12 @@ func sendMulticastQuery(service, domain string) map[string]bool {
 	// were DEBUG only — below the level the app ships with, so every field report
 	// of this warning has arrived without the one fact that explains it.
 	var failures []string
-	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagMulticast == 0 || ifi.Flags&net.FlagLoopback != 0 {
+	for _, ifi := range netmon.MulticastInterfaces() {
+		if ifi.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		addrs, err := ifi.Addrs()
-		if err != nil {
+		addrs := netmon.MulticastInterfaceAddresses(ifi)
+		if len(addrs) == 0 {
 			continue
 		}
 		ifi := ifi

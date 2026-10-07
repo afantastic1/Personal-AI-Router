@@ -1,0 +1,46 @@
+{
+  "$schema": "../manifest.schema.json",
+  "engine": "mnn",
+  "display_name": "MNN",
+  "manifest_version": 1,
+  "platforms": {
+    "android/arm64": {
+      "runtime": {
+        "mode": "hosted",
+        "port": 14325,
+        "ready": {
+          "http": "http://127.0.0.1:{port}/healthz",
+          "status": 200
+        },
+        "health": {
+          "http": "http://127.0.0.1:{port}/healthz",
+          "status": 200
+        }
+      }
+    }
+  },
+  "actions": {
+    "list_models": {
+      "description": "List MNN models available on this Android node.",
+      "http": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "result": {
+        "array": "data",
+        "field": "id"
+      }
+    },
+    "loaded_models": {
+      "description": "List MNN models currently loaded in memory.",
+      "http": {
+        "method": "GET",
+        "path": "/internal/models/loaded"
+      },
+      "result": {
+        "array": "models",
+        "field": "id"
+      }
+    }
+  }
+}

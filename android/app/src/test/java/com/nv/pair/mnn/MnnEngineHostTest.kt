@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -64,7 +64,7 @@ class MnnEngineHostTest {
         host.loadModel(model(), MnnBackend.CPU)
         val tokens = mutableListOf<String>()
 
-        val result = host.generate(7, MnnGenerationRequest("synthetic prompt")) { tokens.add(it) }
+        val result = host.generate(7, chatRequest()) { tokens.add(it) }
 
         assertEquals(listOf("synthetic", " response"), tokens)
         assertTrue(result is MnnResult.Success)
@@ -86,7 +86,7 @@ class MnnEngineHostTest {
         val generationResult = arrayOfNulls<MnnResult<MnnGenerationResult>>(1)
 
         Thread {
-            generationResult[0] = host.generate(9, MnnGenerationRequest("synthetic prompt")) { }
+            generationResult[0] = host.generate(9, chatRequest()) { }
             generationFinished.countDown()
         }.start()
 
@@ -113,7 +113,7 @@ class MnnEngineHostTest {
         val unloadFinished = CountDownLatch(1)
 
         Thread {
-            host.generate(11, MnnGenerationRequest("synthetic prompt")) { }
+            host.generate(11, chatRequest()) { }
             generationFinished.countDown()
         }.start()
         assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
@@ -139,7 +139,7 @@ class MnnEngineHostTest {
         assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
         assertTrue(host.unloadModel() is MnnResult.Success)
         assertTrue(host.loadModel(model("qwen-reloaded"), MnnBackend.CPU) is MnnResult.Success)
-        assertTrue(host.generate(13, MnnGenerationRequest("synthetic prompt")) { } is MnnResult.Success)
+        assertTrue(host.generate(13, chatRequest("qwen-reloaded")) { } is MnnResult.Success)
 
         assertEquals(2, runtime.loadCount.get())
         host.close()
@@ -167,6 +167,11 @@ class MnnEngineHostTest {
         config.writeText("{}")
         return MnnModelDescriptor(modelId, config.absolutePath, modelId)
     }
+
+    private fun chatRequest(modelId: String = "qwen-test"): MnnChatRequest = MnnChatRequest(
+        modelId = modelId,
+        messages = listOf(MnnChatMessage(MnnChatRole.USER, "synthetic prompt")),
+    )
 
     private class FakeMnnRuntime(
         private val loadError: MnnErrorCode? = null,
@@ -199,7 +204,7 @@ class MnnEngineHostTest {
 
         override fun generate(
             requestId: Long,
-            request: MnnGenerationRequest,
+            request: MnnChatRequest,
             onToken: (String) -> Unit
         ): MnnResult<MnnGenerationResult> {
             activeRequestId = requestId
@@ -243,5 +248,9 @@ class MnnEngineHostTest {
         override fun getLoadedModel(): MnnLoadedModel? = loadedModel
 
         override fun getMetrics(): MnnRuntimeMetrics = MnnRuntimeMetrics()
+
+        override fun close() {
+            unloadModel()
+        }
     }
 }

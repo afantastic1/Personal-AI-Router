@@ -40,7 +40,7 @@ class MnnRuntimeInstrumentedTest {
                 val chunks = mutableListOf<String>()
                 val result = runtime.generate(
                     requestId = 100L + cycle,
-                    request = MnnGenerationRequest("Reply with one short word.", maxTokens = 16)
+                    request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")), maxTokens = 16)
                 ) { chunk -> chunks.add(chunk) }
 
                 assertTrue("CPU generation cycle ${cycle + 1} failed.", result is MnnResult.Success)
@@ -76,7 +76,7 @@ class MnnRuntimeInstrumentedTest {
             val generationThread = Thread {
                 generationResult[0] = runtime.generate(
                     requestId = 206,
-                    request = MnnGenerationRequest("Count slowly.", maxTokens = 512)
+                    request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Count slowly.")), maxTokens = 512)
                 ) { firstChunk.countDown() }
                 generationFinished.countDown()
             }
@@ -95,6 +95,34 @@ class MnnRuntimeInstrumentedTest {
     }
 
     @Test
+    fun identicalSeedProducesIdenticalSampledResponse() {
+        val runtime = NativeMnn.create()
+        try {
+            assertSuccess(runtime.loadModel(requiredModelDescriptor(), MnnBackend.CPU), "CPU load")
+            val request = MnnChatRequest(
+                modelId = "qwen-device-test",
+                messages = listOf(MnnChatMessage(MnnChatRole.USER, "Write one short greeting. /no_think")),
+                maxTokens = 24,
+                temperature = 0.8f,
+                topP = 0.9f,
+                seed = 1701,
+            )
+            val first = runtime.generate(251, request) { }
+            val second = runtime.generate(252, request) { }
+
+            assertTrue("First seeded generation failed.", first is MnnResult.Success)
+            assertTrue("Second seeded generation failed.", second is MnnResult.Success)
+            assertEquals(
+                "The same seed and sampling parameters produced different responses.",
+                generationText(first),
+                generationText(second),
+            )
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun openClProbeReportsTypedUnsupportedOrGeneratesAndCpuRemainsUsable() {
         val runtime = NativeMnn.create()
         val model = requiredModelDescriptor()
@@ -105,7 +133,7 @@ class MnnRuntimeInstrumentedTest {
                     val chunks = mutableListOf<String>()
                     val result = runtime.generate(
                         requestId = 307,
-                        request = MnnGenerationRequest("Reply with one short word.", maxTokens = 8)
+                        request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")), maxTokens = 8)
                     ) { chunk -> chunks.add(chunk) }
                     if (result is MnnResult.Failure) {
                         assertEquals(MnnErrorCode.BACKEND_UNSUPPORTED, result.error.code)
@@ -120,7 +148,7 @@ class MnnRuntimeInstrumentedTest {
             assertSuccess(runtime.loadModel(model, MnnBackend.CPU), "CPU load after OpenCL probe")
             val cpuResult = runtime.generate(
                 requestId = 308,
-                request = MnnGenerationRequest("Reply with one short word.", maxTokens = 4)
+                request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")), maxTokens = 4)
             ) {}
             assertTrue("CPU failed after OpenCL probe.", cpuResult is MnnResult.Success)
             assertSuccess(runtime.unloadModel(), "CPU unload after OpenCL probe")
@@ -183,5 +211,10 @@ class MnnRuntimeInstrumentedTest {
     private fun failureCode(result: MnnResult<*>): MnnErrorCode = when (result) {
         is MnnResult.Failure -> result.error.code
         is MnnResult.Success -> error("Expected operation to fail")
+    }
+
+    private fun generationText(result: MnnResult<MnnGenerationResult>): String = when (result) {
+        is MnnResult.Success -> result.value.text
+        is MnnResult.Failure -> error("Expected generation to succeed: ${result.error.code}")
     }
 }

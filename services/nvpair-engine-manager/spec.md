@@ -55,7 +55,8 @@ A declarative, config-driven control plane for **local inference engines** (Olla
 
 **Functional**
 - Load + validate per-engine JSON manifests (bundled + user dir); select the host `<goos>/<goarch>` block; resolve placeholders (`{bin}`, `{cli}`, `{port}`, `{download}`, `{install_dir}`).
-- Support both `process` (owned foreground) and `command` (daemon + control-CLI) runtimes; execute detect / install / uninstall / start / stop / restart / status / health and HTTP **or** CLI actions; emit `engine:*` results and notifications.
+- Support `process` (owned foreground), `command` (daemon + control-CLI), and `hosted` (parent-owned) runtimes. Hosted engines support health/status and declared query actions but explicitly reject install / uninstall / start / stop / restart / set-port / launch editing; shutdown and desired-state restoration never alter their lifecycle.
+- Execute lifecycle operations for process/command runtimes and HTTP **or** CLI actions for all modes; emit `engine:*` results and notifications.
 - Emit `errors:report` / `errors:clear` on its stdio for the Broker to forward to `nvpair-errors`.
 
 **Non-functional**

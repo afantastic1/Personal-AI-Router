@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -20,6 +20,7 @@
 #include <streambuf>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -319,20 +320,44 @@ Java_com_nv_pair_mnn_NativeMnn_nativeLoadModel(JNIEnv* env, jobject, jlong handl
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_com_nv_pair_mnn_NativeMnn_nativeGenerate(
+Java_com_nv_pair_mnn_NativeMnn_nativeGenerateChat(
     JNIEnv* callerEnv,
     jobject,
     jlong handle,
     jlong requestId,
-    jstring prompt,
+    jobjectArray roles,
+    jobjectArray contents,
     jint maxTokens,
     jfloat temperature,
     jfloat topP,
-    jint,
+    jlong seed,
     jobject callback) {
     Session* session = ToSession(handle);
-    if (session == nullptr || prompt == nullptr || callback == nullptr || requestId <= 0 || maxTokens <= 0) {
+    if (session == nullptr || roles == nullptr || contents == nullptr || callback == nullptr || requestId <= 0 || maxTokens <= 0) {
         return kGenerationFailed;
+    }
+    const jsize messageCount = callerEnv->GetArrayLength(roles);
+    if (messageCount <= 0 || callerEnv->GetArrayLength(contents) != messageCount) {
+        return kGenerationFailed;
+    }
+    MNN::Transformer::ChatMessages chatMessages;
+    chatMessages.reserve(static_cast<size_t>(messageCount));
+    for (jsize index = 0; index < messageCount; ++index) {
+        auto role = static_cast<jstring>(callerEnv->GetObjectArrayElement(roles, index));
+        auto content = static_cast<jstring>(callerEnv->GetObjectArrayElement(contents, index));
+        if (role == nullptr || content == nullptr) {
+            if (role != nullptr) callerEnv->DeleteLocalRef(role);
+            if (content != nullptr) callerEnv->DeleteLocalRef(content);
+            return kGenerationFailed;
+        }
+        std::string roleUtf8 = Utf16ToUtf8(callerEnv, role);
+        std::string contentUtf8 = Utf16ToUtf8(callerEnv, content);
+        callerEnv->DeleteLocalRef(role);
+        callerEnv->DeleteLocalRef(content);
+        if (roleUtf8.empty() || contentUtf8.empty()) {
+            return kGenerationFailed;
+        }
+        chatMessages.emplace_back(std::move(roleUtf8), std::move(contentUtf8));
     }
     std::unique_lock<std::mutex> generationGuard(session->generationMutex, std::try_to_lock);
     if (!generationGuard.owns_lock() || session->llm == nullptr) {
@@ -356,12 +381,6 @@ Java_com_nv_pair_mnn_NativeMnn_nativeGenerate(
     if (callbackGlobal == nullptr) {
         return kGenerationFailed;
     }
-    const std::string promptUtf8 = Utf16ToUtf8(callerEnv, prompt);
-    if (promptUtf8.empty()) {
-        callerEnv->DeleteGlobalRef(callbackGlobal);
-        return kGenerationFailed;
-    }
-
     std::atomic<jint> result{kGenerationFailed};
     std::thread worker([&]() {
         AttachedEnv attached(vm);
@@ -388,13 +407,19 @@ Java_com_nv_pair_mnn_NativeMnn_nativeGenerate(
         try {
             std::ostringstream config;
             config << "{\"max_new_tokens\":" << maxTokens
+                   << ",\"sampler_type\":\"" << (temperature <= 0.0f ? "greedy" : "topP") << "\""
                    << ",\"temperature\":" << temperature
-                   << ",\"top_p\":" << topP << "}";
+                   << ",\"top_p\":" << topP;
+            if (seed >= 0) {
+                config << ",\"seed\":" << seed;
+            }
+            config << "}";
             if (!llm->set_config(config.str())) {
                 result.store(kGenerationFailed);
                 return;
             }
-            const std::string formattedPrompt = llm->apply_chat_template(promptUtf8);
+            llm->reset_sampler(seed);
+            const std::string formattedPrompt = llm->apply_chat_template(chatMessages);
             const std::vector<int> inputIds = llm->tokenizer_encode(formattedPrompt);
             if (inputIds.empty()) {
                 result.store(kGenerationFailed);

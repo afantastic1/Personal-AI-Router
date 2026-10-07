@@ -1,16 +1,16 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 package com.nv.pair.mnn
 
-interface MnnRuntime {
+interface MnnRuntime : AutoCloseable {
     fun loadModel(model: MnnModelDescriptor, backend: MnnBackend): MnnResult<Unit>
 
     fun generate(
         requestId: Long,
-        request: MnnGenerationRequest,
+        request: MnnChatRequest,
         onToken: (String) -> Unit
     ): MnnResult<MnnGenerationResult>
 
@@ -23,4 +23,6 @@ interface MnnRuntime {
     fun getLoadedModel(): MnnLoadedModel?
 
     fun getMetrics(): MnnRuntimeMetrics
+
+    override fun close()
 }

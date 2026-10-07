@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,11 +12,12 @@ import kotlin.concurrent.withLock
 class NativeMnn private constructor(
     private var nativeHandle: Long,
     private val initializationError: MnnError?
-) : MnnRuntime, AutoCloseable {
+) : MnnRuntime {
     private val lock = ReentrantLock(true)
     private val requestFinished = lock.newCondition()
     private var loadedModel: MnnLoadedModel? = null
     private var activeRequestId: Long? = null
+    private var cancelledRequestId: Long? = null
     private var unloadRequested = false
     private var closed = false
     private var lastError: MnnError? = initializationError
@@ -82,7 +83,7 @@ class NativeMnn private constructor(
 
     override fun generate(
         requestId: Long,
-        request: MnnGenerationRequest,
+        request: MnnChatRequest,
         onToken: (String) -> Unit
     ): MnnResult<MnnGenerationResult> {
         when (val validation = request.validate()) {
@@ -96,6 +97,7 @@ class NativeMnn private constructor(
                 return MnnResult.failure(MnnErrorCode.INVALID_STATE, "A model must be ready before generation.")
             }
             activeRequestId = requestId
+            cancelledRequestId = null
             nativeHandle
         }
 
@@ -105,14 +107,15 @@ class NativeMnn private constructor(
             onToken(token)
         }
         val resultCode = try {
-            nativeGenerate(
+            nativeGenerateChat(
                 handle,
                 requestId,
-                request.prompt,
+                request.messages.map { it.role.wireName }.toTypedArray(),
+                request.messages.map { it.content }.toTypedArray(),
                 request.maxTokens,
                 request.temperature,
                 request.topP,
-                request.seed ?: -1,
+                request.seed?.toLong()?.and(UNSIGNED_INT_MASK) ?: NO_SEED,
                 callback
             )
         } catch (_: UnsatisfiedLinkError) {
@@ -138,15 +141,23 @@ class NativeMnn private constructor(
             }
         )
 
-        lock.withLock {
+        val cancelled = lock.withLock {
             metrics = completedMetrics
+            val wasCancelled = cancelledRequestId == requestId
+            if (wasCancelled) cancelledRequestId = null
             activeRequestId = null
             requestFinished.signalAll()
+            wasCancelled
         }
 
         return when (resultCode) {
             NATIVE_SUCCESS -> MnnResult.success(MnnGenerationResult(output.toString(), completedMetrics))
             NATIVE_CANCELLED -> MnnResult.failure(MnnErrorCode.CANCELLED, "Generation was cancelled.")
+            NATIVE_ERROR_GENERATION -> if (cancelled) {
+                MnnResult.failure(MnnErrorCode.CANCELLED, "Generation was cancelled.")
+            } else {
+                MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "MNN generation failed.")
+            }
             NATIVE_ERROR_UNSUPPORTED -> MnnResult.failure(
                 MnnErrorCode.BACKEND_UNSUPPORTED,
                 "The selected MNN backend is not supported by this runtime."
@@ -159,6 +170,7 @@ class NativeMnn private constructor(
     override fun cancel(requestId: Long) {
         lock.withLock {
             if (activeRequestId == requestId && nativeHandle != 0L) {
+                cancelledRequestId = requestId
                 runCatching { nativeCancel(nativeHandle, requestId) }
             }
         }
@@ -280,14 +292,15 @@ class NativeMnn private constructor(
     private external fun nativeVersion(): String
     private external fun nativeCreateSession(): Long
     private external fun nativeLoadModel(handle: Long, configPath: String, backend: Int): Int
-    private external fun nativeGenerate(
+    private external fun nativeGenerateChat(
         handle: Long,
         requestId: Long,
-        prompt: String,
+        roles: Array<String>,
+        contents: Array<String>,
         maxTokens: Int,
         temperature: Float,
         topP: Float,
-        seed: Int,
+        seed: Long,
         callback: TokenCallback
     ): Int
     private external fun nativeCancel(handle: Long, requestId: Long)
@@ -307,6 +320,8 @@ class NativeMnn private constructor(
         private const val NATIVE_ERROR_LOAD = 4
         private const val NATIVE_ERROR_GENERATION = 5
         private const val NATIVE_ERROR_UNAVAILABLE = 6
+        private const val UNSIGNED_INT_MASK = 0xffffffffL
+        private const val NO_SEED = -1L
 
         fun create(libraryLoader: () -> Unit = { System.loadLibrary("pair_mnn") }): NativeMnn {
             return try {

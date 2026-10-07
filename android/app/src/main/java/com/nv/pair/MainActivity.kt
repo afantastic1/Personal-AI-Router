@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -46,6 +47,8 @@ import com.nv.pair.data.ClusterState
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.PairWorkload
 import com.nv.pair.ui.theme.PAIRTheme
+import com.nv.pair.models.ModelHubScreen
+import com.nv.pair.models.AutoModelSelector
 
 class MainActivity : ComponentActivity() {
     private lateinit var runtimeController: PairRuntimeController
@@ -138,6 +141,12 @@ private fun PairHomeScreen(
                     icon = {},
                     label = { Text("Cluster") },
                 )
+                NavigationBarItem(
+                    selected = destination == 2,
+                    onClick = { destination = 2 },
+                    icon = {},
+                    label = { Text("Models") },
+                )
             }
         },
     ) { insets ->
@@ -149,7 +158,7 @@ private fun PairHomeScreen(
                 .padding(horizontal = 24.dp, vertical = 32.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            Text(if (destination == 0) "PAIR · Network" else "PAIR · Cluster", style = MaterialTheme.typography.headlineLarge)
+            Text(if (destination == 0) "PAIR · Network" else if (destination == 1) "PAIR · Cluster" else "PAIR · Models", style = MaterialTheme.typography.headlineLarge)
             Text(
                 "Personal AI Router",
                 style = MaterialTheme.typography.titleMedium,
@@ -171,6 +180,7 @@ private fun PairHomeScreen(
             }
             Text("Local router", style = MaterialTheme.typography.titleLarge)
             proxies.forEach { ProxyStatusCard(it) }
+            LocalApiCard(running = running, modelCount = nodes.flatMap { it.models }.distinct().size + AutoModelSelector.ALIASES.size)
             Text("Recent workloads", style = MaterialTheme.typography.titleLarge)
             if (workloads.isEmpty()) {
                 Text("No requests have been routed yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -197,7 +207,7 @@ private fun PairHomeScreen(
             ) {
                 Text(if (running || state.desiredRunning) "Stop PAIR" else "Start PAIR")
             }
-            } else {
+            } else if (destination == 1) {
                 ClusterManagement(
                     cluster = cluster,
                     discoveredNodes = nodes,
@@ -209,6 +219,30 @@ private fun PairHomeScreen(
                     onLeave = onLeave,
                     onRemove = onRemove,
                 )
+            } else {
+                ModelHubScreen(nodes)
+            }
+        }
+    }
+}
+
+@Composable
+private fun LocalApiCard(running: Boolean, modelCount: Int) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val url = "http://127.0.0.1:14326/v1"
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Local API", style = MaterialTheme.typography.titleMedium)
+            Text("Status: ${if (running) "Running" else "Stopped"}")
+            Text("URL: $url", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Key: pair-local", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Models: $modelCount", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedButton(onClick = {
+                val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    ?: return@OutlinedButton
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PAIR Local API", "$url\npair-local"))
+            }) {
+                Text("Copy URL and key")
             }
         }
     }

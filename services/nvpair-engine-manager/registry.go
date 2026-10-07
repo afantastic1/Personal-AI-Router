@@ -112,6 +112,8 @@ type Fetch struct {
 //   - "command": the engine is a daemon brought up/down by commands
 //     (e.g. LM Studio's `lms`); liveness = the readiness/health probe,
 //     and Stop.Cmd brings it down.
+//   - "hosted": the parent application owns lifecycle; this service only
+//     probes health and executes declared query actions.
 type Runtime struct {
 	EditableLaunch *EditableLaunch   `json:"editable_launch,omitempty"`
 	LaunchArgs     *[]string         `json:"launch_args,omitempty"` // literal arguments after managed fields
@@ -153,6 +155,15 @@ func (r *Runtime) modeOrDefault() string {
 		return "process"
 	}
 	return r.Mode
+}
+
+func (r Runtime) isHosted() bool { return r.modeOrDefault() == "hosted" }
+
+func (r Runtime) rejectHostedLifecycle(operation string) error {
+	if r.isHosted() {
+		return fmt.Errorf("%s is unsupported for hosted runtime", operation)
+	}
+	return nil
 }
 
 // hasCustomLaunch reports whether the user supplied any literal argument or
@@ -586,6 +597,9 @@ func (m *Manifest) Validate() error {
 		// than ship a guarantee the manifest cannot keep.
 		if a.RestartAfter {
 			for key, p := range m.Platforms {
+				if p.Runtime.isHosted() {
+					return fmt.Errorf("action %q: restart_after is unsupported for hosted runtime on platform %q", name, key)
+				}
 				if p.Runtime.Ready == nil {
 					return fmt.Errorf("action %q: restart_after requires platform %q to declare runtime.ready (the restart is only observable once the engine is ready again)", name, key)
 				}
@@ -632,8 +646,15 @@ func (p *Platform) validate(key string) error {
 		if len(p.Runtime.Start) == 0 {
 			return fmt.Errorf("platform %q: runtime.start is required in command mode", key)
 		}
+	case "hosted":
+		if p.Runtime.Ready == nil {
+			return fmt.Errorf("platform %q: runtime.ready is required in hosted mode", key)
+		}
+		if p.Runtime.Bin != "" || len(p.Runtime.Start) > 0 || p.Runtime.Stop != nil || p.Install != nil || p.Uninstall != nil || p.Runtime.EditableLaunch != nil || p.Runtime.LaunchArgs != nil || p.Runtime.LaunchEnv != nil {
+			return fmt.Errorf("platform %q: hosted mode cannot declare engine lifecycle or launch configuration", key)
+		}
 	default:
-		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\" or \"command\")", key, p.Runtime.Mode)
+		return fmt.Errorf("platform %q: runtime.mode %q invalid (want \"process\", \"command\", or \"hosted\")", key, p.Runtime.Mode)
 	}
 	if p.Install != nil {
 		if len(p.Install.Script) > 0 && (p.Install.Fetch != nil || len(p.Install.Run) > 0) {

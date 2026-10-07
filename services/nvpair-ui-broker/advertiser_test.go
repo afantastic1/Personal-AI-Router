@@ -46,6 +46,44 @@ func TestRunningEnginePort(t *testing.T) {
 	}
 }
 
+func TestHostedMNNAdvertisementRequiresHealthyBackendAndReadyFacade(t *testing.T) {
+	profile, ok := engineProxyProfileFor("mnn")
+	if !ok {
+		t.Fatal("MNN proxy profile missing")
+	}
+	for _, tc := range []struct {
+		name           string
+		backendHealthy bool
+		facadeReady    bool
+		backendPort    int
+		facadePort     int
+		want           bool
+	}{
+		{name: "both ready", backendHealthy: true, facadeReady: true, backendPort: 14325, facadePort: 14324, want: true},
+		{name: "backend down", facadeReady: true, backendPort: 14325, facadePort: 14324},
+		{name: "facade down", backendHealthy: true, backendPort: 14325, facadePort: 14324},
+		{name: "self forwarding", backendHealthy: true, facadeReady: true, backendPort: 14324, facadePort: 14324},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldAdvertiseEngine(profile, tc.backendHealthy, tc.facadeReady, tc.backendPort, tc.facadePort); got != tc.want {
+				t.Fatalf("shouldAdvertiseEngine = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPostPortGateAdvertisementProfilesExcludeHostedEngines(t *testing.T) {
+	profiles := engineProxyProfilesExceptOwnership(hostedEngine)
+	if len(profiles) != 2 {
+		t.Fatalf("post-gate profiles count = %d, want 2", len(profiles))
+	}
+	for _, profile := range profiles {
+		if profile.Ownership == hostedEngine {
+			t.Fatalf("hosted engine %q remained in the post-gate advertisement loop", profile.Name)
+		}
+	}
+}
+
 func TestLMStudioFallbackNeverAdvertisesItsProxy(t *testing.T) {
 	proxyClient, proxyServer := net.Pipe()
 	defer proxyClient.Close()
@@ -75,7 +113,7 @@ func TestLMStudioFallbackNeverAdvertisesItsProxy(t *testing.T) {
 
 	// A nil client is intentional: collision detection must short-circuit before
 	// any health request can mistake the proxy for LM Studio.
-	b.reconcileAdvertiseLMStudio(nil)
+	b.reconcileEngineAdvertisement(lmstudioProxyProfile, nil)
 	if got := b.regCache.Snapshot(); len(got) != 0 {
 		t.Fatalf("LM Studio proxy was advertised as an engine: %+v", got)
 	}
@@ -100,7 +138,7 @@ func TestLMStudioFallbackDoesNotOverwriteKnownBackend(t *testing.T) {
 
 	// No engine-manager and no proxy: the fallback path that used to poison
 	// the cache with defaultLMStudioPort.
-	b.reconcileAdvertiseLMStudio(nil)
+	b.reconcileEngineAdvertisement(lmstudioProxyProfile, nil)
 
 	if got := int(b.lmstudioState().backendPort.Load()); got != managedLMStudioBackendStart {
 		t.Fatalf("backend cache = %d, want %d (fallback must not overwrite the confirmed backend)", got, managedLMStudioBackendStart)

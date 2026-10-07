@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -20,6 +21,7 @@ class MnnEngineHost(
     }
     private val stateLock = ReentrantLock()
     private val isClosed = AtomicBoolean(false)
+    private val generationAdmission = AtomicReference<Long?>(null)
     private var state = MnnEngineState.UNLOADED
     private var loadedModel: MnnLoadedModel? = null
     private var activeRequestId: Long? = null
@@ -67,58 +69,66 @@ class MnnEngineHost(
 
     fun generate(
         requestId: Long,
-        request: MnnGenerationRequest,
+        request: MnnChatRequest,
         onToken: (String) -> Unit
     ): MnnResult<MnnGenerationResult> {
         val validation = request.validate()
         if (validation is MnnResult.Failure) {
             return validation
         }
-
-        return dispatch {
-            val canGenerate = stateLock.withLock {
-                if (state != MnnEngineState.READY || loadedModel == null || activeRequestId != null) {
-                    false
-                } else {
-                    activeRequestId = requestId
-                    state = MnnEngineState.GENERATING
-                    lastError = null
-                    true
-                }
-            }
-            if (!canGenerate) {
-                return@dispatch MnnResult.failure(
-                    MnnErrorCode.INVALID_STATE,
-                    "A model must be ready and no generation may already be active."
-                )
-            }
-
-            val result = try {
-                runtime.generate(requestId, request, onToken)
-            } catch (_: Exception) {
-                MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "MNN generation failed.")
-            }
-            stateLock.withLock {
-                activeRequestId = null
-                when (result) {
-                    is MnnResult.Success -> {
-                        metrics = result.value.metrics
-                        state = MnnEngineState.READY
+        if (!generationAdmission.compareAndSet(null, requestId)) {
+            return MnnResult.failure(MnnErrorCode.ENGINE_BUSY, "An MNN generation is already active.")
+        }
+        return try {
+            dispatch {
+                val canGenerate = stateLock.withLock {
+                    if (state != MnnEngineState.READY || loadedModel == null || activeRequestId != null) {
+                        false
+                    } else if (loadedModel?.model?.modelId != request.modelId) {
+                        false
+                    } else {
+                        activeRequestId = requestId
+                        state = MnnEngineState.GENERATING
                         lastError = null
+                        true
                     }
-                    is MnnResult.Failure -> {
-                        metrics = runtime.getMetrics()
-                        if (result.error.code == MnnErrorCode.CANCELLED) {
+                }
+                if (!canGenerate) {
+                    return@dispatch MnnResult.failure(
+                        if (getStatus().modelId == null) MnnErrorCode.INVALID_STATE else MnnErrorCode.MODEL_NOT_LOADED,
+                        "The requested MNN model must be loaded before generation."
+                    )
+                }
+
+                val result = try {
+                    runtime.generate(requestId, request, onToken)
+                } catch (_: Exception) {
+                    MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "MNN generation failed.")
+                }
+                stateLock.withLock {
+                    activeRequestId = null
+                    when (result) {
+                        is MnnResult.Success -> {
+                            metrics = result.value.metrics
                             state = MnnEngineState.READY
                             lastError = null
-                        } else {
-                            state = MnnEngineState.ERROR
-                            lastError = result.error
+                        }
+                        is MnnResult.Failure -> {
+                            metrics = runtime.getMetrics()
+                            if (result.error.code == MnnErrorCode.CANCELLED) {
+                                state = MnnEngineState.READY
+                                lastError = null
+                            } else {
+                                state = MnnEngineState.ERROR
+                                lastError = result.error
+                            }
                         }
                     }
                 }
+                result
             }
-            result
+        } finally {
+            generationAdmission.compareAndSet(requestId, null)
         }
     }
 
@@ -166,7 +176,7 @@ class MnnEngineHost(
         if (isClosed.compareAndSet(false, true)) {
             try {
                 executor.submit {
-                    runCatching { runtime.unloadModel() }
+                    runCatching { runtime.close() }
                     stateLock.withLock {
                         loadedModel = null
                         activeRequestId = null

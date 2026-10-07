@@ -43,7 +43,7 @@ func TestEngineModels(t *testing.T) {
 func TestParseTXT(t *testing.T) {
 	txt := []string{
 		"v=1", "uuid=host-abc", "cluster-uuid=clu-xyz", "ip=192.168.1.10",
-		"ni=14318", "ol=11434", "er=14319", "wl=14320", "cl=14321", "em=14322",
+		"ni=14318", "ol=11434", "lm=1234", "mn=14324", "er=14319", "wl=14320", "cl=14321", "em=14322",
 		"unknown=ignored", "bad=notaport",
 	}
 	r := ParseTXT(txt)
@@ -62,8 +62,11 @@ func TestParseTXT(t *testing.T) {
 	if p, ok := r.Port(ServiceEngineManager); !ok || p != 14322 {
 		t.Errorf("em port = %d,%v want 14322,true", p, ok)
 	}
-	if _, ok := r.Port(ServiceLMStudio); ok {
-		t.Error("lm should be absent")
+	if p, ok := r.Port(ServiceMNN); !ok || p != 14324 {
+		t.Errorf("mn port = %d,%v want 14324,true", p, ok)
+	}
+	if p, ok := r.Port(ServiceLMStudio); !ok || p != 1234 {
+		t.Errorf("lm port = %d,%v want 1234,true", p, ok)
 	}
 	// "unknown=" is not a service port; "bad=notaport" is skipped.
 	if _, ok := r.Services["unknown"]; ok {
@@ -100,7 +103,7 @@ func TestTXTRoundTrip(t *testing.T) {
 		HostUUID:      "host-abc",
 		ClusterUUID:   "clu-xyz",
 		IP:            "10.0.0.5",
-		Services:      map[ServiceKey]int{ServiceOllama: 11434, ServiceErrors: 14319, ServiceNodeInfo: 14318, ServiceEngineManager: 14322},
+		Services:      map[ServiceKey]int{ServiceOllama: 11434, ServiceMNN: 14324, ServiceErrors: 14319, ServiceNodeInfo: 14318, ServiceEngineManager: 14322},
 	}
 	txt := orig.TXT()
 	// Schema must be first.
@@ -116,7 +119,7 @@ func TestTXTRoundTrip(t *testing.T) {
 func TestTXTDeterministicOrder(t *testing.T) {
 	r := NodeRecord{
 		HostUUID: "h",
-		Services: map[ServiceKey]int{ServiceCluster: 14321, ServiceNodeInfo: 14318, ServiceOllama: 11434},
+		Services: map[ServiceKey]int{ServiceCluster: 14321, ServiceNodeInfo: 14318, ServiceOllama: 11434, ServiceMNN: 14324},
 	}
 	// Built twice, identical order (map iteration is randomized, so this guards
 	// the deterministic emit).
@@ -124,7 +127,7 @@ func TestTXTDeterministicOrder(t *testing.T) {
 		t.Fatal("TXT() is not deterministic")
 	}
 	got := r.TXT()
-	want := []string{"v=1", "uuid=h", "ni=14318", "ol=11434", "cl=14321"}
+	want := []string{"v=1", "uuid=h", "ni=14318", "ol=11434", "mn=14324", "cl=14321"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("TXT order = %v, want %v", got, want)
 	}
@@ -147,6 +150,7 @@ func TestTransportPolicy(t *testing.T) {
 		{ServiceNodeInfo, TransportPlain, false, false},
 		{ServiceOllama, TransportPlain, false, false},
 		{ServiceLMStudio, TransportPlain, false, false},
+		{ServiceMNN, TransportPlain, false, false},
 		{ServiceEngineManager, TransportPlain, false, false},
 		{ServiceErrors, TransportMTLSWhenClustered, true, false},
 		{ServiceWorkload, TransportMTLSWhenClustered, true, false},

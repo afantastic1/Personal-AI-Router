@@ -188,6 +188,22 @@ func MulticastInterfaces() []net.Interface {
 	return selected
 }
 
+// MulticastInterfaceAddresses returns addresses for a selected mDNS interface.
+// Android can deny net.Interface.Addrs alongside interface enumeration, so
+// use the Wi-Fi address supplied by the parent app when it matches this index.
+func MulticastInterfaceAddresses(ifi net.Interface) []net.Addr {
+	if IsAndroid() {
+		if addrs, ok := androidInterfaceAddressesFromEnvironment(ifi, os.Getenv); ok {
+			return addrs
+		}
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil
+	}
+	return addrs
+}
+
 func IsAndroid() bool { return isAndroidBuild() }
 
 func androidInterfaceFromEnvironment(getenv func(string) string) (net.Interface, bool) {
@@ -198,6 +214,15 @@ func androidInterfaceFromEnvironment(getenv func(string) string) (net.Interface,
 		return net.Interface{}, false
 	}
 	return net.Interface{Index: index, Name: name, Flags: net.FlagUp | net.FlagMulticast}, true
+}
+
+func androidInterfaceAddressesFromEnvironment(ifi net.Interface, getenv func(string) string) ([]net.Addr, bool) {
+	environmentInterface, ok := androidInterfaceFromEnvironment(getenv)
+	if !ok || ifi.Index != environmentInterface.Index {
+		return nil, false
+	}
+	ip := net.ParseIP(getenv("NVPAIR_MDNS_IPV4")).To4()
+	return []net.Addr{&net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}}, true
 }
 
 func androidSnapshotFromEnvironment(getenv func(string) string) (Snapshot, bool) {

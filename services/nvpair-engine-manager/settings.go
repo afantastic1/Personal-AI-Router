@@ -121,6 +121,10 @@ func (e *Executor) launchStateLocked(engine string, st *engineState) settings.La
 	st.mu.Lock()
 	result := settings.LaunchState{Engine: engine, ServerPort: st.plat.Runtime.Port, EffectivePort: st.port, Running: st.running, Adopted: st.adopted, Format: launchTextFormat}
 	st.mu.Unlock()
+	if st.plat.Runtime.isHosted() {
+		result.Reason = "Launch settings are unsupported for hosted runtime."
+		return result
+	}
 	command, err := launchForState(st, result.ServerPort)
 	if err == nil {
 		result.LaunchText, err = command.argumentText(st.plat.Runtime.EditableLaunch)
@@ -246,6 +250,9 @@ func (e *Executor) previewLaunchLocked(st *engineState, request settings.Request
 		return result
 	}
 	rt := st.plat.Runtime
+	if rt.isHosted() {
+		return fail("Launch settings are unsupported for hosted runtime.")
+	}
 	policy := rt.EditableLaunch
 	if policy == nil {
 		return fail("This engine does not support launch settings.")
@@ -388,6 +395,9 @@ func (e *Executor) ConfigureLaunch(ctx context.Context, p settings.Configure, re
 	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
+	if err := st.plat.Runtime.rejectHostedLifecycle("launch editing"); err != nil {
+		return e.launchStateLocked(p.Engine, st), err
+	}
 	if err := ctx.Err(); err != nil {
 		return settings.LaunchState{}, err
 	}

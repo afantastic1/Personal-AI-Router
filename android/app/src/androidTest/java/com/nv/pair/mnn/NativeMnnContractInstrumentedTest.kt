@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -55,7 +55,7 @@ class NativeMnnContractInstrumentedTest {
 
             val result = runtime.generate(
                 requestId = 21,
-                request = MnnGenerationRequest("Reply with one short word.", maxTokens = 8)
+                request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")), maxTokens = 8)
             ) { chunk -> chunks.add(chunk) }
 
             assertTrue(result is MnnResult.Success)
@@ -76,7 +76,7 @@ class NativeMnnContractInstrumentedTest {
         val generationThread = Thread {
             resultHolder[0] = runtime.generate(
                 requestId = 22,
-                request = MnnGenerationRequest("Count slowly.", maxTokens = 512)
+                request = MnnChatRequest("qwen-device-test", listOf(MnnChatMessage(MnnChatRole.USER, "Count slowly.")), maxTokens = 512)
             ) { firstChunk.countDown() }
             generationFinished.countDown()
         }

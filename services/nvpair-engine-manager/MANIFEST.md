@@ -149,7 +149,7 @@ and recovery. Editing `args`/`start` directly remains trusted manifest authoring
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `mode` | string | no | `"process"` (default) — the engine is a foreground process this service spawns and **owns** (liveness = process alive) — or `"command"` — a daemon driven by start/stop commands (liveness = the probe). |
+| `mode` | string | no | `"process"` (default) — engine-manager owns a foreground process; `"command"` — engine-manager owns a daemon through start/stop commands; or `"hosted"` — the parent application owns lifecycle and engine-manager only probes health and runs declared query actions. Hosted mode requires `ready` and rejects lifecycle, port, install, uninstall, and launch-edit operations. |
 | `bin` | string | process mode | Path to the engine binary (required in `process` mode). Placeholders + OS env refs resolved. |
 | `args` | string[] | no | Arguments (process mode). |
 | `env` | object | no | Extra environment (merged over the inherited env). Use `{host}`/`{port}` for the listen address, e.g. `"OLLAMA_HOST": "{host}:{port}"`. |
@@ -157,7 +157,7 @@ and recovery. Editing `args`/`start` directly remains trusted manifest authoring
 | `bind` | string | no | Listen address, substituted as `{host}`. Empty ⇒ `127.0.0.1` (the safe default); an inference engine that serves the cluster sets `"0.0.0.0"` (Ollama does), overridable per call via `engine:start {bind}`. Probes always target loopback. |
 | `start` | string[][] | command mode | Ordered bring-up commands (each an argv) for `command` mode, e.g. `[["{cli}","server","start","--port","{port}"]]`. |
 | `cli` | string | no | The engine's control-CLI path for this platform, referenced as `{cli}` by start/stop/actions so the manifest's **global** actions resolve to the correct per-OS binary. |
-| `ready` | probe | no | Readiness probe; `start` waits for it before reporting Running. |
+| `ready` | probe | process/command: no; hosted: yes | Readiness probe; `start` waits for it before reporting Running. Hosted status uses this probe to identify the parent-owned service. |
 | `stop` | object | no | Process mode: `signal` (`"term"` default, or `"kill"`) + `grace_s` (seconds before force-kill). Command mode: `cmd` (argv) to bring the engine down. |
 | `health` | probe | no | Periodic liveness probe while Running; `interval_s` between checks. |
 
@@ -435,6 +435,7 @@ GPU selection, and auth.
 | **vLLM** | flags-first — **Linux/WSL only** | `vllm serve <model> --host 127.0.0.1 --port {port}` | flags (host/port/api-key); `HF_HOME` for cache. `VLLM_PORT`/`VLLM_HOST_IP` are **not** the API bind | OpenAI `/v1/models`; one model per process (unload = restart) |
 | **Jan** | hybrid (on llama.cpp router) | `jan serve <model> --port {port}` (CLI) | forwards `LLAMA_ARG_*`; perf settings are router-preset-driven | `jan serve` auto-downloads HF repos |
 | **GPT4All** | weak (GUI app) | none (Local API Server toggled in the GUI, `:4891`) | desktop settings / Python SDK — not env | OpenAI `/v1` once enabled in-app |
+| **MNN (Android)** | hosted by the PAIR app | parent-owned runtime on `127.0.0.1:14325` | Android app selects and manages model files | HTTP `/v1/models`, `/internal/models/loaded`; no engine-manager lifecycle |
 
 Caveats worth encoding when authoring these:
 - **Ollama `OLLAMA_MODELS`**: leave it at the default (`~/.ollama`) so models survive an `uninstall` that removes `{install_dir}` — **never** point it inside `{install_dir}`.

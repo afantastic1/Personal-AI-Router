@@ -154,7 +154,7 @@ func (e *Executor) reconcilePresence(ctx context.Context, engine string, st *eng
 	// A command-mode engine needs its control CLI. A compatible HTTP endpoint
 	// alone (for example another OpenAI server on LM Studio's port) is not an
 	// installation and must not suppress the installer.
-	if !pathInstalled && st.plat.Runtime.modeOrDefault() != "process" {
+	if !pathInstalled && st.plat.Runtime.modeOrDefault() == "command" {
 		return presenceResult{}
 	}
 

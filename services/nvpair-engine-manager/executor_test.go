@@ -78,6 +78,82 @@ func TestEngineHTTPClientsBoundResponseHeaders(t *testing.T) {
 	}
 }
 
+func TestHostedRuntimeProbesAndRejectsLifecycleOperations(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"models":["qwen3-1.7b"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := testEngineManifest("")
+	manifest.Engine = "hosted"
+	platform := manifest.Platforms[runtime.GOOS+"/"+runtime.GOARCH]
+	platform.Detect = nil
+	platform.Runtime = Runtime{
+		Mode:   "hosted",
+		Port:   port,
+		Ready:  &Probe{HTTP: "http://127.0.0.1:{port}/healthz", Status: http.StatusOK},
+		Health: &Probe{HTTP: "http://127.0.0.1:{port}/healthz", Status: http.StatusOK},
+	}
+	manifest.Platforms[runtime.GOOS+"/"+runtime.GOARCH] = platform
+	manifest.Actions = map[string]Action{
+		"list_models": {HTTP: &ActionHTTP{Method: http.MethodGet, Path: "/v1/models"}},
+	}
+	ex := newTestExecutor(t, manifest)
+
+	status, err := ex.Status("hosted")
+	if err != nil {
+		t.Fatalf("hosted status: %v", err)
+	}
+	if !status.Installed || !status.Running || !status.Healthy || status.Port != port {
+		t.Fatalf("hosted status = %+v, want installed/running/healthy on %d", status, port)
+	}
+	models, err := ex.Action(context.Background(), "hosted", "list_models", nil)
+	if err != nil || !strings.Contains(string(models), "qwen3-1.7b") {
+		t.Fatalf("hosted list_models = %s, %v", models, err)
+	}
+
+	operations := map[string]func() error{
+		"install":   func() error { return ex.Install(context.Background(), "hosted") },
+		"uninstall": func() error { return ex.Uninstall(context.Background(), "hosted") },
+		"start":     func() error { return ex.Start(context.Background(), "hosted") },
+		"stop":      func() error { return ex.Stop("hosted") },
+		"restart":   func() error { return ex.Restart(context.Background(), "hosted") },
+		"set-port":  func() error { _, err := ex.SetPort(context.Background(), "hosted", port+1); return err },
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); err == nil || !strings.Contains(err.Error(), "unsupported for hosted") {
+				t.Fatalf("hosted %s error = %v, want explicit unsupported error", name, err)
+			}
+		})
+	}
+	if err := ex.setDesiredEnabled("hosted", true); err != nil {
+		t.Fatalf("set hosted desired state: %v", err)
+	}
+	if err := ex.RestoreEnabled(context.Background()); err != nil {
+		t.Fatalf("restore hosted desired state: %v", err)
+	}
+	ex.StopAll()
+	status, err = ex.Status("hosted")
+	if err != nil || !status.Running || !status.Healthy {
+		t.Fatalf("hosted status after restore/shutdown = %+v, %v; parent-owned service must remain running", status, err)
+	}
+}
+
 func TestOnlyOllamaRunModelUsesSlowResponseHeaderBudget(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(100 * time.Millisecond)

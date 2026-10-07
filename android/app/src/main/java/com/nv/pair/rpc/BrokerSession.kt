@@ -49,6 +49,7 @@ class BrokerSession(
         val scheduler = binaries.scheduler()
         val workloadManager = binaries.workloadManager()
         val errors = binaries.errors()
+        val engineManager = binaries.engineManager()
         val runner = PairProcess(
             listOf(
                 broker.absolutePath,
@@ -59,6 +60,7 @@ class BrokerSession(
                 "--scheduler-path", scheduler.absolutePath,
                 "--workload-manager-path", workloadManager.absolutePath,
                 "--errors-path", errors.absolutePath,
+                "--engine-manager-path", engineManager.absolutePath,
             ),
             environment,
         )

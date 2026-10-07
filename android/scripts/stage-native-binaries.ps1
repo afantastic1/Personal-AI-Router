@@ -12,6 +12,7 @@ $buildOutputDir = Join-Path (Join-Path $PSScriptRoot '..') 'build/generated/pair
 $services = @(
     'nvpair-node-settings',
     'nvpair-ui-broker',
+    'nvpair-engine-manager',
     'nvpair-node-scanner',
     'nvpair-cluster-manager',
     'nvpair-proxy',

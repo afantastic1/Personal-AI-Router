@@ -59,12 +59,16 @@ func TestEngineAvailabilityWaitsForBothProxyOutcomes(t *testing.T) {
 	defer cancel()
 	done := make(chan bool, 1)
 	go func() {
-		done <- b.runEngineAvailabilityAfterPortGates(
-			ctx,
-			func(context.Context) { advertised <- "ollama" },
-			func(context.Context) { advertised <- "lmstudio" },
-		)
+		done <- b.runEngineAvailabilityAfterPortGates(ctx, func(context.Context) { advertised <- "hosted" }, func(context.Context) { advertised <- "port-gated" })
 	}()
+	select {
+	case got := <-advertised:
+		if got != "hosted" {
+			t.Fatalf("early advertising callback = %q, want hosted engines", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hosted engine advertising did not start independently of proxy port gates")
+	}
 
 	select {
 	case got := <-restore:
@@ -91,14 +95,13 @@ func TestEngineAvailabilityWaitsForBothProxyOutcomes(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("enabled-engine restore did not run after both proxy outcomes")
 	}
-	seen := map[string]bool{}
-	for len(seen) < 2 {
-		select {
-		case got := <-advertised:
-			seen[got] = true
-		case <-time.After(2 * time.Second):
-			t.Fatalf("advertising did not start for both engines: %v", seen)
+	select {
+	case got := <-advertised:
+		if got != "port-gated" {
+			t.Fatalf("advertising callback = %q, want port-gated engines", got)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("advertising did not start after both proxy outcomes")
 	}
 	if !<-done {
 		t.Fatal("availability orchestration reported cancellation")

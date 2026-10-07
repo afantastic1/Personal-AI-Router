@@ -66,8 +66,8 @@ if ($LASTEXITCODE -ne 0 -or $deviceAbis -notmatch '(^|,)arm64-v8a(,|$)') {
 
 $runId = [guid]::NewGuid().ToString('N')
 $remoteStage = "/data/local/tmp/pair-mnn-$runId"
-$privateModel = "files/mnn-acceptance-$runId"
-$privateSwitchModel = "files/mnn-model-switch-$runId"
+$privateModel = "files/mnn/models/qwen-device-test-$runId"
+$privateSwitchModel = "files/mnn/models/qwen-model-switch-test-$runId"
 $deviceModelArgument = "/data/user/0/com.nv.pair/$privateModel"
 $adbArgs = @('-s', $Serial)
 

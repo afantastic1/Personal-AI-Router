@@ -249,6 +249,17 @@ func TestResponderSendUsesMDNSSourcePortAlongsideReceiver(t *testing.T) {
 	}
 }
 
+func TestMulticastInterfaceByIndexUsesEnvironmentFallbackInterface(t *testing.T) {
+	interfaces := []net.Interface{{Index: 17, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast}}
+	got, ok := multicastInterfaceByIndex(17, interfaces)
+	if !ok || got.Name != "wlan0" {
+		t.Fatalf("multicastInterfaceByIndex = (%+v, %v), want wlan0", got, ok)
+	}
+	if _, ok := multicastInterfaceByIndex(18, interfaces); ok {
+		t.Fatal("multicastInterfaceByIndex found an unlisted interface")
+	}
+}
+
 func loopbackIPv4(t *testing.T) (*net.Interface, net.IP) {
 	t.Helper()
 	ifaces, err := net.Interfaces()

@@ -23,6 +23,7 @@ import com.nv.pair.data.ClusterInvite
 import com.nv.pair.data.RouterRepository
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.UiPreferencesRepository
+import com.nv.pair.mnn.MnnRuntimeContainer
 import com.nv.pair.network.MulticastLockManager
 import com.nv.pair.network.AndroidNetworkContext
 import com.nv.pair.rpc.BrokerSession
@@ -46,6 +47,7 @@ import com.nv.pair.runtime.RuntimePhase.WAITING_READY
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +72,7 @@ class PairRuntimeService : Service() {
     private lateinit var preferences: UiPreferencesRepository
     private lateinit var multicastLock: MulticastLockManager
     private var runtimeJob: Job? = null
+    private var mnnRuntimeContainer: MnnRuntimeContainer? = null
     private val activeSession = AtomicReference<BrokerSession?>()
     @Volatile
     private var foreground = false
@@ -131,6 +134,16 @@ class PairRuntimeService : Service() {
         val restartPolicy = BrokerRestartPolicy()
         try {
             multicastLock.acquire()
+            val container = withContext(Dispatchers.IO) {
+                MnnRuntimeContainer(File(filesDir, MNN_MODELS_DIRECTORY))
+            }
+            try {
+                withContext(Dispatchers.IO) { container.start() }
+                mnnRuntimeContainer = container
+            } catch (failure: Exception) {
+                withContext(NonCancellable + Dispatchers.IO) { container.close() }
+                throw failure
+            }
             while (currentCoroutineContext().isActive && runtimeState.value.desiredRunning) {
                 setPhase(STARTING)
                 val crash = CompletableDeferred<Int>()
@@ -143,6 +156,9 @@ class PairRuntimeService : Service() {
                     onWaitingReady = { setPhaseIf(STARTING, WAITING_READY) },
                     additionalEnvironment = mdnsEnvironment(),
                     onNotification = { notification ->
+                        if (notification.method.startsWith("cluster:invite-")) {
+                            android.util.Log.i(TAG, "cluster invite notification received method=${notification.method}")
+                        }
                         if (notification.method == "discovery:nodes-changed") {
                             val applied = runCatching {
                                 pairRepository.applyNodesChanged(parseNodesChanged(notification.paramsJson))
@@ -243,6 +259,11 @@ class PairRuntimeService : Service() {
             preferences.setDesiredRuntimeRunning(false)
             setDesiredRunning(false)
         } finally {
+            val container = mnnRuntimeContainer
+            mnnRuntimeContainer = null
+            if (container != null) {
+                withContext(NonCancellable + Dispatchers.IO) { container.close() }
+            }
             multicastLock.release()
         }
     }
@@ -260,8 +281,9 @@ class PairRuntimeService : Service() {
                 clusterRepository.setError("Could not notify cluster peers before PAIR stopped.")
                 android.util.Log.w(TAG, "cluster leave failed during runtime shutdown")
             }
-            withContext(Dispatchers.IO) { session.close() }
         }
+        closeMnnRuntime()
+        if (session != null) withContext(Dispatchers.IO) { session.close() }
         runtimeJob?.cancelAndJoin()
         runtimeJob = null
         activeSession.set(null)
@@ -272,6 +294,14 @@ class PairRuntimeService : Service() {
             foreground = false
         }
         stopSelfResult(startId)
+    }
+
+    private suspend fun closeMnnRuntime() {
+        val container = mnnRuntimeContainer
+        mnnRuntimeContainer = null
+        if (container != null) {
+            withContext(NonCancellable + Dispatchers.IO) { container.close() }
+        }
     }
 
     private fun finishStoppedService(startId: Int) {
@@ -485,6 +515,7 @@ class PairRuntimeService : Service() {
         private const val OPEN_REQUEST_CODE = 1
         private const val STOP_REQUEST_CODE = 2
         private const val CLUSTER_MANAGER_PORT = 14321
+        private const val MNN_MODELS_DIRECTORY = "mnn/models"
         private val stateLock = Any()
         private val _runtimeState = MutableStateFlow(PairRuntimeState.stopped())
         private val pairRepository = PairRepository()

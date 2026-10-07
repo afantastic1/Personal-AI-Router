@@ -26,6 +26,9 @@ func (e *Executor) Install(ctx context.Context, engine string) error {
 	if err != nil {
 		return err
 	}
+	if err := st.plat.Runtime.rejectHostedLifecycle("install"); err != nil {
+		return err
+	}
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
 	if ok, _ := e.Detect(engine); ok {
@@ -130,6 +133,9 @@ func (e *Executor) Install(ctx context.Context, engine string) error {
 func (e *Executor) Uninstall(ctx context.Context, engine string) error {
 	st, err := e.state(engine)
 	if err != nil {
+		return err
+	}
+	if err := st.plat.Runtime.rejectHostedLifecycle("uninstall"); err != nil {
 		return err
 	}
 	st.opMu.Lock()

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync/atomic"
 
@@ -45,6 +46,10 @@ const (
 	// and has an official stop command for it, so it may be stopped and
 	// repositioned before the proxy starts. LM Studio.
 	managedEngine
+
+	// hostedEngine — the parent application owns lifecycle and engine-manager
+	// only probes/queries the endpoint. MNN on Android.
+	hostedEngine
 )
 
 // engineProxyProfile is everything the broker needs to supervise one engine's
@@ -167,6 +172,7 @@ func buildEngineProxyProfiles() []engineProxyProfile {
 		// LM Studio is the one engine engine-manager may move while running:
 		// its identified command-mode runtime has an official stop command.
 		"lmstudio": {Ownership: managedEngine, HealthProbePath: "/v1/models"},
+		"mnn":      {Ownership: hostedEngine, HealthProbePath: "/healthz"},
 	}
 	out := make([]engineProxyProfile, 0, len(engines.All()))
 	for _, e := range engines.All() {
@@ -350,7 +356,7 @@ func engineProxyProfileFor(name string) (engineProxyProfile, bool) {
 // is what settles its ownership gate. Skipping the branch entirely would leave
 // the gate closed and strand every engine request behind it.
 func (b *Broker) proxyEnabled(p engineProxyProfile) bool {
-	if b.proxyPath == "" {
+	if b.proxyPath == "" || !p.SupportsProxyPlatform(runtime.GOOS+"/"+runtime.GOARCH) {
 		return false
 	}
 	for _, name := range b.proxyEngines {
@@ -583,6 +589,15 @@ func planManagedEnginePorts(p engineProxyProfile, enabled bool, st ollamaPortSta
 		return managedPortPlan{}
 	}
 	facade, backendStart := p.FacadePort, p.EnginePortBase
+	if p.Ownership == hostedEngine {
+		if st.Running && st.Port == facade {
+			return managedPortPlan{Blocked: fmt.Sprintf("%s backend is running on the facade port", p.DisplayName)}
+		}
+		if !available(facade) {
+			return managedPortPlan{Blocked: "the compatibility port is already in use"}
+		}
+		return managedPortPlan{Enabled: true}
+	}
 
 	// An engine already running on the facade that the broker may not move is
 	// the end of the story: it owns the port and there is nothing to plan.

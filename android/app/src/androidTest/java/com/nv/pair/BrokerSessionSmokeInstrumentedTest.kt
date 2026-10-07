@@ -13,6 +13,7 @@ import com.nv.pair.rpc.ClusterApi
 import com.nv.pair.rpc.RouterApi
 import com.nv.pair.data.ClusterRepository
 import com.nv.pair.data.RouterRepository
+import com.nv.pair.mnn.MnnRuntimeContainer
 import com.nv.pair.runtime.NativeBinaryRegistry
 import java.io.File
 import java.io.IOException
@@ -49,6 +50,58 @@ class BrokerSessionSmokeInstrumentedTest {
     }
 
     @Test
+    fun brokerProbesHostedMnnAndDoesNotStopItsParentOwnedRuntime() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val runtime = MnnRuntimeContainer(File(context.filesDir, "mnn/models"))
+        val session = BrokerSession(
+            NativeBinaryRegistry(File(context.applicationInfo.nativeLibraryDir)),
+            context.filesDir,
+            context.cacheDir,
+        )
+        try {
+            runtime.start()
+            session.start()
+
+            val statusParams = JSONObject().put("engine", "mnn")
+            val status = session.request("engine:status", statusParams)
+            assertTrue("MNN hosted engine was not reported installed", status.optBoolean("installed"))
+            assertTrue("MNN hosted engine was not reported running", status.optBoolean("running"))
+            assertTrue("MNN hosted engine was not reported healthy", status.optBoolean("healthy"))
+            assertEquals(14325, status.optInt("port"))
+
+            val inventory = session.request("engine:models")
+            val byEngine = inventory.optJSONObject("modelsByEngine")
+            assertTrue("MNN model inventory was not present", byEngine?.has("mnn") == true)
+
+            val facade = awaitReadyProxy(session, "mnn-proxy:get-status")
+            assertEquals(14324, facade.optInt("port"))
+            val stop = runCatching { session.request("engine:stop", statusParams) }
+            assertTrue("hosted MNN stop unexpectedly succeeded", stop.isFailure)
+            val afterStop = session.request("engine:status", statusParams)
+            assertTrue("broker stopped the parent-owned MNN runtime", afterStop.optBoolean("running"))
+            val discoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+            var discoveredMnn = false
+            while (System.nanoTime() < discoveryDeadline && !discoveredMnn) {
+                val nodes = session.request("discovery:get-nodes").optJSONArray("nodes")
+                if (nodes != null) {
+                    for (index in 0 until nodes.length()) {
+                        val modelsByEngine = nodes.optJSONObject(index)?.optJSONObject("modelsByEngine")
+                        if (modelsByEngine?.has("mnn") == true) {
+                            discoveredMnn = true
+                            break
+                        }
+                    }
+                }
+                if (!discoveredMnn) Thread.sleep(250)
+            }
+            assertTrue("PAIR discovery did not expose modelsByEngine.mnn", discoveredMnn)
+        } finally {
+            session.close()
+            runtime.close()
+        }
+    }
+
+    @Test
     fun androidProxyServesItsOpenAiModelRoute() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val session = BrokerSession(
@@ -69,6 +122,32 @@ class BrokerSessionSmokeInstrumentedTest {
                 val responseCode = responseLine.split(' ').getOrNull(1)?.toIntOrNull()
                 assertTrue("proxy did not return an HTTP response", responseLine.startsWith("HTTP/1."))
                 assertTrue("proxy did not recognize the OpenAI model-list route", responseCode != 404)
+            }
+        } finally {
+            session.close()
+        }
+    }
+
+    @Test
+    fun unifiedGatewayServesOpenAiModelListOnLoopback() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val session = BrokerSession(
+            NativeBinaryRegistry(File(context.applicationInfo.nativeLibraryDir)),
+            context.filesDir,
+            context.cacheDir,
+        )
+        try {
+            session.start()
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress("127.0.0.1", 14326), 5_000)
+                socket.soTimeout = 5_000
+                socket.getOutputStream().write(
+                    "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".toByteArray(),
+                )
+                val response = socket.getInputStream().bufferedReader().readText()
+                assertTrue("gateway did not serve HTTP 200", response.startsWith("HTTP/1.1 200"))
+                assertTrue("gateway did not return the OpenAI list shape", response.contains("\"object\":\"list\""))
+                assertTrue("gateway leaked engine/node details", !response.contains("127.0.0.1:14325"))
             }
         } finally {
             session.close()

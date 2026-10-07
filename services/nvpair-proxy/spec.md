@@ -96,6 +96,21 @@ is a genuine limitation, not a safety margin (§5.6).
 
 The process starts with **no engine and no listener**. The broker then sends one
 `facade/enable` per engine, carrying that engine's port and any alias addresses.
+After at least one facade is enabled, it sends process-scoped
+`gateway/enable` with port `14326`. The gateway binds only `127.0.0.1`, is not a
+facade or discovery service, and serves the OpenAI model-list and chat
+completion routes. It resolves an explicit model to an engine using loaded
+inventory first and the centralized `mnn`, `ollama`, `lmstudio` preference for
+ties, then delegates to that facade's existing request handler. Node scheduling
+remains owned by the existing facade path.
+
+The model directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
+`auto-best`. `auto` resolves to `auto-balanced`. These aliases choose a model
+and engine from enabled runtime inventory only; catalog entries do not become
+candidates until an engine reports them as available. The shared model
+selector applies capability eligibility and policy scoring, then delegates
+through the selected facade so node placement remains unchanged. The gateway
+does not browse catalogs or install models.
 
 A flag cannot express this. The broker plans a different port for each engine —
 Ollama's managed facade wants `:11434` while LM Studio's wants `:1234`, and
@@ -549,12 +564,19 @@ untouched, the primary listener stays up, and a warning is reported.
 
 ## 8. Ports
 
-| | Ollama | LM Studio |
-| --- | --- | --- |
-| Engine's own client-facing port | 11434 | 1234 |
-| Where PAIR relocates the engine | 11435 | 1235 |
-| Standalone port, when `port` is omitted | 11435 | 1234 |
-| Persisted-port file | `proxy-port.json` | `lmstudio-proxy-port.json` |
+| | Ollama | LM Studio | MNN (Android) |
+| --- | --- | --- | --- |
+| Engine's own client-facing port | 11434 | 1234 | 14325 |
+| Where PAIR relocates the engine | 11435 | 1235 | parent-owned |
+| Standalone port, when `port` is omitted | 11435 | 1234 | 14324 |
+| Persisted-port file | `proxy-port.json` | `lmstudio-proxy-port.json` | `mnn-proxy-port.json` |
+
+MNN is a hosted Android runtime. The broker owns its facade at `:14324`, while
+the Android application owns the engine at `:14325`; the proxy never moves or
+stops that runtime. Desktop brokers may also host an MNN routing facade at
+`:14324` to reach a remote Android owner. Only Android advertises a hosted MNN
+runtime. Its health path is `/healthz`, and its OpenAI-compatible routes are
+`GET /v1/models` and `POST /v1/chat/completions`.
 
 A port chosen at runtime via `set-port` is persisted per engine and restored
 when that facade is enabled, taking precedence over the requested port, so the

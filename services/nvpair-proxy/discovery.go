@@ -40,7 +40,8 @@ type Node struct {
 	// snapshot. Model-bearing inference is eligible only when this list
 	// advertises the requested model; an empty list stays in discovery but is
 	// not an inference candidate until a later inventory update.
-	Models []string `json:"models,omitempty"`
+	Models       []string `json:"models,omitempty"`
+	LoadedModels []string `json:"-"`
 	// IP is the single canonical LAN address a consumer should dial/display for
 	// this node, resolved via the shared netpick ranker: the node's
 	// own ip= TXT if present, else the best-scored advertised IPv4. It is
@@ -152,7 +153,7 @@ func (d *Discovery) SetSubscribed(nodes []Node) (discovered, updated, removed []
 func nodeEqual(a, b Node) bool {
 	return a.ID == b.ID && a.Host == b.Host && a.Port == b.Port && a.IP == b.IP &&
 		slices.Equal(a.Addresses, b.Addresses) && slices.Equal(a.TXT, b.TXT) &&
-		slices.Equal(a.Models, b.Models)
+		slices.Equal(a.Models, b.Models) && slices.Equal(a.LoadedModels, b.LoadedModels)
 }
 
 func (d *Discovery) AddManual(node Node) (added bool) {

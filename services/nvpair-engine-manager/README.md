@@ -5,11 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # nvpair-engine-manager
 
-A config-driven control plane for local inference engines (Ollama today;
-Intel/others via a dropped-in manifest). It manages everything about an
-engine **except serving inference**: detect, user-mode install,
-start/stop/restart, health, and config-declared actions. Adding an engine
-is a JSON manifest, not code.
+A config-driven control plane for local inference engines. It manages declared
+process and command engine lifecycles, and can probe/query a hosted engine whose
+parent application owns its lifecycle. All modes share health checks and
+manifest-declared actions; hosted mode explicitly refuses install, uninstall,
+start, stop, restart, port changes, and launch editing.
 
 The bundled manifests under `manifests/` are the working reference for manifest
 authoring.
@@ -105,6 +105,14 @@ Moving a **running, adopted** engine is **refused** with an error (nothing is
 persisted) — NVPAIR can't relocate a process it didn't start; see Adoption below.
 
 ## Lifecycle
+
+`runtime.mode` selects the ownership contract:
+
+- `process`: engine-manager starts and stops the foreground process.
+- `command`: engine-manager runs the manifest's daemon start/stop commands.
+- `hosted`: the parent owns lifecycle; engine-manager only probes the fixed
+  endpoint and runs declared query actions. The Android MNN manifest uses this
+  mode, so broker shutdown never stops the MNN HTTP service.
 
 Combined launch/server/proxy edits use the broker's
 [engine settings protocol](../nvpair-ui-broker/ENGINE_SETTINGS.md). The worker

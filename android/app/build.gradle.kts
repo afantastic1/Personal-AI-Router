@@ -27,13 +27,25 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         testInstrumentationRunnerArguments["pairMnnModelDir"] =
             project.findProperty("pairMnnDeviceModelDir")?.toString().orEmpty()
+        testInstrumentationRunnerArguments["pairModelId"] =
+            project.findProperty("pairMnnDeviceModelId")?.toString().orEmpty()
         val modelSwitchFixture = project.findProperty("pairMnnModelSwitchDeviceDir")?.toString().orEmpty()
+        val excludedInstrumentedTests = mutableListOf(
+            "com.nv.pair.M65AndroidToPcRoutingInstrumentedTest",
+        )
+        val m10Acceptance = project.findProperty("pairM10Acceptance")?.toString()?.equals("true", ignoreCase = true) == true
+        if (m10Acceptance) {
+            testInstrumentationRunnerArguments["pairHostIp"] = project.findProperty("pairM10PcAddress")?.toString().orEmpty()
+            testInstrumentationRunnerArguments["class"] = "com.nv.pair.M10PcToAndroidMnnInstrumentedTest"
+        } else {
+            excludedInstrumentedTests += "com.nv.pair.M10PcToAndroidMnnInstrumentedTest"
+        }
         if (modelSwitchFixture.isBlank()) {
-            testInstrumentationRunnerArguments["notClass"] =
-                "com.nv.pair.mnn.MnnModelSwitchInstrumentedTest"
+            excludedInstrumentedTests += "com.nv.pair.mnn.MnnModelSwitchInstrumentedTest"
         } else {
             testInstrumentationRunnerArguments["pairMnnModelSwitchDir"] = modelSwitchFixture
         }
+        testInstrumentationRunnerArguments["notClass"] = excludedInstrumentedTests.joinToString(",")
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -105,6 +117,8 @@ val selectedMnnArtifactsDir = mnnArtifactsDir.map { directory ->
 val buildMnnRuntime = tasks.register<Exec>("buildMnnRuntime") {
     inputs.property("mnnSourceRevision", "d407447ed56c4121a11ccbd266dc184ca1ead0c2")
     inputs.property("mnnRuntimeVariant", mnnRuntimeVariant)
+    inputs.file(rootProject.file("scripts/build-mnn.ps1"))
+    inputs.file(rootProject.file("patches/mnn-request-sampler.patch"))
     outputs.file(selectedMnnArtifactsDir.map { it.file("source-revision.txt") })
     val buildArguments = mutableListOf(
         "powershell.exe",
