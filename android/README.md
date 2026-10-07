@@ -26,9 +26,17 @@ POST /internal/models/load
 POST /internal/models/unload
 ```
 
-Install each model as one directory below the app-private `files/mnn/models/` directory. The directory name is the exact model ID exposed by `/v1/models`. One model may be loaded and one generation may run at a time; a simultaneous generation returns `409 engine_busy`. Stopping PAIR first stops HTTP acceptance, cancels any active generation, unloads MNN, closes port 14325, and then shuts down the broker.
+Install each model as one directory below the app-private `files/mnn/models/` directory. The directory name is the exact model ID exposed by `/v1/models`. One model may be loaded and one generation may run at a time; a simultaneous generation returns `409 engine_busy`. Stopping PAIR first stops HTTP acceptance and requests cancellation of any active generation. HTTP workers and native runtime shutdown each have a 10-second bound, so full MNN container shutdown can take up to 20 seconds. If native inference does not return, PAIR continues stopping and logs that native resources may remain allocated until process exit. In that case, MNN may not unload cleanly, but the PAIR foreground service does not wait indefinitely for the optional engine. A native call that never returns cannot be safely force-killed in-process; isolating MNN in a separate process is future work.
 
-Chat completions accept structured `system`, `user`, and `assistant` messages. MNN applies the model's chat template. Both streamed SSE and non-streamed responses support `max_tokens`, `temperature`, `top_p`, and `seed`; unsupported OpenAI capabilities return an explicit HTTP 400 response.
+The Models tab stores the preferred MNN compute engine as `cpu` or `opencl` in
+DataStore. The choice applies to the next implicit model load and is restored
+when PAIR starts. `POST /internal/models/load` with a `backend` value also
+changes the process-local preference for subsequent model loads, but does not
+persist it; a later UI selection replaces that runtime override, and restarting
+PAIR restores the saved UI choice. If OpenCL is unsupported, the request returns
+`422 backend_unsupported` without falling back to CPU.
+
+Chat completions accept structured `system`, `user`, and `assistant` messages. MNN applies the model's chat template. Both streamed SSE and non-streamed responses support `max_tokens`, `temperature`, `top_p`, and `seed`; the native runtime's terminal status maps to `finish_reason: stop` or `finish_reason: length`. Error responses keep HTTP status, OpenAI error type, and error code aligned. Unsupported OpenAI capabilities return an explicit HTTP 400 response.
 
 ## PAIR local OpenAI API
 
@@ -48,14 +56,18 @@ separate from models reported by PAIR runtime inventory. Catalog metadata can
 describe installation candidates, but automatic selection only uses models
 currently advertised by a runtime. Local MNN imports and verified catalog
 downloads are installed under app-private `files/mnn/models/`; downloads resume
-partial transfers and verify SHA-256 before publishing the model directory.
+partial transfers and verify each artifact against trusted SHA-256 metadata
+before atomically publishing the model directory. Catalog entries without
+complete artifact metadata remain browsable, while Verified Install stays
+disabled with a specific verification or artifact availability status. Local
+imports validate the MNN files independently of remote checksum metadata.
 Installed models can be removed from this screen.
 
 The unified API advertises `auto`, `auto-fast`, `auto-balanced`, and `auto-best`
-in addition to explicit model IDs. `auto` maps to `auto-balanced`. The selector
-filters by request capabilities, availability, context, memory, and
-compatibility, then chooses a model and engine using the selected policy. The
-existing engine facade still chooses the node and records workload attribution.
+in addition to explicit model IDs. The Android Models screen reads those IDs
+from the gateway model list. Go owns automatic model and engine selection,
+including request capability filtering; the existing engine facade still
+chooses the node and records workload attribution.
 
 For the M11 device acceptance, use a third-party OpenAI-compatible chat app on
 the phone, set Base URL to `http://127.0.0.1:14326/v1`, and use `pair-local` if

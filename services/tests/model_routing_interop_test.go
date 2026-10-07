@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -153,5 +154,39 @@ func TestStrictModelRoutingAcrossProcesses(t *testing.T) {
 				t.Fatalf("ownerless request reached an upstream: hits %v -> %v", before, after)
 			}
 		})
+	}
+}
+
+func TestGatewayBindConflictLeavesEngineProxiesReady(t *testing.T) {
+	if portBusy(11435) || portBusy(1234) {
+		t.Skip("ollama-proxy (11435) or lmstudio-proxy (1234) default port already in use; skipping")
+	}
+
+	var gatewayListener net.Listener
+	if !portBusy(14326) {
+		listener, err := net.Listen("tcp", "127.0.0.1:14326")
+		if err != nil {
+			t.Fatalf("reserve OpenAI gateway port for conflict case: %v", err)
+		}
+		gatewayListener = listener
+		defer gatewayListener.Close()
+	}
+
+	stdin, msgs, stderr, cleanup := startBrokerWith(t,
+		"--proxy-path", proxyBin,
+		"--proxy-engines", "ollama,lmstudio",
+	)
+	t.Cleanup(cleanup)
+	go func() {
+		for range stderr {
+		}
+	}()
+
+	waitForMethod(t, msgs, "app:ready", 10*time.Second)
+	if port := waitProxyReady(t, stdin, msgs, 15*time.Second); port <= 0 {
+		t.Fatalf("ollama-proxy reported invalid port %d", port)
+	}
+	if port := waitLMStudioProxyReady(t, stdin, msgs, 15*time.Second); port <= 0 {
+		t.Fatalf("lmstudio-proxy reported invalid port %d", port)
 	}
 }

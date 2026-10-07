@@ -46,7 +46,7 @@ class ResumableModelDownloaderTest {
     }
 
     @Test
-    fun restartsWhenServerIgnoresRangeAndRejectsHashMismatch() {
+    fun hashMismatchDeletesPartFileAndDoesNotPublishDestination() {
         val content = "complete artifact".toByteArray()
         val server = ModelDownloadServer { DownloadResponse(200, content) }
         val directory = Files.createTempDirectory("pair-model-download").toFile()

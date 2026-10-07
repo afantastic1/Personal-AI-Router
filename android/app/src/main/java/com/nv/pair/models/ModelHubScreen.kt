@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -35,18 +37,27 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.nv.pair.data.PairNode
+import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.mnn.MnnModelCatalog
-import com.nv.pair.models.ModelCapability.CHAT
+import com.nv.pair.runtime.MnnLocalEngineStatus
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun ModelHubScreen(nodes: List<PairNode>) {
+fun ModelHubScreen(
+    nodes: List<PairNode>,
+    gatewayModelIds: List<String>?,
+    preferredBackend: MnnBackend,
+    localEngineStatus: MnnLocalEngineStatus,
+    onBackendChange: (MnnBackend) -> Unit,
+) {
     val context = LocalContext.current
     val modelRoot = remember { File(context.filesDir, "mnn/models") }
     val scope = rememberCoroutineScope()
@@ -105,6 +116,28 @@ fun ModelHubScreen(nodes: List<PairNode>) {
             "Search model catalogs, install verified MNN models to this device, or import files from local storage.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("MNN Compute Engine", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "The selected engine applies to the next MNN model request.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Column(Modifier.selectableGroup()) {
+                    MnnBackendOption("CPU", MnnBackend.CPU, preferredBackend, onBackendChange)
+                    MnnBackendOption("OpenCL", MnnBackend.OPENCL, preferredBackend, onBackendChange)
+                }
+                if (
+                    preferredBackend == MnnBackend.OPENCL &&
+                    localEngineStatus.errorCode == MnnErrorCode.BACKEND_UNSUPPORTED
+                ) {
+                    Text(
+                        "OpenCL is not available on this device/runtime. CPU remains available.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Catalog", style = MaterialTheme.typography.titleLarge)
@@ -217,13 +250,13 @@ fun ModelHubScreen(nodes: List<PairNode>) {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("PAIR runtime inventory", style = MaterialTheme.typography.titleLarge)
-                Text("Only these advertised models are eligible for Auto selection.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Models advertised by the PAIR gateway are available to local API clients.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 val inventory = remember(nodes) { ModelInventoryRepository().fromNetwork(nodes) }
                 if (inventory.isEmpty()) {
                     Text("No models are currently available in the PAIR network.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
                     inventory.forEach { item ->
-                        Text("${item.model.engineModelId} · ${item.engine} · ${item.nodeId}${if (item.loaded) " · loaded" else ""}")
+                        Text("${item.modelId} · ${item.engine} · ${item.nodeId}${if (item.loaded) " · loaded" else ""}")
                     }
                 }
             }
@@ -232,11 +265,15 @@ fun ModelHubScreen(nodes: List<PairNode>) {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Automatic model policies", style = MaterialTheme.typography.titleLarge)
-                Text("auto → auto-balanced")
-                Text("auto-fast · prefers loaded and smaller models")
-                Text("auto-balanced · weighs quality and loaded state")
-                Text("auto-best · prefers model capability and size")
-                Text("The existing PAIR scheduler still chooses the node.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val aliases = gatewayModelIds?.filter { it == "auto" || it.startsWith("auto-") }.orEmpty()
+                if (gatewayModelIds == null) {
+                    Text("Automatic model aliases are unavailable while the gateway model list cannot be read.")
+                } else if (aliases.isEmpty()) {
+                    Text("The gateway is not advertising automatic model aliases.")
+                } else {
+                    aliases.forEach { alias -> Text(alias) }
+                }
+                Text("The Go gateway chooses the model and engine; the existing PAIR scheduler chooses the node.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
@@ -268,6 +305,26 @@ fun ModelHubScreen(nodes: List<PairNode>) {
 }
 
 @Composable
+private fun MnnBackendOption(
+    label: String,
+    backend: MnnBackend,
+    preferredBackend: MnnBackend,
+    onBackendChange: (MnnBackend) -> Unit,
+) {
+    val selected = backend == preferredBackend
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, role = Role.RadioButton) { onBackendChange(backend) }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = null)
+        Text(label, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
 private fun SourceChoice(label: String, selected: Boolean, onSelect: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         RadioButton(selected = selected, onClick = onSelect)
@@ -277,10 +334,8 @@ private fun SourceChoice(label: String, selected: Boolean, onSelect: () -> Unit)
 
 @Composable
 private fun ModelCatalogCard(descriptor: ModelDescriptor, busy: Boolean, onInstall: () -> Unit) {
-    val requiredArtifacts = setOf("config.json", "llm.mnn", "llm.mnn.weight", "tokenizer.txt")
-    val filesByPath = descriptor.files.associateBy(ModelFile::path)
-    val hasChecksums = requiredArtifacts.all { filesByPath[it]?.sha256 != null }
-    val supported = descriptor.format == ModelFormat.MNN && hasChecksums
+    val installability = descriptor.installability()
+    val supported = installability == ModelInstallability.VERIFIED_INSTALLABLE
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(descriptor.displayName, style = MaterialTheme.typography.titleMedium)
@@ -292,7 +347,12 @@ private fun ModelCatalogCard(descriptor: ModelDescriptor, busy: Boolean, onInsta
             )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    if (supported) "SHA-256 verified MNN files available" else "MNN files with SHA-256 checksums required",
+                    when (installability) {
+                        ModelInstallability.VERIFIED_INSTALLABLE -> "SHA-256 verified MNN files available"
+                        ModelInstallability.MISSING_VERIFICATION_METADATA -> "Verification metadata unavailable"
+                        ModelInstallability.UNSUPPORTED_FORMAT -> "Unsupported model format"
+                        ModelInstallability.INCOMPLETE_ARTIFACT_SET -> "Required MNN artifacts unavailable"
+                    },
                     modifier = Modifier.weight(1f),
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -313,7 +373,6 @@ private fun installedModels(modelRoot: File): List<ModelDescriptor> = MnnModelCa
         parameterCount = inferParameters(model.modelId),
         quantization = null,
         contextLength = null,
-        capabilities = setOf(CHAT),
         source = ModelSource(ModelSourceKind.LOCAL, model.configPath),
         format = ModelFormat.MNN,
         estimatedMemoryBytes = File(model.configPath).parentFile?.walkTopDown()?.filter(File::isFile)?.sumOf(File::length),

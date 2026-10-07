@@ -24,6 +24,9 @@ import com.nv.pair.data.RouterRepository
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.UiPreferencesRepository
 import com.nv.pair.mnn.MnnRuntimeContainer
+import com.nv.pair.mnn.MnnErrorCode
+import com.nv.pair.mnn.MnnSettingsRepository
+import com.nv.pair.mnn.MnnBackend
 import com.nv.pair.network.MulticastLockManager
 import com.nv.pair.network.AndroidNetworkContext
 import com.nv.pair.rpc.BrokerSession
@@ -70,6 +73,7 @@ class PairRuntimeService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commandMutex = Mutex()
     private lateinit var preferences: UiPreferencesRepository
+    private lateinit var mnnSettings: MnnSettingsRepository
     private lateinit var multicastLock: MulticastLockManager
     private var runtimeJob: Job? = null
     private var mnnRuntimeContainer: MnnRuntimeContainer? = null
@@ -80,6 +84,12 @@ class PairRuntimeService : Service() {
     override fun onCreate() {
         super.onCreate()
         preferences = UiPreferencesRepository(applicationContext)
+        mnnSettings = MnnSettingsRepository(applicationContext)
+        serviceScope.launch {
+            mnnSettings.preferredBackend.collect { backend ->
+                applyPreferredMnnBackend(backend)
+            }
+        }
         multicastLock = MulticastLockManager(applicationContext)
         createNotificationChannel()
     }
@@ -87,6 +97,9 @@ class PairRuntimeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> serviceScope.launch { commandMutex.withLock { stopRuntime(startId) } }
+            ACTION_MNN_BACKEND_CHANGED -> serviceScope.launch {
+                applyPreferredMnnBackend(MnnBackend.fromPreferenceValue(intent.getStringExtra(EXTRA_MNN_BACKEND)))
+            }
             ACTION_CLUSTER_CREATE, ACTION_CLUSTER_INVITE, ACTION_CLUSTER_RESPOND,
             ACTION_CLUSTER_CANCEL, ACTION_CLUSTER_LEAVE, ACTION_CLUSTER_REMOVE ->
                 serviceScope.launch { performClusterAction(intent.action.orEmpty(), intent) }
@@ -134,16 +147,7 @@ class PairRuntimeService : Service() {
         val restartPolicy = BrokerRestartPolicy()
         try {
             multicastLock.acquire()
-            val container = withContext(Dispatchers.IO) {
-                MnnRuntimeContainer(File(filesDir, MNN_MODELS_DIRECTORY))
-            }
-            try {
-                withContext(Dispatchers.IO) { container.start() }
-                mnnRuntimeContainer = container
-            } catch (failure: Exception) {
-                withContext(NonCancellable + Dispatchers.IO) { container.close() }
-                throw failure
-            }
+            val mnnAvailable = startOptionalMnnRuntime()
             while (currentCoroutineContext().isActive && runtimeState.value.desiredRunning) {
                 setPhase(STARTING)
                 val crash = CompletableDeferred<Int>()
@@ -155,6 +159,7 @@ class PairRuntimeService : Service() {
                     onCrash = { code -> crash.complete(code) },
                     onWaitingReady = { setPhaseIf(STARTING, WAITING_READY) },
                     additionalEnvironment = mdnsEnvironment(),
+                    proxyEngines = BrokerSession.proxyEnginesForLocalMnn(mnnAvailable),
                     onNotification = { notification ->
                         if (notification.method.startsWith("cluster:invite-")) {
                             android.util.Log.i(TAG, "cluster invite notification received method=${notification.method}")
@@ -224,14 +229,14 @@ class PairRuntimeService : Service() {
                         setPhase(CRASHED, error = "PAIR broker exited with code $exitCode")
                     } finally {
                         proxyMonitor.cancelAndJoin()
-                        routerRepository.setProxyStatus(EngineProxyStatus("ollama", false, 0))
-                        routerRepository.setProxyStatus(EngineProxyStatus("lmstudio", false, 0))
+                        routerRepository.resetProxyStatuses()
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
                     setPhase(STARTUP_FAILED, error = failure.message ?: "PAIR broker failed to start")
                 } finally {
+                    routerRepository.resetProxyStatuses()
                     activeSession.compareAndSet(session, null)
                     withContext(Dispatchers.IO) { session.close() }
                     clusterRepository.clearPendingInvites()
@@ -259,12 +264,74 @@ class PairRuntimeService : Service() {
             preferences.setDesiredRuntimeRunning(false)
             setDesiredRunning(false)
         } finally {
+            routerRepository.resetProxyStatuses()
             val container = mnnRuntimeContainer
             mnnRuntimeContainer = null
             if (container != null) {
                 withContext(NonCancellable + Dispatchers.IO) { container.close() }
             }
+            _mnnLocalEngine.value = MnnLocalEngineStatus(available = false)
             multicastLock.release()
+        }
+    }
+
+    private suspend fun startOptionalMnnRuntime(): Boolean {
+        _mnnLocalEngine.value = MnnLocalEngineStatus(available = false)
+        var candidate: MnnRuntimeContainer? = null
+        try {
+            val container = withContext(Dispatchers.IO) {
+                MnnRuntimeContainer(
+                    File(filesDir, MNN_MODELS_DIRECTORY),
+                    preferredBackend = mnnSettings.readPreferredBackend(),
+                )
+            }
+            candidate = container
+            withContext(Dispatchers.IO) { container.start() }
+            val health = withContext(Dispatchers.IO) { container.health() }
+            if (!health.available) {
+                closeUnstartedMnnContainer(container)
+                val errorCode = health.error?.code ?: MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE
+                _mnnLocalEngine.value = MnnLocalEngineStatus(
+                    available = false,
+                    backend = _preferredMnnBackend.value,
+                    errorCode = errorCode,
+                )
+                android.util.Log.w(TAG, "local MNN unavailable code=${errorCode.name.lowercase()}")
+                return false
+            }
+            mnnRuntimeContainer = container
+            val preferredBackend = withContext(Dispatchers.IO) { mnnSettings.readPreferredBackend() }
+            container.setPreferredBackend(preferredBackend)
+            _preferredMnnBackend.value = preferredBackend
+            _mnnLocalEngine.value = MnnLocalEngineStatus(available = true, backend = preferredBackend)
+            return true
+        } catch (cancelled: CancellationException) {
+            candidate?.let { closeUnstartedMnnContainer(it) }
+            throw cancelled
+        } catch (_: Exception) {
+            candidate?.let { closeUnstartedMnnContainer(it) }
+            val errorCode = MnnErrorCode.INTERNAL_ERROR
+            _mnnLocalEngine.value = MnnLocalEngineStatus(
+                available = false,
+                backend = _preferredMnnBackend.value,
+                errorCode = errorCode,
+            )
+            android.util.Log.w(TAG, "local MNN startup failed code=${errorCode.name.lowercase()}")
+            return false
+        }
+    }
+
+    private fun applyPreferredMnnBackend(backend: MnnBackend) {
+        _preferredMnnBackend.value = backend
+        mnnRuntimeContainer?.setPreferredBackend(backend)
+        if (_mnnLocalEngine.value.available) {
+            _mnnLocalEngine.value = _mnnLocalEngine.value.copy(backend = backend, errorCode = null)
+        }
+    }
+
+    private suspend fun closeUnstartedMnnContainer(container: MnnRuntimeContainer) {
+        withContext(NonCancellable + Dispatchers.IO) {
+            runCatching { container.close() }
         }
     }
 
@@ -332,11 +399,21 @@ class PairRuntimeService : Service() {
 
     private suspend fun monitorProxyStatus(session: BrokerSession) {
         while (currentCoroutineContext().isActive && activeSession.get() === session && runtimeState.value.phase == RUNNING) {
-            for (engine in listOf("ollama", "lmstudio")) {
+            for (engine in RouterRepository.ROUTER_ENGINES) {
                 val status = runCatching {
                     withContext(Dispatchers.IO) { RouterApi(session).proxyStatus(engine) }
                 }.getOrNull() ?: EngineProxyStatus(engine, false, 0)
                 routerRepository.setProxyStatus(status)
+            }
+            mnnRuntimeContainer?.let { container ->
+                val (health, status) = withContext(Dispatchers.IO) {
+                    container.health() to container.runtimeStatus()
+                }
+                _mnnLocalEngine.value = MnnLocalEngineStatus(
+                    available = health.available,
+                    backend = container.preferredBackend(),
+                    errorCode = status.error?.code,
+                )
             }
             delay(2_000)
         }
@@ -499,6 +576,7 @@ class PairRuntimeService : Service() {
     companion object {
         const val ACTION_START = "com.nv.pair.action.START_RUNTIME"
         const val ACTION_STOP = "com.nv.pair.action.STOP_RUNTIME"
+        const val ACTION_MNN_BACKEND_CHANGED = "com.nv.pair.action.MNN_BACKEND_CHANGED"
         const val ACTION_CLUSTER_CREATE = "com.nv.pair.action.CLUSTER_CREATE"
         const val ACTION_CLUSTER_INVITE = "com.nv.pair.action.CLUSTER_INVITE"
         const val ACTION_CLUSTER_RESPOND = "com.nv.pair.action.CLUSTER_RESPOND"
@@ -508,6 +586,7 @@ class PairRuntimeService : Service() {
         const val EXTRA_VALUE = "com.nv.pair.extra.VALUE"
         const val EXTRA_SECONDARY = "com.nv.pair.extra.SECONDARY"
         const val EXTRA_ACCEPT = "com.nv.pair.extra.ACCEPT"
+        const val EXTRA_MNN_BACKEND = "com.nv.pair.extra.MNN_BACKEND"
 
         private const val TAG = "PAIR-Runtime"
         private const val CHANNEL_ID = "pair-runtime"
@@ -526,6 +605,9 @@ class PairRuntimeService : Service() {
         val discoveredNodes = pairRepository.nodes
         val clusterState = clusterRepository.state
         val proxyStatuses = routerRepository.proxies
+        private val _mnnLocalEngine = MutableStateFlow(MnnLocalEngineStatus(available = false))
+        val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = _mnnLocalEngine.asStateFlow()
+        private val _preferredMnnBackend = MutableStateFlow(MnnBackend.CPU)
         val workloads = routerRepository.workloads
     }
 }

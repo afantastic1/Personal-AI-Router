@@ -84,6 +84,9 @@ scores model metadata and runtime signals, then sends the selected model through
 the same facade handler and its existing node scheduler. Catalog entries absent
 from runtime inventory are never candidates. The gateway does not provide
 catalog search or download operations.
+Before scoring, eligibility intersects model-name capability heuristics with
+known engine protocol support. MNN supports chat only and is excluded for tools,
+vision, and embeddings requirements, regardless of model ID hints.
 
 ### Flags
 

@@ -8,6 +8,7 @@ package com.nv.pair.mnn.http
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import com.nv.pair.mnn.MnnRuntimeMetrics
+import com.nv.pair.mnn.MnnFinishReason
 import org.json.JSONObject
 
 class SseStream(
@@ -26,12 +27,16 @@ class SseStream(
         event(OpenAiResponseWriter.streamChunk(id, model, value))
     }
 
-    fun finish(metrics: MnnRuntimeMetrics? = null, includeUsage: Boolean = false) {
+    fun finish(
+        finishReason: MnnFinishReason,
+        metrics: MnnRuntimeMetrics? = null,
+        includeUsage: Boolean = false,
+    ) {
         if (!started) {
             output.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".toByteArray(StandardCharsets.US_ASCII))
             started = true
         }
-        event(OpenAiResponseWriter.streamChunk(id, model, "", "stop"))
+        event(OpenAiResponseWriter.streamChunk(id, model, "", finishReason))
         if (includeUsage && metrics != null) {
             event(OpenAiResponseWriter.streamUsageChunk(id, model, metrics.promptTokens, metrics.generatedTokens))
         }

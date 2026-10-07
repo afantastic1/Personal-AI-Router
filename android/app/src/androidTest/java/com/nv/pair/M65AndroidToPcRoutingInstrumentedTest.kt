@@ -8,6 +8,7 @@ package com.nv.pair
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.nv.pair.data.PairNode
+import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.runtime.PairRuntimeController
 import com.nv.pair.runtime.RuntimePhase
 import java.io.BufferedReader
@@ -15,6 +16,7 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,15 @@ import org.junit.runner.RunWith
 class M65AndroidToPcRoutingInstrumentedTest {
     @Test
     fun streamsPcOnlyModelThroughAndroidEngineFacade() = runBlocking {
+        runPcRoutingAcceptance(mnnPortUnavailable = false)
+    }
+
+    @Test
+    fun mnnUnavailableStillAllowsDiscoveryAndPcRouting() = runBlocking {
+        runPcRoutingAcceptance(mnnPortUnavailable = true)
+    }
+
+    private suspend fun runPcRoutingAcceptance(mnnPortUnavailable: Boolean) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val arguments = InstrumentationRegistry.getArguments()
@@ -47,10 +58,23 @@ class M65AndroidToPcRoutingInstrumentedTest {
         assertTrue("model ID argument is empty", modelId.isNotBlank())
         assertFalse("M6.5 requires an unpaired Android node", controller.cluster.value.isClustered)
 
-        controller.start()
+        val mnnPortReservation = if (mnnPortUnavailable) {
+            ServerSocket().apply {
+                reuseAddress = false
+                bind(InetSocketAddress("127.0.0.1", MNN_PORT))
+            }
+        } else {
+            null
+        }
         try {
+            controller.start()
             withTimeout(RUNTIME_TIMEOUT_MILLIS) {
                 controller.state.first { it.phase == RuntimePhase.RUNNING }
+            }
+            if (mnnPortUnavailable) {
+                assertFalse("local MNN must report unavailable", controller.mnnLocalEngine.value.available)
+                assertEquals(MnnErrorCode.INTERNAL_ERROR, controller.mnnLocalEngine.value.errorCode)
+                assertFalse("MNN facade must not be started", canConnect("127.0.0.1", MNN_FACADE_PORT))
             }
 
             val pc = withTimeout(DISCOVERY_TIMEOUT_MILLIS) {
@@ -124,21 +148,34 @@ class M65AndroidToPcRoutingInstrumentedTest {
             assertEquals("the request was not scheduled on the PC", pc.hostUuid, workload.scheduledOn)
             assertEquals("the request did not complete", WORKLOAD_COMPLETED, workload.state)
         } finally {
-            pairingFile.delete()
-            if (controller.cluster.value.isClustered) {
-                controller.leaveCluster()
-                withTimeout(CLUSTER_TIMEOUT_MILLIS) {
-                    controller.cluster.first { !it.isClustered }
+            try {
+                pairingFile.delete()
+                if (controller.cluster.value.isClustered) {
+                    controller.leaveCluster()
+                    withTimeout(CLUSTER_TIMEOUT_MILLIS) {
+                        controller.cluster.first { !it.isClustered }
+                    }
                 }
-            }
-            controller.stop()
-            withTimeout(RUNTIME_TIMEOUT_MILLIS) {
-                controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
+                controller.stop()
+                withTimeout(RUNTIME_TIMEOUT_MILLIS) {
+                    controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
+                }
+            } finally {
+                mnnPortReservation?.close()
             }
         }
     }
 
     private fun PairNode.isTargetPc(address: String): Boolean = ipAddress == address || address in ipAddresses
+
+    private fun canConnect(address: String, port: Int): Boolean = Socket().use { socket ->
+        try {
+            socket.connect(InetSocketAddress(address, port), BACKEND_CONNECT_TIMEOUT_MILLIS)
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
 
     private suspend fun engineBackendIsUnreachable(address: String): Boolean = withContext(Dispatchers.IO) {
         val socket = Socket()
@@ -270,6 +307,8 @@ class M65AndroidToPcRoutingInstrumentedTest {
         const val PAIRING_FILE_NAME = "m65-pairing.json"
         const val CLUSTER_NAME = "PAIR M6.5 Android to PC acceptance"
         const val ENGINE_BACKEND_PORT = 1235
+        const val MNN_PORT = 14325
+        const val MNN_FACADE_PORT = 14324
         const val BACKEND_CONNECT_TIMEOUT_MILLIS = 750
         const val RUNTIME_TIMEOUT_MILLIS = 30_000L
         const val DISCOVERY_TIMEOUT_MILLIS = 45_000L

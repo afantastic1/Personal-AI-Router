@@ -12,16 +12,33 @@ import com.nv.pair.data.PairNode
 import com.nv.pair.data.ClusterState
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.PairWorkload
+import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.mnn.MnnSettingsRepository
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
 class PairRuntimeController(context: Context) {
     private val applicationContext = context.applicationContext
+    private val mnnSettings = MnnSettingsRepository(applicationContext)
 
     val state: StateFlow<PairRuntimeState> = PairRuntimeService.runtimeState
     val nodes: StateFlow<List<PairNode>> = PairRuntimeService.discoveredNodes
     val cluster: StateFlow<ClusterState> = PairRuntimeService.clusterState
     val proxies: StateFlow<List<EngineProxyStatus>> = PairRuntimeService.proxyStatuses
+    val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = PairRuntimeService.mnnLocalEngine
+    val preferredMnnBackend: Flow<MnnBackend> = mnnSettings.preferredBackend
     val workloads: StateFlow<List<PairWorkload>> = PairRuntimeService.workloads
+
+    suspend fun setPreferredMnnBackend(backend: MnnBackend) {
+        mnnSettings.setPreferredBackend(backend)
+        if (PairRuntimeService.runtimeState.value.desiredRunning) {
+            applicationContext.startService(
+                Intent(applicationContext, PairRuntimeService::class.java)
+                    .setAction(PairRuntimeService.ACTION_MNN_BACKEND_CHANGED)
+                    .putExtra(PairRuntimeService.EXTRA_MNN_BACKEND, backend.preferenceValue),
+            )
+        }
+    }
 
     fun start() {
         val intent = Intent(applicationContext, PairRuntimeService::class.java)

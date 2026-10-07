@@ -11,9 +11,14 @@ data class MnnModelDescriptor(
     val displayName: String? = null
 )
 
-enum class MnnBackend {
-    CPU,
-    OPENCL
+enum class MnnBackend(val preferenceValue: String) {
+    CPU("cpu"),
+    OPENCL("opencl");
+
+    companion object {
+        fun fromPreferenceValue(value: String?): MnnBackend =
+            entries.firstOrNull { it.preferenceValue == value } ?: CPU
+    }
 }
 
 enum class MnnEngineState {
@@ -40,6 +45,11 @@ enum class MnnErrorCode {
     GENERATION_FAILED,
     CANCELLED,
     INTERNAL_ERROR
+}
+
+enum class MnnFinishReason(val wireName: String) {
+    STOP("stop"),
+    LENGTH("length")
 }
 
 data class MnnError(
@@ -70,6 +80,12 @@ data class MnnRuntimeStatus(
     val backend: MnnBackend? = null,
     val modelId: String? = null,
     val error: MnnError? = null
+)
+
+data class MnnHealthStatus(
+    val available: Boolean,
+    val state: MnnEngineState,
+    val error: MnnError? = null,
 )
 
 data class MnnRuntimeMetrics(
@@ -124,5 +140,6 @@ data class MnnChatRequest(
 
 data class MnnGenerationResult(
     val text: String,
-    val metrics: MnnRuntimeMetrics
+    val metrics: MnnRuntimeMetrics,
+    val finishReason: MnnFinishReason,
 )

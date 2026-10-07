@@ -14,6 +14,8 @@ interface MnnInferenceService {
 
     fun status(): MnnRuntimeStatus
 
+    fun health(): MnnHealthStatus
+
     fun ensureLoaded(modelId: String, backend: MnnBackend): MnnResult<MnnLoadedModel>
 
     fun generate(requestId: Long, request: MnnChatRequest, onToken: (String) -> Unit): MnnResult<MnnGenerationResult>
@@ -26,6 +28,7 @@ interface MnnInferenceService {
 class LocalMnnInferenceService(
     private val catalog: MnnModelCatalog,
     private val host: MnnEngineHost,
+    private val backendSelection: MnnBackendSelection = MnnBackendSelection(),
 ) : MnnInferenceService, AutoCloseable {
     private val operationLock = ReentrantLock()
     private val activeRequestId = AtomicReference<Long?>(null)
@@ -34,13 +37,23 @@ class LocalMnnInferenceService(
 
     override fun status(): MnnRuntimeStatus = host.getStatus()
 
-    override fun ensureLoaded(modelId: String, backend: MnnBackend): MnnResult<MnnLoadedModel> =
-        operationLock.withLock {
+    override fun health(): MnnHealthStatus = host.getHealth()
+
+    fun preferredBackend(): MnnBackend = backendSelection.current()
+
+    fun setPreferredBackend(backend: MnnBackend) {
+        backendSelection.update(backend)
+    }
+
+    override fun ensureLoaded(modelId: String, backend: MnnBackend): MnnResult<MnnLoadedModel> {
+        backendSelection.update(backend)
+        return operationLock.withLock {
             if (activeRequestId.get() != null) {
                 return MnnResult.failure(MnnErrorCode.ENGINE_BUSY, "An MNN generation is already active.")
             }
             ensureLoadedLocked(modelId, backend)
         }
+    }
 
     override fun generate(
         requestId: Long,
@@ -53,11 +66,9 @@ class LocalMnnInferenceService(
             return MnnResult.failure(MnnErrorCode.ENGINE_BUSY, "An MNN generation is already active.")
         }
         return try {
-            val backend = host.getLoadedModel()
-                ?.takeIf { it.model.modelId == request.modelId }
-                ?.backend
-                ?: MnnBackend.CPU
-            when (val loaded = operationLock.withLock { ensureLoadedLocked(request.modelId, backend) }) {
+            when (val loaded = operationLock.withLock {
+                ensureLoadedLocked(request.modelId, backendSelection.current())
+            }) {
                 is MnnResult.Failure -> loaded
                 is MnnResult.Success -> host.generate(requestId, request, onToken)
             }

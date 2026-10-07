@@ -100,8 +100,9 @@ func eligible(candidate RuntimeModel, requirements Requirements) bool {
 	if !candidate.Available || !candidate.Model.Compatible || candidate.Model.ContextLength < requirements.MinimumContextLength {
 		return false
 	}
+	capabilities := effectiveCapabilities(candidate)
 	for capability, required := range requirements.Capabilities {
-		if required && !candidate.Model.Capabilities[capability] {
+		if required && !capabilities[capability] {
 			return false
 		}
 	}
@@ -144,12 +145,28 @@ func scoreCandidate(policy string, candidate RuntimeModel) float64 {
 	case AutoFastAlias:
 		return fastWeights.loaded*loaded + fastWeights.latency*latency + fastWeights.throughput*throughput + fastWeights.size*size
 	case AutoBestAlias:
-		capability := float64(capabilityCount(candidate.Model.Capabilities)) / 4
+		capability := float64(capabilityCount(effectiveCapabilities(candidate))) / 4
 		return bestWeights.quality*quality + bestWeights.context*contextScore(candidate.Model.ContextLength) + bestWeights.capability*capability
 	default:
 		return balancedWeights.quality*quality + balancedWeights.latency*latency + balancedWeights.loaded*loaded +
 			balancedWeights.network*network + balancedWeights.pressure*pressure
 	}
+}
+
+func effectiveCapabilities(candidate RuntimeModel) map[string]bool {
+	effective := make(map[string]bool, len(candidate.Model.Capabilities))
+	for capability, modelSupports := range candidate.Model.Capabilities {
+		effective[capability] = modelSupports && engineProtocolSupports(candidate.Engine, capability)
+	}
+	return effective
+}
+
+func engineProtocolSupports(engine, capability string) bool {
+	if engine != "mnn" {
+		return true
+	}
+	// The Android MNN chat facade rejects tools, vision, and embeddings.
+	return capability == "chat"
 }
 
 func qualityScore(parameters float64, contextLength int) float64 {

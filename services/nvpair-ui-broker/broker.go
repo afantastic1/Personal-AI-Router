@@ -923,11 +923,6 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 				callErr = fmt.Errorf("proxy rejected gateway/enable: %s", rpcErr.Message)
 			}
 			slog.Warn("local OpenAI gateway failed to start", "err", callErr)
-			pp.Stop()
-			for _, profile := range engineProxyProfiles {
-				b.setEngineProxyHandle(profile, nil)
-			}
-			return nil, fmt.Errorf("local OpenAI gateway failed to start: %w", callErr)
 		}
 	}
 	if enabled == 0 {

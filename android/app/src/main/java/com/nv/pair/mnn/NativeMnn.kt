@@ -151,7 +151,8 @@ class NativeMnn private constructor(
         }
 
         return when (resultCode) {
-            NATIVE_SUCCESS -> MnnResult.success(MnnGenerationResult(output.toString(), completedMetrics))
+            NATIVE_SUCCESS -> MnnResult.success(MnnGenerationResult(output.toString(), completedMetrics, MnnFinishReason.STOP))
+            NATIVE_LENGTH -> MnnResult.success(MnnGenerationResult(output.toString(), completedMetrics, MnnFinishReason.LENGTH))
             NATIVE_CANCELLED -> MnnResult.failure(MnnErrorCode.CANCELLED, "Generation was cancelled.")
             NATIVE_ERROR_GENERATION -> if (cancelled) {
                 MnnResult.failure(MnnErrorCode.CANCELLED, "Generation was cancelled.")
@@ -320,6 +321,7 @@ class NativeMnn private constructor(
         private const val NATIVE_ERROR_LOAD = 4
         private const val NATIVE_ERROR_GENERATION = 5
         private const val NATIVE_ERROR_UNAVAILABLE = 6
+        private const val NATIVE_LENGTH = 7
         private const val UNSIGNED_INT_MASK = 0xffffffffL
         private const val NO_SEED = -1L
 

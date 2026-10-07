@@ -87,17 +87,17 @@ class MnnHttpServer(
                 route(request, client)
             } catch (failure: HttpProtocolException) {
                 runCatching {
-                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error(failure.code, failure.message.orEmpty()))
+                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
                 }
             } catch (failure: OpenAiRequestException) {
                 runCatching {
-                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error(failure.code, failure.message.orEmpty()))
+                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
                 }
             } catch (failure: IOException) {
                 // A closed client is expected during streaming cancellation.
             } catch (_: Exception) {
                 runCatching {
-                    writeJson(client, HTTP_INTERNAL_SERVER_ERROR, OpenAiResponseWriter.error("server_error", "MNN HTTP request failed."))
+                    writeJson(client, HTTP_INTERNAL_SERVER_ERROR, OpenAiResponseWriter.error("server_error", "server_error", "MNN HTTP request failed."))
                 }
             }
         }
@@ -106,11 +106,14 @@ class MnnHttpServer(
     private fun route(request: MnnHttpRequest, socket: Socket) {
         val path = request.target.substringBefore('?')
         when {
-            request.method == "GET" && path == "/healthz" -> writeJson(
-                socket,
-                HTTP_OK,
-                OpenAiResponseWriter.health(inference.status()),
-            )
+            request.method == "GET" && path == "/healthz" -> {
+                val health = inference.health()
+                writeJson(
+                    socket,
+                    if (health.available) HTTP_OK else HTTP_SERVICE_UNAVAILABLE,
+                    OpenAiResponseWriter.health(health, inference.status().modelId != null),
+                )
+            }
             request.method == "GET" && path == "/v1/models" -> writeJson(
                 socket,
                 HTTP_OK,
@@ -127,9 +130,9 @@ class MnnHttpServer(
             path in KNOWN_PATHS -> writeJson(
                 socket,
                 HTTP_METHOD_NOT_ALLOWED,
-                OpenAiResponseWriter.error("method_not_allowed", "The HTTP method is not supported for this path."),
+                OpenAiResponseWriter.error("invalid_request_error", "method_not_allowed", "The HTTP method is not supported for this path."),
             )
-            else -> writeJson(socket, HTTP_NOT_FOUND, OpenAiResponseWriter.error("not_found", "The requested path was not found."))
+            else -> writeJson(socket, HTTP_NOT_FOUND, OpenAiResponseWriter.error("invalid_request_error", "not_found", "The requested path was not found."))
         }
     }
 
@@ -179,9 +182,13 @@ class MnnHttpServer(
                         throw failure
                     }
                 }) {
-                    is MnnResult.Success -> stream.finish(result.value.metrics, parsed.includeUsage)
+                    is MnnResult.Success -> stream.finish(
+                        result.value.finishReason,
+                        result.value.metrics,
+                        parsed.includeUsage,
+                    )
                     is MnnResult.Failure -> {
-                        val error = OpenAiResponseWriter.error(errorCode(result.error.code), result.error.message)
+                        val error = OpenAiResponseWriter.error(errorType(result.error.code), errorCode(result.error.code), result.error.message)
                         if (stream.started) stream.error(error) else writeJson(socket, httpStatus(result.error.code), error)
                     }
                 }
@@ -197,12 +204,13 @@ class MnnHttpServer(
                             text.toString(),
                             result.value.metrics.promptTokens,
                             result.value.metrics.generatedTokens,
+                            result.value.finishReason,
                         ),
                     )
                     is MnnResult.Failure -> writeJson(
                         socket,
                         httpStatus(result.error.code),
-                        OpenAiResponseWriter.error(errorCode(result.error.code), result.error.message),
+                        OpenAiResponseWriter.error(errorType(result.error.code), errorCode(result.error.code), result.error.message),
                     )
                 }
             }
@@ -271,7 +279,7 @@ class MnnHttpServer(
     }
 
     private fun writeInferenceError(socket: Socket, code: MnnErrorCode, message: String) =
-        writeJson(socket, httpStatus(code), OpenAiResponseWriter.error(errorCode(code), message))
+        writeJson(socket, httpStatus(code), OpenAiResponseWriter.error(errorType(code), errorCode(code), message))
 
     private fun writeJson(socket: Socket, statusCode: Int, json: JSONObject) {
         val body = OpenAiResponseWriter.bytes(json)
@@ -299,6 +307,15 @@ class MnnHttpServer(
         MnnErrorCode.BACKEND_UNSUPPORTED -> "backend_unsupported"
         MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE -> "engine_unavailable"
         MnnErrorCode.INVALID_MODEL_ID, MnnErrorCode.MODEL_NOT_LOADED, MnnErrorCode.INVALID_REQUEST -> "invalid_request_error"
+        else -> "server_error"
+    }
+
+    private fun errorType(code: MnnErrorCode): String = when (code) {
+        MnnErrorCode.INVALID_MODEL_ID,
+        MnnErrorCode.BACKEND_UNSUPPORTED,
+        MnnErrorCode.INVALID_REQUEST,
+        MnnErrorCode.MODEL_NOT_FOUND,
+        MnnErrorCode.MODEL_NOT_LOADED -> "invalid_request_error"
         else -> "server_error"
     }
 

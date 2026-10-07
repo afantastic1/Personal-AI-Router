@@ -12,10 +12,7 @@ import kotlinx.coroutines.flow.asStateFlow
 class RouterRepository {
     private val lock = Any()
     private var workloadGeneration = 0L
-    private val _proxies = MutableStateFlow(listOf(
-        EngineProxyStatus("ollama", false, 0),
-        EngineProxyStatus("lmstudio", false, 0),
-    ))
+    private val _proxies = MutableStateFlow(emptyProxyStatuses())
     private val _workloads = MutableStateFlow<List<PairWorkload>>(emptyList())
 
     val proxies: StateFlow<List<EngineProxyStatus>> = _proxies.asStateFlow()
@@ -23,13 +20,15 @@ class RouterRepository {
 
     fun setProxyStatus(status: EngineProxyStatus) {
         synchronized(lock) {
-            _proxies.value = (_proxies.value.filterNot { it.engine == status.engine } + status).sortedBy {
-                when (it.engine) {
-                    "ollama" -> 0
-                    "lmstudio" -> 1
-                    else -> 2
-                }
-            }
+            if (status.engine !in ROUTER_ENGINES) return
+            val statusesByEngine = _proxies.value.associateBy(EngineProxyStatus::engine) + (status.engine to status)
+            _proxies.value = ROUTER_ENGINES.mapNotNull(statusesByEngine::get)
+        }
+    }
+
+    fun resetProxyStatuses() {
+        synchronized(lock) {
+            _proxies.value = emptyProxyStatuses()
         }
     }
 
@@ -60,4 +59,11 @@ class RouterRepository {
     }
 
     private fun PairWorkload.key(): String = "$originatedFrom\u0000$engine\u0000$runId\u0000$id"
+
+    private fun emptyProxyStatuses(): List<EngineProxyStatus> =
+        ROUTER_ENGINES.map { engine -> EngineProxyStatus(engine, false, 0) }
+
+    companion object {
+        val ROUTER_ENGINES = listOf("ollama", "lmstudio", "mnn")
+    }
 }

@@ -112,6 +112,12 @@ selector applies capability eligibility and policy scoring, then delegates
 through the selected facade so node placement remains unchanged. The gateway
 does not browse catalogs or install models.
 
+Eligibility intersects model-name capability heuristics with known engine
+protocol support before scoring. MNN is chat-only; it cannot satisfy tools,
+vision, or embeddings requirements even when its model ID contains those
+capability hints. Unknown engine capabilities remain unknown and do not gain
+fabricated support from a model name.
+
 A flag cannot express this. The broker plans a different port for each engine —
 Ollama's managed facade wants `:11434` while LM Studio's wants `:1234`, and
 either may be absent so the child keeps its own persisted port — and a

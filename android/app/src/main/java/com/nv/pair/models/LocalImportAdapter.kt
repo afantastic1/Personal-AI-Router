@@ -51,7 +51,6 @@ class LocalImportAdapter(
                 parameterCount = null,
                 quantization = null,
                 contextLength = null,
-                capabilities = setOf(ModelCapability.CHAT),
                 source = ModelSource(ModelSourceKind.LOCAL, target.absolutePath),
                 format = ModelFormat.MNN,
                 estimatedMemoryBytes = target.walkTopDown().filter(File::isFile).sumOf(File::length).takeIf { it > 0L },

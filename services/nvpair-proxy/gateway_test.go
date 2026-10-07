@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -81,7 +82,33 @@ func TestGatewayAutoPoliciesSelectOnlyAdvertisedModels(t *testing.T) {
 	}
 }
 
-func TestGatewayAutoAliasRewritesOnlyModelBeforeExistingFacadeRouting(t *testing.T) {
+func TestGatewayAutoToolsRequestDoesNotRouteToMNN(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	proxy := NewProxy(NewCodec(rwNop{}))
+	mnn, _ := profileFor("mnn")
+	discovery := NewDiscovery()
+	discovery.AddManual(nodeForModel(t, "phone", upstream.URL, "qwen-tool-0.6b"))
+	proxy.facades = map[string]*facade{"mnn": newFacade(proxy, mnn, discovery, 14325)}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"auto-balanced","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function"}]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("gateway status = %d body=%s, want no compatible model", response.Code, response.Body.String())
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("MNN upstream hits = %d, want 0", hits.Load())
+	}
+}
+
+func TestGatewayAutoChatRequestCanRouteToMNNAndRewritesOnlyModel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -91,9 +118,16 @@ func TestGatewayAutoAliasRewritesOnlyModelBeforeExistingFacadeRouting(t *testing
 		if err := json.Unmarshal(body, &payload); err != nil {
 			t.Errorf("decode upstream request: %v", err)
 		}
-		var model string
-		if err := json.Unmarshal(payload["model"], &model); err != nil || model != "qwen3-1.7b" {
-			t.Errorf("resolved model = %q, err = %v", model, err)
+		var payloadModel string
+		if err := json.Unmarshal(payload["model"], &payloadModel); err != nil || payloadModel != "qwen3-1.7b" {
+			t.Errorf("resolved model = %q, err = %v", payloadModel, err)
+		}
+		var stream bool
+		if err := json.Unmarshal(payload["stream"], &stream); err != nil || !stream {
+			t.Errorf("stream = %v, err = %v; rewriting the alias must preserve other request fields", stream, err)
+		}
+		if !strings.Contains(string(body), `"messages"`) {
+			t.Errorf("rewritten body lost messages: %s", body)
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"choices":[]}`)

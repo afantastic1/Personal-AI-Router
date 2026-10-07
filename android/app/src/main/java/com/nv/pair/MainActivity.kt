@@ -32,8 +32,12 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,9 +50,15 @@ import com.nv.pair.data.PairNode
 import com.nv.pair.data.ClusterState
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.PairWorkload
+import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.runtime.MnnLocalEngineStatus
 import com.nv.pair.ui.theme.PAIRTheme
 import com.nv.pair.models.ModelHubScreen
-import com.nv.pair.models.AutoModelSelector
+import com.nv.pair.models.GatewayModelRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private lateinit var runtimeController: PairRuntimeController
@@ -67,17 +77,43 @@ class MainActivity : ComponentActivity() {
         runtimeController = PairRuntimeController(applicationContext)
         setContent {
             PAIRTheme {
+                val scope = rememberCoroutineScope()
                 val state by runtimeController.state.collectAsState()
                 val nodes by runtimeController.nodes.collectAsState()
                 val cluster by runtimeController.cluster.collectAsState()
                 val proxies by runtimeController.proxies.collectAsState()
                 val workloads by runtimeController.workloads.collectAsState()
+                var gatewayModelIds by remember { mutableStateOf<List<String>?>(null) }
+                LaunchedEffect(state.phase) {
+                    gatewayModelIds = null
+                    if (state.phase == RuntimePhase.RUNNING) {
+                        while (true) {
+                            gatewayModelIds = runCatching {
+                                withContext(Dispatchers.IO) { GatewayModelRepository().modelIds() }
+                            }.getOrNull()
+                            delay(GATEWAY_MODEL_REFRESH_MILLIS)
+                        }
+                    }
+                }
+                val preferredMnnBackend by runtimeController.preferredMnnBackend.collectAsState(initial = MnnBackend.CPU)
+                val mnnLocalEngine by runtimeController.mnnLocalEngine.collectAsState()
+                val displayedMnnBackend = if (mnnLocalEngine.available) {
+                    mnnLocalEngine.backend ?: preferredMnnBackend
+                } else {
+                    preferredMnnBackend
+                }
                 PairHomeScreen(
                     state = state,
                     nodes = nodes,
                     cluster = cluster,
                     proxies = proxies,
                     workloads = workloads,
+                    gatewayModelIds = gatewayModelIds,
+                    preferredMnnBackend = displayedMnnBackend,
+                    mnnLocalEngine = mnnLocalEngine,
+                    onPreferredMnnBackendChange = { backend ->
+                        scope.launch { runtimeController.setPreferredMnnBackend(backend) }
+                    },
                     onStart = ::startRuntime,
                     onStop = runtimeController::stop,
                     onCreateCluster = runtimeController::createCluster,
@@ -110,6 +146,10 @@ private fun PairHomeScreen(
     cluster: ClusterState,
     proxies: List<EngineProxyStatus>,
     workloads: List<PairWorkload>,
+    gatewayModelIds: List<String>?,
+    preferredMnnBackend: MnnBackend,
+    mnnLocalEngine: MnnLocalEngineStatus,
+    onPreferredMnnBackendChange: (MnnBackend) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onCreateCluster: (String) -> Unit,
@@ -180,7 +220,8 @@ private fun PairHomeScreen(
             }
             Text("Local router", style = MaterialTheme.typography.titleLarge)
             proxies.forEach { ProxyStatusCard(it) }
-            LocalApiCard(running = running, modelCount = nodes.flatMap { it.models }.distinct().size + AutoModelSelector.ALIASES.size)
+            MnnLocalEngineCard(mnnLocalEngine)
+            LocalApiCard(running = running, modelIds = gatewayModelIds)
             Text("Recent workloads", style = MaterialTheme.typography.titleLarge)
             if (workloads.isEmpty()) {
                 Text("No requests have been routed yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -220,14 +261,20 @@ private fun PairHomeScreen(
                     onRemove = onRemove,
                 )
             } else {
-                ModelHubScreen(nodes)
+                ModelHubScreen(
+                    nodes = nodes,
+                    gatewayModelIds = gatewayModelIds,
+                    preferredBackend = preferredMnnBackend,
+                    localEngineStatus = mnnLocalEngine,
+                    onBackendChange = onPreferredMnnBackendChange,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun LocalApiCard(running: Boolean, modelCount: Int) {
+private fun LocalApiCard(running: Boolean, modelIds: List<String>?) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val url = "http://127.0.0.1:14326/v1"
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -236,7 +283,7 @@ private fun LocalApiCard(running: Boolean, modelCount: Int) {
             Text("Status: ${if (running) "Running" else "Stopped"}")
             Text("URL: $url", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Key: pair-local", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("Models: $modelCount", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Models: ${modelIds?.size?.toString() ?: "Unavailable"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton(onClick = {
                 val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
                     ?: return@OutlinedButton
@@ -248,15 +295,29 @@ private fun LocalApiCard(running: Boolean, modelCount: Int) {
     }
 }
 
+private const val GATEWAY_MODEL_REFRESH_MILLIS = 5_000L
+
 @Composable
 private fun ProxyStatusCard(status: EngineProxyStatus) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(status.engine, style = MaterialTheme.typography.titleMedium)
+            Text(if (status.engine == "mnn") "MNN facade" else status.engine, style = MaterialTheme.typography.titleMedium)
             Text(
-                if (status.ready) "http://127.0.0.1:${status.port}" else "Router facade is starting or unavailable",
+                if (status.ready) "http://127.0.0.1:${status.port}"
+                else if (status.engine == "mnn") "MNN facade is unavailable" else "Router facade is starting or unavailable",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+@Composable
+private fun MnnLocalEngineCard(status: MnnLocalEngineStatus) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Local MNN engine", style = MaterialTheme.typography.titleMedium)
+            Text(if (status.available) "Available" else "Unavailable")
+            status.errorCode?.let { Text("Error: ${it.name}", color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
 }

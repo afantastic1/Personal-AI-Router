@@ -29,8 +29,7 @@ class ModelInventoryRepositoryTest {
         assertEquals(1, inventory.size)
         assertEquals("phone-uuid", inventory.single().nodeId)
         assertEquals("mnn", inventory.single().engine)
+        assertEquals("qwen3-1.7b", inventory.single().modelId)
         assertTrue(inventory.single().loaded)
-        assertEquals(ModelSourceKind.RUNTIME, inventory.single().model.source.kind)
-        assertEquals(1_700_000_000L, inventory.single().model.parameterCount)
     }
 }

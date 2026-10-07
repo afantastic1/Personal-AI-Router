@@ -14,7 +14,7 @@ import org.junit.Test
 
 class LocalImportAdapterTest {
     @Test
-    fun importsAndValidatesAnMnnModelIntoPrivateModelRoot() {
+    fun localImportRemainsIndependentOfRemoteChecksumMetadata() {
         val root = Files.createTempDirectory("pair-model-import").toFile()
         try {
             val descriptor = LocalImportAdapter(root).importMnnModel(

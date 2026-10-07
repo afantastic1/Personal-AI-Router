@@ -28,7 +28,9 @@ class BrokerSession(
     private val onNotification: (RpcNotification) -> Unit = {},
     private val scannerBinaryOverride: File? = null,
     private val additionalEnvironment: Map<String, String> = emptyMap(),
+    proxyEngines: List<String> = DEFAULT_PROXY_ENGINES,
 ) : AutoCloseable {
+    private val proxyEngines = proxyEngines.toList()
     private val stopping = AtomicBoolean()
     private val ready = CompletableFuture<String>()
     private var process: Process? = null
@@ -40,28 +42,9 @@ class BrokerSession(
     @Synchronized
     fun start(): BrokerRuntimeInfo {
         check(process == null) { "broker session already started" }
-        val broker = binaries.broker()
-        val scanner = scannerBinaryOverride ?: binaries.scanner()
         val environment = runtimeEnvironment()
-        val settings = binaries.settings()
-        val clusterManager = binaries.clusterManager()
-        val proxy = binaries.proxy()
-        val scheduler = binaries.scheduler()
-        val workloadManager = binaries.workloadManager()
-        val errors = binaries.errors()
-        val engineManager = binaries.engineManager()
         val runner = PairProcess(
-            listOf(
-                broker.absolutePath,
-                "--scanner-path", scanner.absolutePath,
-                "--settings-path", settings.absolutePath,
-                "--cluster-manager-path", clusterManager.absolutePath,
-                "--proxy-path", proxy.absolutePath,
-                "--scheduler-path", scheduler.absolutePath,
-                "--workload-manager-path", workloadManager.absolutePath,
-                "--errors-path", errors.absolutePath,
-                "--engine-manager-path", engineManager.absolutePath,
-            ),
+            commandArguments(),
             environment,
         )
         processRunner = runner
@@ -122,6 +105,23 @@ class BrokerSession(
     ): JSONObject {
         val client = rpc ?: throw IOException("broker session has not started")
         return client.request(method, params, timeoutMillis)
+    }
+
+    internal fun commandArguments(): List<String> {
+        val broker = binaries.broker()
+        val scanner = scannerBinaryOverride ?: binaries.scanner()
+        return listOf(
+            broker.absolutePath,
+            "--scanner-path", scanner.absolutePath,
+            "--settings-path", binaries.settings().absolutePath,
+            "--cluster-manager-path", binaries.clusterManager().absolutePath,
+            "--proxy-path", binaries.proxy().absolutePath,
+            "--proxy-engines", proxyEngines.joinToString(","),
+            "--scheduler-path", binaries.scheduler().absolutePath,
+            "--workload-manager-path", binaries.workloadManager().absolutePath,
+            "--errors-path", binaries.errors().absolutePath,
+            "--engine-manager-path", binaries.engineManager().absolutePath,
+        )
     }
 
     private fun handleNotification(notification: RpcNotification) {
@@ -187,5 +187,12 @@ class BrokerSession(
         }
         rpc?.close()
         stderrThread?.join(2_000)
+    }
+
+    companion object {
+        private val DEFAULT_PROXY_ENGINES = listOf("ollama", "lmstudio", "mnn")
+
+        fun proxyEnginesForLocalMnn(mnnAvailable: Boolean): List<String> =
+            if (mnnAvailable) DEFAULT_PROXY_ENGINES else DEFAULT_PROXY_ENGINES.filterNot { it == "mnn" }
     }
 }

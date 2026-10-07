@@ -15,8 +15,49 @@ class RouterRepositoryTest {
         repository.setProxyStatus(EngineProxyStatus("lmstudio", true, 12345))
         repository.setProxyStatus(EngineProxyStatus("ollama", true, 11435))
 
-        assertEquals(listOf("ollama", "lmstudio"), repository.proxies.value.map(EngineProxyStatus::engine))
+        assertEquals(listOf("ollama", "lmstudio", "mnn"), repository.proxies.value.map(EngineProxyStatus::engine))
         assertEquals(11435, repository.proxies.value.first().port)
+    }
+
+    @Test
+    fun mnnProxyStatusIsUpdatedWithoutChangingOtherEngines() {
+        val repository = RouterRepository()
+        repository.setProxyStatus(EngineProxyStatus("ollama", true, 11435))
+        repository.setProxyStatus(EngineProxyStatus("lmstudio", true, 12345))
+
+        repository.setProxyStatus(EngineProxyStatus("mnn", true, 14324))
+
+        assertEquals(true, repository.proxies.value.first { it.engine == "mnn" }.ready)
+        assertEquals(14324, repository.proxies.value.first { it.engine == "mnn" }.port)
+        assertEquals(true, repository.proxies.value.first { it.engine == "ollama" }.ready)
+        assertEquals(true, repository.proxies.value.first { it.engine == "lmstudio" }.ready)
+    }
+
+    @Test
+    fun resettingProxyStatusesAfterBrokerExitClearsAllFacades() {
+        val repository = RouterRepository()
+        RouterRepository.ROUTER_ENGINES.forEachIndexed { index, engine ->
+            repository.setProxyStatus(EngineProxyStatus(engine, true, 10000 + index))
+        }
+
+        repository.resetProxyStatuses()
+
+        assertEquals(listOf("ollama", "lmstudio", "mnn"), repository.proxies.value.map(EngineProxyStatus::engine))
+        assertEquals(listOf(false, false, false), repository.proxies.value.map(EngineProxyStatus::ready))
+        assertEquals(listOf(0, 0, 0), repository.proxies.value.map(EngineProxyStatus::port))
+    }
+
+    @Test
+    fun unavailableMnnProxyDoesNotChangeOtherFacadeCards() {
+        val repository = RouterRepository()
+        repository.setProxyStatus(EngineProxyStatus("ollama", true, 11435))
+        repository.setProxyStatus(EngineProxyStatus("lmstudio", true, 12345))
+
+        repository.setProxyStatus(EngineProxyStatus("mnn", false, 0))
+
+        assertEquals(true, repository.proxies.value.first { it.engine == "ollama" }.ready)
+        assertEquals(true, repository.proxies.value.first { it.engine == "lmstudio" }.ready)
+        assertEquals(false, repository.proxies.value.first { it.engine == "mnn" }.ready)
     }
 
     @Test

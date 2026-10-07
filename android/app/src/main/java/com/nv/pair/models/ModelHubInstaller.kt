@@ -20,7 +20,7 @@ import org.json.JSONObject
 
 class ResumableModelDownloader {
     fun download(url: String, destination: File, expectedSha256: String, bearerToken: String? = null): File {
-        require(expectedSha256.matches(SHA256_PATTERN)) { "A valid SHA-256 checksum is required." }
+        require(isTrustedSha256(expectedSha256)) { "A valid SHA-256 checksum is required." }
         val parent = destination.parentFile ?: throw IOException("Model artifact destination has no parent directory.")
         if (!parent.exists() && !parent.mkdirs()) throw IOException("Could not create model download directory.")
         val partial = File(parent, "${destination.name}.part")
@@ -156,7 +156,8 @@ class ModelHubInstaller(
         artifact: ModelFile,
     ) {
         require(isSafeRelativePath(artifact.path)) { "Model artifact path must stay inside the staging directory." }
-        val checksum = artifact.sha256 ?: throw IOException("The catalog entry has no SHA-256 checksum for ${artifact.path}.")
+        val checksum = artifact.sha256?.takeIf(::isTrustedSha256)
+            ?: throw IOException("Missing trusted SHA-256 for ${artifact.path}.")
         val destination = File(staging, artifact.path)
         require(destination.canonicalPath.startsWith(staging.canonicalPath + File.separator)) {
             "Model artifact path must stay inside the staging directory."

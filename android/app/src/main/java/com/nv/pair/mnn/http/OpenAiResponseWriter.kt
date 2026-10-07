@@ -5,6 +5,8 @@
 
 package com.nv.pair.mnn.http
 
+import com.nv.pair.mnn.MnnHealthStatus
+import com.nv.pair.mnn.MnnFinishReason
 import com.nv.pair.mnn.MnnLoadedModel
 import com.nv.pair.mnn.MnnModelDescriptor
 import com.nv.pair.mnn.MnnRuntimeStatus
@@ -40,10 +42,13 @@ object OpenAiResponseWriter {
         .put("backend", model.backend.name.lowercase())
         .put("state", "ready")
 
-    fun health(status: MnnRuntimeStatus): JSONObject = JSONObject()
-        .put("status", "ok")
+    fun health(status: MnnHealthStatus, modelLoaded: Boolean): JSONObject = JSONObject()
+        .put("status", if (status.available) "ok" else "unavailable")
         .put("runtime_state", status.state.name.lowercase())
-        .put("model_loaded", status.modelId != null)
+        .put("model_loaded", modelLoaded)
+        .apply {
+            if (!status.available) put("error_code", status.error?.code?.name?.lowercase())
+        }
 
     fun completion(
         id: String,
@@ -51,6 +56,7 @@ object OpenAiResponseWriter {
         text: String,
         promptTokens: Int,
         generatedTokens: Int,
+        finishReason: MnnFinishReason,
     ): JSONObject = JSONObject()
         .put("id", id)
         .put("object", "chat.completion")
@@ -60,14 +66,19 @@ object OpenAiResponseWriter {
             JSONObject()
                 .put("index", 0)
                 .put("message", JSONObject().put("role", "assistant").put("content", text))
-                .put("finish_reason", "stop"),
+                .put("finish_reason", finishReason.wireName),
         ))
         .put("usage", JSONObject()
             .put("prompt_tokens", promptTokens)
             .put("completion_tokens", generatedTokens)
             .put("total_tokens", promptTokens + generatedTokens))
 
-    fun streamChunk(id: String, model: String, content: String, finishReason: String? = null): JSONObject = JSONObject()
+    fun streamChunk(
+        id: String,
+        model: String,
+        content: String,
+        finishReason: MnnFinishReason? = null,
+    ): JSONObject = JSONObject()
         .put("id", id)
         .put("object", "chat.completion.chunk")
         .put("created", System.currentTimeMillis() / 1_000L)
@@ -76,7 +87,7 @@ object OpenAiResponseWriter {
             JSONObject()
                 .put("index", 0)
                 .put("delta", JSONObject().put("content", content))
-                .put("finish_reason", finishReason?.let { it } ?: JSONObject.NULL),
+                .put("finish_reason", finishReason?.wireName ?: JSONObject.NULL),
         ))
 
     fun streamUsageChunk(
@@ -95,10 +106,10 @@ object OpenAiResponseWriter {
             .put("completion_tokens", generatedTokens)
             .put("total_tokens", promptTokens + generatedTokens))
 
-    fun error(code: String, message: String): JSONObject = JSONObject()
+    fun error(type: String, code: String, message: String): JSONObject = JSONObject()
         .put("error", JSONObject()
             .put("message", message)
-            .put("type", "invalid_request_error")
+            .put("type", type)
             .put("code", code))
 
     fun bytes(json: JSONObject): ByteArray = json.toString().toByteArray(StandardCharsets.UTF_8)

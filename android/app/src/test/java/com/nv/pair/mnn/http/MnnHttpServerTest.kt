@@ -12,7 +12,9 @@ import com.nv.pair.mnn.MnnChatRole
 import com.nv.pair.mnn.MnnError
 import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.mnn.MnnGenerationResult
+import com.nv.pair.mnn.MnnFinishReason
 import com.nv.pair.mnn.MnnInferenceService
+import com.nv.pair.mnn.MnnHealthStatus
 import com.nv.pair.mnn.MnnLoadedModel
 import com.nv.pair.mnn.MnnModelDescriptor
 import com.nv.pair.mnn.MnnResult
@@ -50,13 +52,98 @@ class MnnHttpServerTest {
             )
 
             assertTrue(health.startsWith("HTTP/1.1 200"))
+            assertTrue(health.contains("\"status\":\"ok\""))
+            assertTrue(health.contains("\"runtime_state\":\"unloaded\""))
             assertTrue(models.contains("\"id\":\"qwen3-0.6b\""))
             assertTrue(completion.startsWith("HTTP/1.1 200"))
             assertTrue(completion.contains("\"object\":\"chat.completion\""))
             assertTrue(completion.contains("\"content\":\"Hello world\""))
+            assertTrue(completion.contains("\"finish_reason\":\"stop\""))
             assertEquals(listOf(MnnChatMessage(MnnChatRole.USER, "Say hello.")), service.lastRequest?.messages)
         } finally {
             server.close()
+        }
+    }
+
+    @Test
+    fun healthReturns503WhenNativeRuntimeIsUnavailable() {
+        val server = MnnHttpServer(FakeInferenceService(available = false), TEST_PORT)
+        server.start()
+        try {
+            val health = http(server.localPort, "GET", "/healthz")
+
+            assertTrue(health.startsWith("HTTP/1.1 503"))
+            assertTrue(health.contains("\"status\":\"unavailable\""))
+            assertTrue(health.contains("\"runtime_state\":\"error\""))
+            assertTrue(health.contains("\"error_code\":\"native_library_unavailable\""))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun unsupportedOpenClLoadReturnsTyped422WithoutCpuSuccess() {
+        val server = MnnHttpServer(FakeInferenceService(supportsOpenCl = false), TEST_PORT)
+        server.start()
+        try {
+            val result = http(
+                server.localPort,
+                "POST",
+                "/internal/models/load",
+                """{"model":"qwen3-0.6b","backend":"opencl"}""",
+            )
+
+            assertTrue(result.startsWith("HTTP/1.1 422"))
+            assertTrue(result.contains("\"code\":\"backend_unsupported\""))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun mapsInferenceErrorsToConsistentOpenAiStatusTypeAndCode() {
+        val cases = listOf(
+            Triple(MnnErrorCode.ENGINE_BUSY, 409, "server_error"),
+            Triple(MnnErrorCode.BACKEND_UNSUPPORTED, 422, "invalid_request_error"),
+            Triple(MnnErrorCode.INVALID_REQUEST, 400, "invalid_request_error"),
+            Triple(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, 503, "server_error"),
+            Triple(MnnErrorCode.GENERATION_FAILED, 500, "server_error"),
+        )
+
+        cases.forEach { (errorCode, status, type) ->
+            val server = MnnHttpServer(FakeInferenceService(generationError = errorCode), TEST_PORT)
+            server.start()
+            try {
+                val response = http(server.localPort, "POST", "/v1/chat/completions", chatBody(stream = false))
+                val expectedCode = when (errorCode) {
+                    MnnErrorCode.ENGINE_BUSY -> "engine_busy"
+                    MnnErrorCode.BACKEND_UNSUPPORTED -> "backend_unsupported"
+                    MnnErrorCode.INVALID_REQUEST -> "invalid_request_error"
+                    MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE -> "engine_unavailable"
+                    else -> "server_error"
+                }
+                assertTrue("$errorCode returned unexpected status: $response", response.startsWith("HTTP/1.1 $status"))
+                assertTrue("$errorCode returned unexpected type: $response", response.contains("\"type\":\"$type\""))
+                assertTrue("$errorCode returned unexpected code: $response", response.contains("\"code\":\"$expectedCode\""))
+            } finally {
+                server.close()
+            }
+        }
+
+        val missingModelServer = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        missingModelServer.start()
+        try {
+            val response = http(
+                missingModelServer.localPort,
+                "POST",
+                "/v1/chat/completions",
+                """{"model":"missing-model","messages":[{"role":"user","content":"x"}]}""",
+            )
+            assertTrue(response.startsWith("HTTP/1.1 404"))
+            assertTrue(response.contains("\"type\":\"invalid_request_error\""))
+            assertTrue(response.contains("\"code\":\"model_not_found\""))
+        } finally {
+            missingModelServer.close()
         }
     }
 
@@ -72,6 +159,8 @@ class MnnHttpServerTest {
             assertTrue(stream, firstEvent >= 0)
             assertTrue(done > firstEvent)
             assertTrue(stream.contains("\"content\":\"Hello\""))
+            assertTrue(stream.contains("\"finish_reason\":\"stop\""))
+            assertEquals(1, Regex("data: \\[DONE\\]").findAll(stream).count())
 
             val usageStream = http(
                 server.localPort,
@@ -90,6 +179,35 @@ class MnnHttpServerTest {
             )
             assertTrue(unsupported.startsWith("HTTP/1.1 400"))
             assertTrue(unsupported.contains("\"code\":\"unsupported_parameter\""))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun completionAndStreamExposeLengthFinishReasonFromInference() {
+        val server = MnnHttpServer(
+            FakeInferenceService(generationFinishReason = MnnFinishReason.LENGTH),
+            TEST_PORT,
+        )
+        server.start()
+        try {
+            val completion = http(
+                server.localPort,
+                "POST",
+                "/v1/chat/completions",
+                """{"model":"qwen3-0.6b","messages":[{"role":"user","content":"x"}]}""",
+            )
+            assertTrue(completion.contains("\"finish_reason\":\"length\""))
+
+            val stream = http(
+                server.localPort,
+                "POST",
+                "/v1/chat/completions",
+                """{"model":"qwen3-0.6b","messages":[{"role":"user","content":"x"}],"stream":true}""",
+            )
+            assertTrue(stream.contains("\"finish_reason\":\"length\""))
+            assertEquals(1, Regex("data: \\[DONE\\]").findAll(stream).count())
         } finally {
             server.close()
         }
@@ -174,6 +292,10 @@ class MnnHttpServerTest {
 
     private class FakeInferenceService(
         private val blockAfterFirstToken: Boolean = false,
+        private val available: Boolean = true,
+        private val supportsOpenCl: Boolean = true,
+        private val generationError: MnnErrorCode? = null,
+        private val generationFinishReason: MnnFinishReason = MnnFinishReason.STOP,
     ) : MnnInferenceService {
         private val model = MnnModelDescriptor("qwen3-0.6b", "/models/qwen3-0.6b/config.json")
         val firstToken = CountDownLatch(1)
@@ -191,8 +313,17 @@ class MnnHttpServerTest {
             modelId = if (loaded) model.modelId else null,
         )
 
+        override fun health(): MnnHealthStatus = MnnHealthStatus(
+            available = available,
+            state = if (available) status().state else MnnEngineState.ERROR,
+            error = if (available) null else MnnError(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, "native unavailable"),
+        )
+
         override fun ensureLoaded(modelId: String, backend: MnnBackend): MnnResult<MnnLoadedModel> {
             if (modelId != model.modelId) return MnnResult.failure(MnnErrorCode.MODEL_NOT_FOUND, "Model not found.")
+            if (backend == MnnBackend.OPENCL && !supportsOpenCl) {
+                return MnnResult.failure(MnnErrorCode.BACKEND_UNSUPPORTED, "Backend unavailable.")
+            }
             loaded = true
             return MnnResult.success(MnnLoadedModel(model, backend))
         }
@@ -206,12 +337,16 @@ class MnnHttpServerTest {
                 return MnnResult.failure(MnnErrorCode.ENGINE_BUSY, "An MNN generation is already active.")
             }
             lastRequest = request
-            ensureLoaded(request.modelId, MnnBackend.CPU)
+            when (val loadResult = ensureLoaded(request.modelId, MnnBackend.CPU)) {
+                is MnnResult.Failure -> return loadResult
+                is MnnResult.Success -> Unit
+            }
+            generationError?.let { return MnnResult.failure(it, "Synthetic inference failure.") }
             onToken("Hello")
             firstToken.countDown()
             if (blockAfterFirstToken) releaseGeneration.await(5, TimeUnit.SECONDS)
             onToken(" world")
-            return MnnResult.success(MnnGenerationResult("Hello world", MnnRuntimeMetrics(generatedTokens = 2)))
+            return MnnResult.success(MnnGenerationResult("Hello world", MnnRuntimeMetrics(generatedTokens = 2), generationFinishReason))
         }
 
         override fun cancel(requestId: Long) {

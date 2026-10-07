@@ -12,13 +12,14 @@ import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.security.MessageDigest
+import java.util.Collections
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ModelHubInstallerTest {
     @Test
-    fun downloadsVerifiesAndInstallsMnnArtifactsUnderThePrivateModelRoot() {
+    fun successfulInstallPublishesAtomicallyUnderThePrivateModelRoot() {
         val artifacts = mnnArtifacts()
         val server = ArtifactServer(artifacts)
         val root = Files.createTempDirectory("pair-model-hub").toFile()
@@ -30,6 +31,7 @@ class ModelHubInstallerTest {
             assertEquals(ModelSourceKind.LOCAL, installed.source.kind)
             assertTrue(root.resolve("Qwen3-0.6B-MNN/config.json").isFile)
             assertTrue(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").isFile)
+            assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").exists().not())
         } finally {
             server.close()
             root.deleteRecursively()
@@ -37,7 +39,7 @@ class ModelHubInstallerTest {
     }
 
     @Test
-    fun rejectsChecksumMismatchAndRemovesTheIncompleteStagingDirectory() {
+    fun failedInstallLeavesNoFinalModelDirectory() {
         val artifacts = mnnArtifacts().toMutableMap()
         artifacts["llm.mnn.weight"] = "tampered".toByteArray()
         val server = ArtifactServer(artifacts)
@@ -57,6 +59,31 @@ class ModelHubInstallerTest {
         }
     }
 
+    @Test
+    fun missingRequiredArtifactHashFailsBeforePublish() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts, expectedRequests = 2)
+        val root = Files.createTempDirectory("pair-model-hub").toFile()
+        try {
+            val descriptor = catalogDescriptor(artifacts).copy(
+                files = catalogDescriptor(artifacts).files.map { file ->
+                    if (file.path == "llm.mnn.weight") file.copy(sha256 = null) else file
+                },
+            )
+            val failure = runCatching {
+                ModelHubInstaller(root).installMnnModel(descriptor, localHttpAdapter(server.port))
+            }.exceptionOrNull()
+
+            assertEquals("Missing trusted SHA-256 for llm.mnn.weight.", failure?.message)
+            assertEquals(listOf("config.json", "llm.mnn"), server.requestedPaths.toList())
+            assertTrue(root.resolve("Qwen3-0.6B-MNN").exists().not())
+            assertTrue(root.listFiles().orEmpty().isEmpty())
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
     private fun catalogDescriptor(artifacts: Map<String, ByteArray>) = ModelDescriptor(
         logicalId = "hugging_face:owner/Qwen3-0.6B-MNN",
         engineModelId = "owner/Qwen3-0.6B-MNN",
@@ -65,7 +92,6 @@ class ModelHubInstallerTest {
         parameterCount = 600_000_000,
         quantization = null,
         contextLength = null,
-        capabilities = setOf(ModelCapability.CHAT),
         source = ModelSource(ModelSourceKind.HUGGING_FACE, "owner/Qwen3-0.6B-MNN"),
         format = ModelFormat.MNN,
         estimatedMemoryBytes = 1_440_000_000,
@@ -92,11 +118,15 @@ class ModelHubInstallerTest {
         .digest(content)
         .joinToString("") { "%02x".format(it) }
 
-    private class ArtifactServer(private val artifacts: Map<String, ByteArray>) : AutoCloseable {
-        private val server = ServerSocket(0, artifacts.size, InetAddress.getByName("127.0.0.1"))
+    private class ArtifactServer(
+        private val artifacts: Map<String, ByteArray>,
+        expectedRequests: Int = artifacts.size,
+    ) : AutoCloseable {
+        private val server = ServerSocket(0, expectedRequests, InetAddress.getByName("127.0.0.1"))
+        val requestedPaths = Collections.synchronizedList(mutableListOf<String>())
         val port: Int = server.localPort
         private val worker = Thread {
-            repeat(artifacts.size) {
+            repeat(expectedRequests) {
                 server.accept().use(::serve)
             }
         }.apply { start() }
@@ -104,6 +134,7 @@ class ModelHubInstallerTest {
         private fun serve(socket: Socket) {
             val reader = socket.getInputStream().bufferedReader(StandardCharsets.US_ASCII)
             val path = reader.readLine()?.split(' ')?.getOrNull(1)?.removePrefix("/")
+            path?.let(requestedPaths::add)
             while (reader.readLine()?.isNotEmpty() == true) Unit
             val body = artifacts[path] ?: ByteArray(0)
             val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"

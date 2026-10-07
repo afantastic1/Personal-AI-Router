@@ -10,11 +10,114 @@ import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MnnInferenceServiceTest {
+    @Test
+    fun defaultBackendIsCpu() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime()
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime))
+        try {
+            assertTrue(service.generate(1, request()) { } is MnnResult.Success)
+            assertEquals(MnnBackend.CPU, runtime.getLoadedModel()?.backend)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun firstGenerationUsesSelectedOpenCl() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime()
+        val selection = MnnBackendSelection(MnnBackend.OPENCL)
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime), selection)
+        try {
+            assertTrue(service.generate(2, request()) { } is MnnResult.Success)
+            assertEquals(MnnBackend.OPENCL, runtime.getLoadedModel()?.backend)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun modelSwitchKeepsSelectedOpenCl() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        createModel(root, "qwen3-1.7b")
+        val runtime = FakeRuntime()
+        val service = LocalMnnInferenceService(
+            MnnModelCatalog(root),
+            MnnEngineHost(runtime),
+            MnnBackendSelection(MnnBackend.OPENCL),
+        )
+        try {
+            assertTrue(service.generate(3, request("qwen3-0.6b")) { } is MnnResult.Success)
+            assertTrue(service.generate(4, request("qwen3-1.7b")) { } is MnnResult.Success)
+            assertEquals(listOf(MnnBackend.OPENCL, MnnBackend.OPENCL), runtime.loadedBackends)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun sameModelReloadsWhenBackendPreferenceChanges() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime()
+        val selection = MnnBackendSelection(MnnBackend.CPU)
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime), selection)
+        try {
+            assertTrue(service.generate(5, request()) { } is MnnResult.Success)
+            selection.update(MnnBackend.OPENCL)
+            assertTrue(service.generate(6, request()) { } is MnnResult.Success)
+            assertEquals(listOf(MnnBackend.CPU, MnnBackend.OPENCL), runtime.loadedBackends)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun explicitLoadSelectsBackendForFollowingImplicitModelLoad() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        createModel(root, "qwen3-1.7b")
+        val runtime = FakeRuntime()
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime))
+        try {
+            assertTrue(service.ensureLoaded("qwen3-0.6b", MnnBackend.OPENCL) is MnnResult.Success)
+            assertTrue(service.generate(9, request("qwen3-1.7b")) { } is MnnResult.Success)
+            assertEquals(listOf(MnnBackend.OPENCL, MnnBackend.OPENCL), runtime.loadedBackends)
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun unsupportedOpenClDoesNotSilentlyFallbackAndCpuWorksAfterward() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime(supportedBackends = setOf(MnnBackend.CPU))
+        val selection = MnnBackendSelection(MnnBackend.OPENCL)
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime), selection)
+        try {
+            val unsupported = service.generate(7, request()) { }
+            assertEquals(MnnErrorCode.BACKEND_UNSUPPORTED, failureCode(unsupported))
+            assertEquals(listOf(MnnBackend.OPENCL), runtime.loadedBackends)
+
+            selection.update(MnnBackend.CPU)
+            assertTrue(service.generate(8, request()) { } is MnnResult.Success)
+            assertEquals(listOf(MnnBackend.OPENCL, MnnBackend.CPU), runtime.loadedBackends)
+        } finally {
+            service.close()
+        }
+    }
+
     @Test
     fun loadsOneCatalogModelAndReturnsTypedMissingModelFailure() {
         val root = Files.createTempDirectory("pair-mnn-service").toFile()
@@ -99,7 +202,8 @@ class MnnInferenceServiceTest {
         directory.resolve("tokenizer.txt").writeText("tokenizer")
     }
 
-    private fun request() = MnnChatRequest("qwen3-0.6b", listOf(MnnChatMessage(MnnChatRole.USER, "hello")))
+    private fun request(modelId: String = "qwen3-0.6b") =
+        MnnChatRequest(modelId, listOf(MnnChatMessage(MnnChatRole.USER, "hello")))
 
     private fun failureCode(result: MnnResult<*>): MnnErrorCode = when (result) {
         is MnnResult.Failure -> result.error.code
@@ -109,9 +213,11 @@ class MnnInferenceServiceTest {
     private class FakeRuntime(
         private val blockGeneration: Boolean = false,
         generationFailures: Int = 0,
+        private val supportedBackends: Set<MnnBackend> = setOf(MnnBackend.CPU, MnnBackend.OPENCL),
     ) : MnnRuntime {
         val generationStarted = CountDownLatch(1)
         val loadCount = AtomicInteger()
+        val loadedBackends = CopyOnWriteArrayList<MnnBackend>()
         private val releaseGeneration = CountDownLatch(1)
         private val remainingGenerationFailures = AtomicInteger(generationFailures)
         @Volatile private var loaded: MnnLoadedModel? = null
@@ -119,6 +225,10 @@ class MnnInferenceServiceTest {
 
         override fun loadModel(model: MnnModelDescriptor, backend: MnnBackend): MnnResult<Unit> {
             loadCount.incrementAndGet()
+            loadedBackends.add(backend)
+            if (backend !in supportedBackends) {
+                return MnnResult.failure(MnnErrorCode.BACKEND_UNSUPPORTED, "Backend unavailable")
+            }
             loaded = MnnLoadedModel(model, backend)
             return MnnResult.success(Unit)
         }
@@ -135,7 +245,7 @@ class MnnInferenceServiceTest {
                 return MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "generation failed")
             }
             onToken("response")
-            return MnnResult.success(MnnGenerationResult("response", MnnRuntimeMetrics(generatedTokens = 1)))
+            return MnnResult.success(MnnGenerationResult("response", MnnRuntimeMetrics(generatedTokens = 1), MnnFinishReason.STOP))
         }
 
         override fun cancel(requestId: Long) {

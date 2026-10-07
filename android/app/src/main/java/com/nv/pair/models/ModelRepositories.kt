@@ -32,50 +32,24 @@ class ModelCatalogRepository(
     }
 }
 
+data class ModelInventoryItem(
+    val modelId: String,
+    val nodeId: String,
+    val engine: String,
+    val loaded: Boolean,
+)
+
 class ModelInventoryRepository {
-    fun fromNetwork(nodes: List<PairNode>): List<RuntimeModel> = nodes.flatMap { node ->
+    fun fromNetwork(nodes: List<PairNode>): List<ModelInventoryItem> = nodes.flatMap { node ->
         node.modelsByEngine.flatMap { (engine, models) ->
             models.map { modelId ->
-                val descriptor = ModelDescriptor(
-                    logicalId = "$engine:$modelId",
-                    engineModelId = modelId,
-                    displayName = modelId,
-                    family = inferFamily(modelId),
-                    parameterCount = inferParameterCount(modelId),
-                    quantization = null,
-                    contextLength = null,
-                    capabilities = inferCapabilities(modelId),
-                    source = ModelSource(ModelSourceKind.RUNTIME, node.hostUuid.ifBlank { node.id }),
-                    format = if (engine == "mnn") ModelFormat.MNN else ModelFormat.UNKNOWN,
-                    estimatedMemoryBytes = null,
-                    compatibility = ModelCompatibility.UNKNOWN,
-                )
-                RuntimeModel(
-                    model = descriptor,
+                ModelInventoryItem(
+                    modelId = modelId,
                     nodeId = node.hostUuid.ifBlank { node.id },
                     engine = engine,
-                    available = true,
                     loaded = node.loadedByEngine[engine].orEmpty().any { it == modelId },
                 )
             }
         }
-    }
-
-    private fun inferFamily(modelId: String): String = FAMILY_NAMES.firstOrNull { modelId.contains(it, ignoreCase = true) } ?: "unknown"
-
-    private fun inferParameterCount(modelId: String): Long? = PARAMETER_PATTERN.find(modelId)?.groupValues?.get(1)
-        ?.toDoubleOrNull()?.let { (it * BILLION).toLong() }
-
-    private fun inferCapabilities(modelId: String): Set<ModelCapability> = buildSet {
-        val lower = modelId.lowercase()
-        if ("embed" in lower) add(ModelCapability.EMBEDDINGS) else add(ModelCapability.CHAT)
-        if ("vision" in lower || "llava" in lower || "-vl" in lower || "_vl" in lower) add(ModelCapability.VISION)
-        if ("tool" in lower) add(ModelCapability.TOOLS)
-    }
-
-    private companion object {
-        const val BILLION = 1_000_000_000.0
-        val FAMILY_NAMES = listOf("qwen", "llama", "gemma", "mistral", "deepseek", "phi", "smollm", "internlm")
-        val PARAMETER_PATTERN = Regex("(?i)([0-9]+(?:\\.[0-9]+)?)\\s*[- ]?B(?:\\b|$)")
     }
 }

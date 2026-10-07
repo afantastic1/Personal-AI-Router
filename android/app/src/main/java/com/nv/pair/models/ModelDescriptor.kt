@@ -5,13 +5,18 @@
 
 package com.nv.pair.models
 
-enum class ModelCapability { CHAT, VISION, TOOLS, EMBEDDINGS }
-
 enum class ModelSourceKind { MODELSCOPE, HUGGING_FACE, LOCAL, RUNTIME }
 
 enum class ModelFormat { MNN, GGUF, ONNX, UNKNOWN }
 
 enum class ModelCompatibility { COMPATIBLE, UNKNOWN, INCOMPATIBLE }
+
+enum class ModelInstallability {
+    VERIFIED_INSTALLABLE,
+    MISSING_VERIFICATION_METADATA,
+    UNSUPPORTED_FORMAT,
+    INCOMPLETE_ARTIFACT_SET,
+}
 
 data class ModelSource(
     val kind: ModelSourceKind,
@@ -33,7 +38,6 @@ data class ModelDescriptor(
     val parameterCount: Long?,
     val quantization: String?,
     val contextLength: Int?,
-    val capabilities: Set<ModelCapability>,
     val source: ModelSource,
     val format: ModelFormat,
     val estimatedMemoryBytes: Long?,
@@ -41,30 +45,20 @@ data class ModelDescriptor(
     val files: List<ModelFile> = emptyList(),
 )
 
-/** A runtime observation. Catalog records are never eligible for selection by themselves. */
-data class RuntimeModel(
-    val model: ModelDescriptor,
-    val nodeId: String,
-    val engine: String,
-    val available: Boolean,
-    val loaded: Boolean,
-    val tokensPerSecond: Double? = null,
-    val timeToFirstTokenMillis: Long? = null,
-    val memoryPressure: Double = 0.0,
-    val availableMemoryBytes: Long? = null,
-    val networkCost: Double = 0.0,
-)
+fun ModelDescriptor.installability(): ModelInstallability {
+    if (format != ModelFormat.MNN) return ModelInstallability.UNSUPPORTED_FORMAT
 
-data class ModelRequirements(
-    val capabilities: Set<ModelCapability> = setOf(ModelCapability.CHAT),
-    val minimumContextLength: Int = 0,
-    val maximumMemoryBytes: Long? = null,
-)
+    val filesByPath = files.associateBy(ModelFile::path)
+    val requiredPaths = listOf("config.json", "llm.mnn", "llm.mnn.weight", "tokenizer.txt")
+    if (requiredPaths.any { filesByPath[it] == null }) {
+        return ModelInstallability.INCOMPLETE_ARTIFACT_SET
+    }
+    if (requiredPaths.any { path -> filesByPath[path]?.sha256?.let(::isTrustedSha256) != true }) {
+        return ModelInstallability.MISSING_VERIFICATION_METADATA
+    }
+    return ModelInstallability.VERIFIED_INSTALLABLE
+}
 
-data class ModelSelection(
-    val requestedModel: String,
-    val policyAlias: String,
-    val model: ModelDescriptor,
-    val engine: String,
-    val score: Double,
-)
+internal fun isTrustedSha256(value: String): Boolean = value.matches(TRUSTED_SHA256_PATTERN)
+
+private val TRUSTED_SHA256_PATTERN = Regex("(?i)[0-9a-f]{64}")

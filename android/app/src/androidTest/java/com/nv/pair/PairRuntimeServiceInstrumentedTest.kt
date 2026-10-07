@@ -10,6 +10,8 @@ import androidx.core.content.ContextCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.nv.pair.data.PairNode
+import com.nv.pair.data.RouterRepository
+import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.data.UiPreferencesRepository
 import com.nv.pair.network.AndroidNetworkContext
 import com.nv.pair.runtime.PairRuntimeController
@@ -18,6 +20,7 @@ import com.nv.pair.runtime.RuntimePhase
 import java.io.IOException
 import java.io.File
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.runBlocking
@@ -138,6 +141,22 @@ class PairRuntimeServiceInstrumentedTest {
     }
 
     @Test
+    fun mnnPortConflictDoesNotPreventPairRuntimeFromRunning() = runBlocking {
+        withMnnPortConflict { controller ->
+            assertEquals(RuntimePhase.RUNNING, controller.state.value.phase)
+        }
+    }
+
+    @Test
+    fun mnnUnavailableDoesNotPublishMnnProxyReady() = runBlocking {
+        withMnnPortConflict { controller ->
+            assertFalse("MNN local engine status must be unavailable", controller.mnnLocalEngine.value.available)
+            assertEquals(MnnErrorCode.INTERNAL_ERROR, controller.mnnLocalEngine.value.errorCode)
+            assertFalse("MNN facade must not start without its local runtime", canConnectMnnFacade(MNN_LOOPBACK))
+        }
+    }
+
+    @Test
     fun startsForegroundRuntimeAndStopsGracefully() = runBlocking {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
@@ -157,6 +176,11 @@ class PairRuntimeServiceInstrumentedTest {
         }
         assertEquals(RuntimePhase.STOPPED, stopped.phase)
         assertFalse(preferences.readDesiredRuntimeRunning())
+        assertEquals(
+            RouterRepository.ROUTER_ENGINES,
+            controller.proxies.value.map { it.engine },
+        )
+        assertTrue(controller.proxies.value.all { !it.ready && it.port == 0 })
     }
 
     @Test
@@ -233,6 +257,29 @@ class PairRuntimeServiceInstrumentedTest {
                 .toByteArray(StandardCharsets.US_ASCII),
         )
         socket.getInputStream().readBytes().toString(StandardCharsets.UTF_8)
+    }
+
+    private suspend fun withMnnPortConflict(action: suspend (PairRuntimeController) -> Unit) {
+        val reservation = ServerSocket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress(MNN_LOOPBACK, MNN_PORT))
+        }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val controller = PairRuntimeController(context)
+        try {
+            controller.start()
+            withTimeout(30_000) { controller.state.first { it.phase == RuntimePhase.RUNNING } }
+            action(controller)
+        } finally {
+            try {
+                controller.stop()
+                withTimeout(30_000) {
+                    controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
+                }
+            } finally {
+                reservation.close()
+            }
+        }
     }
 
     private fun canConnectMnn(address: String): Boolean = Socket().use { socket ->

@@ -66,6 +66,38 @@ class MnnRuntimeInstrumentedTest {
     }
 
     @Test
+    fun nativeTerminalStatusMapsToStopAndLengthFinishReasons() {
+        val runtime = NativeMnn.create()
+        try {
+            assertSuccess(runtime.loadModel(requiredModelDescriptor(), MnnBackend.CPU), "CPU load")
+
+            val tokenLimited = runtime.generate(
+                requestId = 190,
+                request = MnnChatRequest(
+                    "qwen-device-test",
+                    listOf(MnnChatMessage(MnnChatRole.USER, "Reply with one short word.")),
+                    maxTokens = 1,
+                    temperature = 0f,
+                ),
+            ) { }
+            assertEquals(MnnFinishReason.LENGTH, generationFinishReason(tokenLimited))
+
+            val naturallyStopped = runtime.generate(
+                requestId = 191,
+                request = MnnChatRequest(
+                    "qwen-device-test",
+                    listOf(MnnChatMessage(MnnChatRole.USER, "Reply with exactly the word yes, then stop. /no_think")),
+                    maxTokens = 32,
+                    temperature = 0f,
+                ),
+            ) { }
+            assertEquals(MnnFinishReason.STOP, generationFinishReason(naturallyStopped))
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun cancellationQuiescesGenerationBeforeUnloadAndReload() {
         val runtime = NativeMnn.create()
         try {
@@ -215,6 +247,11 @@ class MnnRuntimeInstrumentedTest {
 
     private fun generationText(result: MnnResult<MnnGenerationResult>): String = when (result) {
         is MnnResult.Success -> result.value.text
+        is MnnResult.Failure -> error("Expected generation to succeed: ${result.error.code}")
+    }
+
+    private fun generationFinishReason(result: MnnResult<MnnGenerationResult>): MnnFinishReason = when (result) {
+        is MnnResult.Success -> result.value.finishReason
         is MnnResult.Failure -> error("Expected generation to succeed: ${result.error.code}")
     }
 }

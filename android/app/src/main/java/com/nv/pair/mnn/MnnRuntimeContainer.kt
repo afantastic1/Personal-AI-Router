@@ -13,13 +13,27 @@ class MnnRuntimeContainer(
     modelRoot: File,
     port: Int = MnnHttpServer.DEFAULT_PORT,
     runtime: MnnRuntime = NativeMnn.create(),
+    preferredBackend: MnnBackend = MnnBackend.CPU,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
-    private val inference = LocalMnnInferenceService(MnnModelCatalog(modelRoot), MnnEngineHost(runtime))
+    private val backendSelection = MnnBackendSelection(preferredBackend)
+    private val inference = LocalMnnInferenceService(
+        MnnModelCatalog(modelRoot),
+        MnnEngineHost(runtime),
+        backendSelection,
+    )
     private val httpServer = MnnHttpServer(inference, port)
 
     val localPort: Int
         get() = httpServer.localPort
+
+    fun health(): MnnHealthStatus = inference.health()
+
+    fun runtimeStatus(): MnnRuntimeStatus = inference.status()
+
+    fun preferredBackend(): MnnBackend = inference.preferredBackend()
+
+    fun setPreferredBackend(backend: MnnBackend) = inference.setPreferredBackend(backend)
 
     fun start() {
         check(!closed.get()) { "MNN runtime container is closed." }

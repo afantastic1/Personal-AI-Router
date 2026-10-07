@@ -16,6 +16,84 @@ import org.junit.Test
 
 class MnnEngineHostTest {
     @Test
+    fun closeCancelsActiveGeneration() {
+        val runtime = FakeMnnRuntime(blockGeneration = true)
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        val generationFinished = CountDownLatch(1)
+        Thread {
+            host.generate(30, chatRequest()) { }
+            generationFinished.countDown()
+        }.start()
+        assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
+
+        host.close()
+
+        assertEquals(1, runtime.cancelCount.get())
+        assertTrue(generationFinished.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun closeReturnsWithinBoundWhenRuntimeIgnoresCancel() {
+        val runtime = FakeMnnRuntime(blockGeneration = true, ignoreCancellation = true)
+        val warnings = mutableListOf<String>()
+        val host = MnnEngineHost(runtime, shutdownTimeoutMillis = 50, logWarning = warnings::add)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        Thread { host.generate(31, chatRequest()) { } }.start()
+        assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
+        val startedAt = System.nanoTime()
+
+        host.close()
+
+        val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        assertTrue("close took ${elapsedMillis}ms", elapsedMillis < 1_000)
+        assertTrue(warnings.single().contains("native runtime may remain allocated until process exit"))
+        runtime.releaseGeneration.countDown()
+    }
+
+    @Test
+    fun pairStopContinuesWhenMnnCloseTimesOut() {
+        val runtime = FakeMnnRuntime(blockGeneration = true, ignoreCancellation = true)
+        val host = MnnEngineHost(runtime, shutdownTimeoutMillis = 50, logWarning = {})
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        Thread { host.generate(32, chatRequest()) { } }.start()
+        assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
+        val stopContinued = CountDownLatch(1)
+
+        Thread {
+            host.close()
+            stopContinued.countDown()
+        }.start()
+
+        assertTrue("PAIR stop remained blocked on MNN close", stopContinued.await(1, TimeUnit.SECONDS))
+        runtime.releaseGeneration.countDown()
+    }
+
+    @Test
+    fun normalCloseStillUnloadsAndDestroysRuntime() {
+        val runtime = FakeMnnRuntime()
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+
+        host.close()
+
+        assertEquals(1, runtime.closeCount.get())
+        assertEquals(1, runtime.unloadCount.get())
+    }
+
+    @Test
+    fun initialNativeUnavailableIsPreservedByHost() {
+        val runtime = NativeMnn.create { throw UnsatisfiedLinkError("synthetic unavailable library") }
+        val host = MnnEngineHost(runtime)
+
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertEquals(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, host.getStatus().error?.code)
+        assertFalse(host.getHealth().available)
+        assertEquals(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, host.getHealth().error?.code)
+        host.close()
+    }
+
+    @Test
     fun successfulLoadReachesReady() {
         val host = MnnEngineHost(FakeMnnRuntime())
 
@@ -53,6 +131,35 @@ class MnnEngineHostTest {
             is MnnResult.Success -> error("Expected runtime load exception to be translated")
         }
         assertEquals(MnnErrorCode.MODEL_LOAD_FAILED, errorCode)
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertEquals(null, host.getLoadedModel())
+        host.close()
+    }
+
+    @Test
+    fun repeatedLoadFailuresLeaveNoModelAndLaterLoadWorks() {
+        val runtime = FakeMnnRuntime(failLoadAttempts = 2)
+        val host = MnnEngineHost(runtime)
+
+        repeat(2) {
+            assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Failure)
+            assertEquals(null, host.getLoadedModel())
+        }
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        assertTrue(host.generate(15, chatRequest()) { } is MnnResult.Success)
+
+        assertEquals(MnnEngineState.READY, host.getStatus().state)
+        host.close()
+    }
+
+    @Test
+    fun failedUnloadSynchronizesLoadedModelWithRuntime() {
+        val runtime = FakeMnnRuntime(unloadFailureDropsModel = true)
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+
+        assertTrue(host.unloadModel() is MnnResult.Failure)
+
         assertEquals(MnnEngineState.ERROR, host.getStatus().state)
         assertEquals(null, host.getLoadedModel())
         host.close()
@@ -101,6 +208,37 @@ class MnnEngineHostTest {
         }
         assertEquals(MnnErrorCode.CANCELLED, errorCode)
         assertEquals(MnnEngineState.READY, host.getStatus().state)
+        assertTrue(host.generate(10, chatRequest()) { } is MnnResult.Success)
+        host.close()
+    }
+
+    @Test
+    fun generationFailureCanBeFollowedByReloadAndAnotherGeneration() {
+        val runtime = FakeMnnRuntime(failingRequestId = 16)
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+
+        assertTrue(host.generate(16, chatRequest()) { } is MnnResult.Failure)
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        assertTrue(host.generate(17, chatRequest()) { } is MnnResult.Success)
+
+        assertEquals(MnnEngineState.READY, host.getStatus().state)
+        host.close()
+    }
+
+    @Test
+    fun metricsReadFailureDuringGenerationCleanupDoesNotLeaveHostGenerating() {
+        val runtime = FakeMnnRuntime(failingRequestId = 18)
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        runtime.throwOnNextMetricsRead.set(true)
+
+        assertTrue(host.generate(18, chatRequest()) { } is MnnResult.Failure)
+
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        assertTrue(host.generate(19, chatRequest()) { } is MnnResult.Success)
         host.close()
     }
 
@@ -159,6 +297,18 @@ class MnnEngineHostTest {
         assertEquals(MnnErrorCode.BACKEND_UNSUPPORTED, errorCode)
         assertTrue(cpuResult is MnnResult.Success)
         assertEquals(MnnEngineState.READY, host.getStatus().state)
+        assertTrue(host.getHealth().available)
+        host.close()
+    }
+
+    @Test
+    fun recoverableModelLoadFailureKeepsRuntimeAvailable() {
+        val host = MnnEngineHost(FakeMnnRuntime(loadError = MnnErrorCode.MODEL_LOAD_FAILED))
+
+        host.loadModel(model(), MnnBackend.CPU)
+
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertTrue(host.getHealth().available)
         host.close()
     }
 
@@ -177,12 +327,20 @@ class MnnEngineHostTest {
         private val loadError: MnnErrorCode? = null,
         private val throwOnLoad: Boolean = false,
         private val blockGeneration: Boolean = false,
-        private val supportedBackends: Set<MnnBackend> = setOf(MnnBackend.CPU, MnnBackend.OPENCL)
+        private val ignoreCancellation: Boolean = false,
+        private val supportedBackends: Set<MnnBackend> = setOf(MnnBackend.CPU, MnnBackend.OPENCL),
+        failLoadAttempts: Int = 0,
+        private val failingRequestId: Long? = null,
+        private val unloadFailureDropsModel: Boolean = false,
     ) : MnnRuntime {
         val generationStarted = CountDownLatch(1)
         val releaseGeneration = CountDownLatch(1)
         val loadCount = AtomicInteger()
         val unloadCount = AtomicInteger()
+        val cancelCount = AtomicInteger()
+        val closeCount = AtomicInteger()
+        private val loadFailuresRemaining = AtomicInteger(failLoadAttempts)
+        val throwOnNextMetricsRead = java.util.concurrent.atomic.AtomicBoolean(false)
         private var loadedModel: MnnLoadedModel? = null
         private var activeRequestId: Long? = null
         @Volatile private var cancelledRequestId: Long? = null
@@ -191,6 +349,9 @@ class MnnEngineHostTest {
             loadCount.incrementAndGet()
             if (throwOnLoad) {
                 error("Synthetic runtime failure")
+            }
+            if (loadFailuresRemaining.getAndUpdate { remaining -> if (remaining > 0) remaining - 1 else remaining } > 0) {
+                return MnnResult.failure(MnnErrorCode.MODEL_LOAD_FAILED, "Synthetic model load failure")
             }
             if (backend !in supportedBackends) {
                 return MnnResult.failure(MnnErrorCode.BACKEND_UNSUPPORTED, "Backend unavailable")
@@ -210,7 +371,17 @@ class MnnEngineHostTest {
             activeRequestId = requestId
             generationStarted.countDown()
             if (blockGeneration) {
-                releaseGeneration.await(2, TimeUnit.SECONDS)
+                if (ignoreCancellation) {
+                    while (releaseGeneration.count != 0L) {
+                        try {
+                            releaseGeneration.await()
+                        } catch (_: InterruptedException) {
+                            // Simulate a native call that ignores both cancellation and interruption.
+                        }
+                    }
+                } else {
+                    releaseGeneration.await(2, TimeUnit.SECONDS)
+                }
             } else {
                 onToken("synthetic")
                 onToken(" response")
@@ -219,16 +390,21 @@ class MnnEngineHostTest {
             if (cancelledRequestId == requestId) {
                 return MnnResult.failure(MnnErrorCode.CANCELLED, "Generation cancelled")
             }
+            if (failingRequestId == requestId) {
+                return MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "Synthetic generation failure")
+            }
             return MnnResult.success(
                 MnnGenerationResult(
                     text = "synthetic response",
-                    metrics = MnnRuntimeMetrics(generatedTokens = 2)
+                    metrics = MnnRuntimeMetrics(generatedTokens = 2),
+                    finishReason = MnnFinishReason.STOP,
                 )
             )
         }
 
         override fun cancel(requestId: Long) {
-            if (activeRequestId == requestId) {
+            cancelCount.incrementAndGet()
+            if (activeRequestId == requestId && !ignoreCancellation) {
                 cancelledRequestId = requestId
                 releaseGeneration.countDown()
             }
@@ -236,7 +412,13 @@ class MnnEngineHostTest {
 
         override fun unloadModel(): MnnResult<Unit> {
             unloadCount.incrementAndGet()
-            loadedModel = null
+            if (!unloadFailureDropsModel) {
+                loadedModel = null
+            }
+            if (unloadFailureDropsModel) {
+                loadedModel = null
+                return MnnResult.failure(MnnErrorCode.MODEL_LOAD_FAILED, "Synthetic unload failure")
+            }
             return MnnResult.success(Unit)
         }
 
@@ -247,9 +429,15 @@ class MnnEngineHostTest {
 
         override fun getLoadedModel(): MnnLoadedModel? = loadedModel
 
-        override fun getMetrics(): MnnRuntimeMetrics = MnnRuntimeMetrics()
+        override fun getMetrics(): MnnRuntimeMetrics {
+            if (throwOnNextMetricsRead.compareAndSet(true, false)) {
+                error("Synthetic metrics read failure")
+            }
+            return MnnRuntimeMetrics()
+        }
 
         override fun close() {
+            closeCount.incrementAndGet()
             unloadModel()
         }
     }

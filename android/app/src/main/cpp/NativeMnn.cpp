@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
@@ -27,6 +28,7 @@ namespace {
 
 constexpr jint kSuccess = 0;
 constexpr jint kCancelled = 1;
+constexpr jint kLength = 7;
 constexpr jint kUnsupported = 2;
 constexpr jint kInvalidConfig = 3;
 constexpr jint kLoadFailed = 4;
@@ -297,16 +299,20 @@ Java_com_nv_pair_mnn_NativeMnn_nativeLoadModel(JNIEnv* env, jobject, jlong handl
     session->durationMillis = 0;
 
     try {
-        MNN::Transformer::Llm* llm = MNN::Transformer::Llm::createLLM(path);
-        if (llm == nullptr) {
+        using LlmPtr = std::unique_ptr<MNN::Transformer::Llm, void (*)(MNN::Transformer::Llm*)>;
+        LlmPtr candidate(
+            MNN::Transformer::Llm::createLLM(path),
+            &MNN::Transformer::Llm::destroy
+        );
+        if (candidate == nullptr) {
             return kLoadFailed;
         }
         const char* backendName = backend == 0 ? "cpu" : "opencl";
         const std::string runtimeConfig = std::string("{\"backend_type\":\"") + backendName + "\"}";
-        if (!llm->set_config(runtimeConfig) || !llm->load()) {
-            return LoadErrorCode(llm, false);
+        if (!candidate->set_config(runtimeConfig) || !candidate->load()) {
+            return LoadErrorCode(candidate.get(), false);
         }
-        session->llm = llm;
+        session->llm = candidate.release();
         session->backend = backend;
         session->promptTokens = 0;
         session->generatedTokens = 0;
@@ -480,7 +486,7 @@ Java_com_nv_pair_mnn_NativeMnn_nativeGenerateChat(
                     break;
                 }
                 if (tokenIndex + 1 == maxTokens) {
-                    result.store(kSuccess);
+                    result.store(kLength);
                 }
             }
             if (session->cancelledRequestId.load() == requestId) {
@@ -501,7 +507,7 @@ Java_com_nv_pair_mnn_NativeMnn_nativeGenerateChat(
                 const auto* finalContext = llm->getContext();
                 if (finalContext != nullptr && finalContext->status == MNN::Transformer::LlmStatus::RUNNING &&
                     session->generatedTokens >= maxTokens) {
-                    result.store(kSuccess);
+                    result.store(kLength);
                 }
             }
         } catch (const std::exception&) {

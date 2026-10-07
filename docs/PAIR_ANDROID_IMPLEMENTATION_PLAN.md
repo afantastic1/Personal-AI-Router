@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # PAIR Android / Mobile Compute Node 完整开发施工文档
 
 > 文档状态：Architecture Frozen / Implementation Plan  

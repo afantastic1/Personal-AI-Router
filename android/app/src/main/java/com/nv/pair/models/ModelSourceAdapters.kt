@@ -193,17 +193,6 @@ private fun modelDescriptor(
         ?.let { (it * PARAMETERS_PER_BILLION).toLong() }
     val quantization = QUANTIZATION_PATTERN.find(searchable)?.value
     val context = CONTEXT_PATTERN.find(searchable)?.groupValues?.get(1)?.toIntOrNull()
-    val capabilities = buildSet {
-        add(ModelCapability.CHAT)
-        if ("vision" in searchable.lowercase() || "image" in searchable.lowercase() || "vl" in searchable.lowercase()) {
-            add(ModelCapability.VISION)
-        }
-        if ("embedding" in searchable.lowercase() || "embed" in searchable.lowercase()) {
-            remove(ModelCapability.CHAT)
-            add(ModelCapability.EMBEDDINGS)
-        }
-        if ("tool" in searchable.lowercase() || "function-calling" in searchable.lowercase()) add(ModelCapability.TOOLS)
-    }
     val memory = parameters?.let { (it * BYTES_PER_PARAMETER).toLong() }
     return ModelDescriptor(
         logicalId = "${kind.name.lowercase()}:$repository",
@@ -213,7 +202,6 @@ private fun modelDescriptor(
         parameterCount = parameters,
         quantization = quantization,
         contextLength = context,
-        capabilities = capabilities,
         source = ModelSource(kind, repository),
         format = format,
         estimatedMemoryBytes = memory,

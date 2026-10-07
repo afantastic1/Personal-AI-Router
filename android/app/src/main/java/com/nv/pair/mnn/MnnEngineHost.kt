@@ -7,14 +7,18 @@ package com.nv.pair.mnn
 
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 class MnnEngineHost(
-    private val runtime: MnnRuntime
+    private val runtime: MnnRuntime,
+    private val shutdownTimeoutMillis: Long = SHUTDOWN_TIMEOUT_MILLIS,
+    private val logWarning: (String) -> Unit = { message -> android.util.Log.w(TAG, message) },
 ) : AutoCloseable {
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "pair-mnn-runtime").apply { isDaemon = true }
@@ -27,17 +31,34 @@ class MnnEngineHost(
     private var activeRequestId: Long? = null
     private var lastError: MnnError? = null
     private var metrics = MnnRuntimeMetrics()
+    private var runtimeAvailable = true
+
+    init {
+        try {
+            val runtimeStatus = runtime.getStatus()
+            state = runtimeStatus.state
+            loadedModel = runtime.getLoadedModel()
+            lastError = runtimeStatus.error
+            metrics = runtime.getMetrics()
+            runtimeAvailable = runtimeStatus.error?.code != MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE
+        } catch (_: Exception) {
+            state = MnnEngineState.ERROR
+            lastError = MnnError(MnnErrorCode.INTERNAL_ERROR, "MNN runtime initialization failed.")
+            runtimeAvailable = false
+        }
+    }
 
     fun loadModel(model: MnnModelDescriptor, backend: MnnBackend): MnnResult<Unit> =
         dispatch {
-            stateLock.withLock {
+            val previousModel = stateLock.withLock {
                 state = MnnEngineState.LOADING
                 lastError = null
+                loadedModel
             }
-            if (loadedModel != null) {
+            if (previousModel != null) {
                 val unloadResult = runtime.unloadModel()
                 if (unloadResult is MnnResult.Failure) {
-                    return@dispatch failState(unloadResult.error)
+                    return@dispatch failStateAfterRuntimeSync(unloadResult.error)
                 }
                 stateLock.withLock { loadedModel = null }
             }
@@ -105,22 +126,30 @@ class MnnEngineHost(
                 } catch (_: Exception) {
                     MnnResult.failure(MnnErrorCode.GENERATION_FAILED, "MNN generation failed.")
                 }
+                val generationMetrics = when (result) {
+                    is MnnResult.Success -> result.value.metrics
+                    is MnnResult.Failure -> runCatching { runtime.getMetrics() }
+                        .getOrDefault(MnnRuntimeMetrics())
+                }
                 stateLock.withLock {
                     activeRequestId = null
                     when (result) {
                         is MnnResult.Success -> {
-                            metrics = result.value.metrics
+                            metrics = generationMetrics
                             state = MnnEngineState.READY
                             lastError = null
                         }
                         is MnnResult.Failure -> {
-                            metrics = runtime.getMetrics()
+                            metrics = generationMetrics
                             if (result.error.code == MnnErrorCode.CANCELLED) {
                                 state = MnnEngineState.READY
                                 lastError = null
                             } else {
                                 state = MnnEngineState.ERROR
                                 lastError = result.error
+                                if (result.error.code == MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE) {
+                                    runtimeAvailable = false
+                                }
                             }
                         }
                     }
@@ -141,7 +170,10 @@ class MnnEngineHost(
     }
 
     fun unloadModel(): MnnResult<Unit> = dispatch {
-        if (loadedModel == null && state == MnnEngineState.UNLOADED) {
+        val isAlreadyUnloaded = stateLock.withLock {
+            loadedModel == null && state == MnnEngineState.UNLOADED
+        }
+        if (isAlreadyUnloaded) {
             return@dispatch MnnResult.success(Unit)
         }
         when (val result = runtime.unloadModel()) {
@@ -155,7 +187,7 @@ class MnnEngineHost(
                 }
                 MnnResult.success(Unit)
             }
-            is MnnResult.Failure -> failState(result.error)
+            is MnnResult.Failure -> failStateAfterRuntimeSync(result.error)
         }
     }
 
@@ -172,9 +204,24 @@ class MnnEngineHost(
 
     fun getMetrics(): MnnRuntimeMetrics = stateLock.withLock { metrics }
 
+    fun getHealth(): MnnHealthStatus = stateLock.withLock {
+        val available = runtimeAvailable && !isClosed.get()
+        MnnHealthStatus(
+            available = available,
+            state = state,
+            error = if (available) null else lastError
+                ?: MnnError(MnnErrorCode.INVALID_STATE, "MNN runtime is unavailable."),
+        )
+    }
+
     override fun close() {
         if (isClosed.compareAndSet(false, true)) {
-            try {
+            val requestToCancel = stateLock.withLock { activeRequestId }
+            requestToCancel?.let { requestId ->
+                runCatching { runtime.cancel(requestId) }
+                    .onFailure { warnShutdown("Could not cancel active MNN generation during shutdown.") }
+            }
+            val closeFuture: Future<*> = try {
                 executor.submit {
                     runCatching { runtime.close() }
                     stateLock.withLock {
@@ -182,16 +229,30 @@ class MnnEngineHost(
                         activeRequestId = null
                         state = MnnEngineState.UNLOADED
                     }
-                }.get()
-            } catch (_: Exception) {
+                }
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
                 executor.shutdownNow()
                 return
             }
-            executor.shutdown()
-            if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+            try {
+                closeFuture.get(shutdownTimeoutMillis, TimeUnit.MILLISECONDS)
+                executor.shutdown()
+            } catch (_: TimeoutException) {
+                warnShutdown("MNN shutdown exceeded ${shutdownTimeoutMillis}ms; native runtime may remain allocated until process exit.")
+                executor.shutdownNow()
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                warnShutdown("MNN shutdown was interrupted; native runtime may remain allocated until process exit.")
+                executor.shutdownNow()
+            } catch (_: ExecutionException) {
+                warnShutdown("MNN runtime close failed; native runtime may remain allocated until process exit.")
                 executor.shutdownNow()
             }
         }
+    }
+
+    private fun warnShutdown(message: String) {
+        runCatching { logWarning(message) }
     }
 
     private fun <T> dispatch(action: () -> MnnResult<T>): MnnResult<T> {
@@ -220,7 +281,21 @@ class MnnEngineHost(
         stateLock.withLock {
             state = MnnEngineState.ERROR
             lastError = error
+            if (error.code == MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE) {
+                runtimeAvailable = false
+            }
         }
         return MnnResult.Failure(error)
+    }
+
+    private fun failStateAfterRuntimeSync(error: MnnError): MnnResult.Failure {
+        val runtimeModel = runCatching { runtime.getLoadedModel() }.getOrNull()
+        stateLock.withLock { loadedModel = runtimeModel }
+        return failState(error)
+    }
+
+    private companion object {
+        const val TAG = "PAIR-MNN"
+        const val SHUTDOWN_TIMEOUT_MILLIS = 10_000L
     }
 }
