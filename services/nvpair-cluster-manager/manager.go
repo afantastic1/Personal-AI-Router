@@ -37,6 +37,9 @@ type Manager struct {
 	clusterDir string
 	port       int
 
+	membershipStore *MembershipStore
+	memberships     map[string]Membership
+
 	identity *NodeIdentity
 	trust    *TrustStore
 	// mesh supplies the pool's reloadable local identity; TrustStore is the pin
@@ -222,12 +225,13 @@ func NewManager(codec *Codec, configDir string, port int) (*Manager, error) {
 	}
 	mesh := clustertrust.Open(clusterDir)
 	mgr := &Manager{
-		codec:      codec,
-		clusterDir: clusterDir,
-		port:       port,
-		identity:   identity,
-		trust:      trust,
-		mesh:       mesh,
+		codec:           codec,
+		clusterDir:      clusterDir,
+		port:            port,
+		membershipStore: OpenMembershipStore(clusterDir),
+		identity:        identity,
+		trust:           trust,
+		mesh:            mesh,
 		clients: clustertrust.NewPeerClientPoolOpts(mesh, clustertrust.PeerClientOptions{
 			Timeout:    pairingHTTPTimeout,
 			ResolvePin: trust.DER,
@@ -261,6 +265,9 @@ func NewManager(codec *Codec, configDir string, port int) (*Manager, error) {
 	if err := mgr.loadMembers(); err != nil {
 		return nil, fmt.Errorf("load members: %w", err)
 	}
+	if err := mgr.loadMemberships(); err != nil {
+		return nil, fmt.Errorf("load memberships: %w", err)
+	}
 	if err := mgr.rollbackIncompleteAdmission(); err != nil {
 		return nil, fmt.Errorf("rollback incomplete admission: %w", err)
 	}
@@ -280,6 +287,9 @@ func NewManager(codec *Codec, configDir string, port int) (*Manager, error) {
 	mgr.loadTombstones()
 	if err := mgr.loadRemovalProofs(); err != nil {
 		return nil, fmt.Errorf("load removal proofs: %w", err)
+	}
+	if err := mgr.migrateLegacyMemberships(); err != nil {
+		return nil, fmt.Errorf("migrate legacy memberships: %w", err)
 	}
 	if err := mgr.loadInviteCreatedCluster(); err != nil {
 		return nil, fmt.Errorf("load invite-created cluster provenance: %w", err)

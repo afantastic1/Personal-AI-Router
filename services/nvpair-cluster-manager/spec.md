@@ -5,6 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Microservice: Cluster Manager
 
+> **Multi-cluster contract:** This specification is being updated under the
+> approved design in `docs/superpowers/specs/2026-10-08-pair-multi-cluster-design.md`.
+> A device identity is installation-wide, while authorization and membership
+> are scoped to `(clusterId, nodeUuid)`. The older single-cluster statements
+> below describe the pre-migration contract and are superseded as each planned
+> implementation task updates its section. Do not use a device certificate or
+> discovery record as proof of membership in a cluster.
+
 ## 1. Purpose
 Owns cluster membership — which nodes belong to the same logical cluster — and the interactive join/leave handshake that establishes it. The Cluster Manager invites nodes, receives and responds to invites, removes nodes, and maintains the authoritative local view of cluster members, giving the customer the data to render "who is in my cluster" and the controls to change it. `cluster_id` is the membership identifier this service negotiates around, while the join/leave protocol itself lives here.
 

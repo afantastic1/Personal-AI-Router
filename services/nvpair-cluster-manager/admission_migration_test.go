@@ -60,6 +60,10 @@ func TestRestartMigratesLegacyPinnedMemberAdmission(t *testing.T) {
 	}
 
 	restarted := testManagerAt(t, dir, 15124)
+	membership, exists := restarted.memberships["cluster-1"]
+	if !exists || membership.Members[peer.identity.NodeUUID].AdmissionEpoch != legacyAdmissionEpoch {
+		t.Fatalf("durable migrated membership = %+v", membership)
+	}
 	pin, ok := restarted.trust.Get(peer.identity.NodeUUID)
 	if !ok || pin.ClusterID != "cluster-1" || pin.AdmissionEpoch != legacyAdmissionEpoch {
 		t.Fatalf("migrated pin = %+v", pin)
