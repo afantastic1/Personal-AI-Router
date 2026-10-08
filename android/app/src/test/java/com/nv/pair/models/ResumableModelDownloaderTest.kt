@@ -125,6 +125,62 @@ class ResumableModelDownloaderTest {
     }
 
     @Test
+    fun followsValidPartialContentSegmentsUntilTheDeclaredTotalIsComplete() {
+        val content = "segmented model".toByteArray()
+        val requestedRanges = mutableListOf<String?>()
+        val server = ModelDownloadServer(expectedRequests = 3) { range ->
+            requestedRanges += range
+            when (range) {
+                null -> DownloadResponse(206, content.copyOfRange(0, 4), "bytes 0-3/${content.size}")
+                "bytes=4-" -> DownloadResponse(206, content.copyOfRange(4, 9), "bytes 4-8/${content.size}")
+                "bytes=9-" -> DownloadResponse(206, content.copyOfRange(9, content.size), "bytes 9-${content.lastIndex}/${content.size}")
+                else -> error("Unexpected range: $range")
+            }
+        }
+        val directory = Files.createTempDirectory("pair-model-download").toFile()
+        try {
+            val destination = directory.resolve("model.bin")
+
+            val downloaded = ResumableModelDownloader(allowLoopbackHttpForTests = true).download(
+                "http://127.0.0.1:${server.port}/model.bin",
+                destination,
+                sha256(content),
+            )
+
+            assertTrue(content.contentEquals(downloaded.readBytes()))
+            assertEquals(listOf(null, "bytes=4-", "bytes=9-"), requestedRanges)
+        } finally {
+            server.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rejectsFullResponseWhoseLengthDiffersFromInspectedArtifactSize() {
+        val content = "truncated".toByteArray()
+        val server = ModelDownloadServer { DownloadResponse(200, content) }
+        val directory = Files.createTempDirectory("pair-model-download").toFile()
+        try {
+            val destination = directory.resolve("model.bin")
+
+            val failure = runCatching {
+                ResumableModelDownloader(allowLoopbackHttpForTests = true).download(
+                    "http://127.0.0.1:${server.port}/model.bin",
+                    destination,
+                    expectedSha256 = null,
+                    expectedSizeBytes = content.size + 1L,
+                )
+            }.exceptionOrNull()
+
+            assertTrue("response must match the inspected size", failure is java.io.IOException)
+            assertTrue(destination.exists().not())
+        } finally {
+            server.close()
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun retriesTransientServerFailuresWithRetryAfterDelay() {
         val content = "retried artifact".toByteArray()
         val requests = AtomicInteger()

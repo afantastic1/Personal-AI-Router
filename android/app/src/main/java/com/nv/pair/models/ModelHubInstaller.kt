@@ -44,7 +44,15 @@ private data class ModelDownloadTaskState(
     val requiredArtifactPaths: List<String>,
     val sourceSha256ByPath: Map<String, String>,
     val completedArtifacts: MutableMap<String, DownloadedArtifactReceipt>,
+    var phase: ModelInstallPhase,
 )
+
+private enum class ModelInstallPhase {
+    DOWNLOADING,
+    VERIFIED,
+    PUBLISHING,
+    INSTALLED,
+}
 
 class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = false) {
     fun download(
@@ -53,13 +61,16 @@ class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = 
         expectedSha256: String?,
         bearerToken: String? = null,
         onProgress: (Long, Long?) -> Unit = { _, _ -> },
+        expectedSizeBytes: Long? = null,
     ): File {
         require(expectedSha256 == null || isTrustedSha256(expectedSha256)) { "A valid SHA-256 checksum is required when supplied." }
+        require(expectedSizeBytes == null || expectedSizeBytes >= 0L) { "Expected artifact size cannot be negative." }
         val parent = destination.parentFile ?: throw IOException("Model artifact destination has no parent directory.")
         if (!parent.exists() && !parent.mkdirs()) throw IOException("Could not create model download directory.")
         val partial = File(parent, "${destination.name}.part")
         var attempt = 0
         var transientRetries = 0
+        var expectedTotalBytes = expectedSizeBytes
         while (true) {
             val offset = partial.length()
             val connection = openDownloadConnection(URL(url), bearerToken, offset)
@@ -82,27 +93,48 @@ class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = 
                 if (status == HTTP_RANGE_NOT_SATISFIABLE && offset > 0L) {
                     val total = UNSATISFIED_RANGE.matchEntire(connection.getHeaderField("Content-Range").orEmpty())
                         ?.groupValues?.get(1)?.toLongOrNull()
-                    if (total == offset && (expectedSha256 == null || sha256(partial) == expectedSha256.lowercase())) break
+                    val expectedLengthMatches = total == offset &&
+                        (expectedTotalBytes == null || expectedTotalBytes == total)
+                    val expectedHashMatches = expectedSha256 == null || sha256(partial) == expectedSha256.lowercase()
+                    if (expectedLengthMatches && expectedHashMatches) {
+                        expectedTotalBytes = total
+                        break
+                    }
                     if (attempt++ >= MAX_RESTARTS) throw IOException("Model source repeatedly rejected the resume range.")
                     partial.delete()
                     continue
                 }
-                val append = when {
-                    offset > 0L && status == HTTP_PARTIAL -> {
-                        validateContentRange(
+                var segmentEndExclusive: Long? = null
+                val append = when (status) {
+                    HTTP_PARTIAL -> {
+                        val range = validateContentRange(
                             connection.getHeaderField("Content-Range"),
                             offset,
                             connection.contentLengthLong,
+                            expectedTotalBytes,
                         )
+                        if (range.totalBytes != null) expectedTotalBytes = range.totalBytes
+                        else if (expectedTotalBytes == null) {
+                            throw IOException("Model source did not provide a complete artifact length.")
+                        }
+                        segmentEndExclusive = range.endInclusive + 1L
                         true
                     }
-                    status == HTTP_OK -> false
+                    HTTP_OK -> {
+                        val responseLength = connection.contentLengthLong.takeIf { it >= 0L }
+                        if (responseLength != null && expectedTotalBytes != null && responseLength != expectedTotalBytes) {
+                            throw IOException("Model source response length does not match the inspected artifact size.")
+                        }
+                        if (expectedTotalBytes == null) expectedTotalBytes = responseLength
+                        false
+                    }
                     else -> throw IOException("Model download failed with HTTP $status.")
                 }
-                val artifactTotal = connection.contentLengthLong.takeIf { it >= 0L }
-                    ?.let { contentLength -> if (append) offset + contentLength else contentLength }
+                val responseBytesExpected = segmentEndExclusive?.minus(offset)
+                    ?: connection.contentLengthLong.takeIf { it >= 0L }
                 var receivedBytes = if (append) offset else 0L
-                onProgress(receivedBytes, artifactTotal)
+                var responseBytesReceived = 0L
+                onProgress(receivedBytes, expectedTotalBytes)
                 FileOutputStream(partial, append).use { output ->
                     connection.inputStream.use { input ->
                         val buffer = ByteArray(COPY_BUFFER_BYTES)
@@ -112,22 +144,36 @@ class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = 
                             }
                             val count = input.read(buffer)
                             if (count < 0) break
+                            responseBytesReceived += count
+                            if (responseBytesExpected != null && responseBytesReceived > responseBytesExpected) {
+                                throw IOException("Model source sent more bytes than its response range declared.")
+                            }
                             output.write(buffer, 0, count)
                             receivedBytes += count
-                            onProgress(receivedBytes, artifactTotal)
+                            onProgress(receivedBytes, expectedTotalBytes)
                         }
                     }
                     output.fd.sync()
                 }
-                break
+                if (responseBytesExpected != null && responseBytesReceived != responseBytesExpected) {
+                    throw IOException("Model source ended before its response range was complete.")
+                }
+                val actualBytes = partial.length()
+                if (expectedTotalBytes != null && actualBytes > expectedTotalBytes) {
+                    throw IOException("Downloaded model artifact exceeds its expected size.")
+                }
+                if (status != HTTP_PARTIAL || actualBytes == expectedTotalBytes) break
             } finally {
                 connection.disconnect()
             }
         }
 
-        if (!partial.isFile || (expectedSha256 != null && sha256(partial) != expectedSha256.lowercase())) {
+        if (!partial.isFile || (expectedTotalBytes != null && partial.length() != expectedTotalBytes) ||
+            (expectedSha256 == null && expectedTotalBytes == null) ||
+            (expectedSha256 != null && sha256(partial) != expectedSha256.lowercase())
+        ) {
             partial.delete()
-            throw IOException("Downloaded model artifact failed SHA-256 verification.")
+            throw IOException("Downloaded model artifact failed size or SHA-256 verification.")
         }
         Files.move(partial.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         return destination
@@ -167,18 +213,25 @@ class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = 
         throw IOException("Model source returned an excessive redirect chain.")
     }
 
-    private fun validateContentRange(value: String?, offset: Long, contentLength: Long) {
+    private fun validateContentRange(
+        value: String?,
+        offset: Long,
+        contentLength: Long,
+        expectedTotalBytes: Long?,
+    ): ContentRange {
         val match = CONTENT_RANGE.matchEntire(value.orEmpty())
             ?: throw IOException("Model source returned an invalid resume range.")
         val start = match.groupValues[1].toLongOrNull()
         val end = match.groupValues[2].toLongOrNull()
         val total = match.groupValues[3].takeIf { it != "*" }?.toLongOrNull()
+        val totalBytes = total ?: expectedTotalBytes
         if (start != offset || end == null || end < offset ||
             (contentLength >= 0L && end - offset + 1L != contentLength) ||
-            (total != null && total <= end)
+            (totalBytes != null && (totalBytes <= end || (expectedTotalBytes != null && totalBytes != expectedTotalBytes)))
         ) {
             throw IOException("Model source returned a resume range at the wrong offset.")
         }
+        return ContentRange(end, total)
     }
 
     private fun retryDelayMillis(retryAfter: String?, retry: Int): Long {
@@ -197,6 +250,8 @@ class ResumableModelDownloader(private val allowLoopbackHttpForTests: Boolean = 
     }
 
     private fun origin(url: URL): String = "${url.protocol.lowercase()}://${url.host.lowercase()}:${url.port.takeIf { it >= 0 } ?: url.defaultPort}"
+
+    private data class ContentRange(val endInclusive: Long, val totalBytes: Long?)
 
     private fun isAllowedDownloadHost(host: String): Boolean = APPROVED_DOWNLOAD_HOSTS.any { allowed ->
         host.equals(allowed, ignoreCase = true) || host.endsWith(".$allowed", ignoreCase = true)
@@ -261,45 +316,52 @@ class ModelHubInstaller(
         val modelId = installedModelId(descriptor)
         val target = File(modelRoot, modelId)
         require(target.canonicalFile.parentFile == modelRoot.canonicalFile) { "Model target must stay inside the private model root." }
-        require(!target.exists()) { "A model with this ID is already installed." }
+        if (target.exists()) return recoverPublishedInstall(target, descriptor, modelId)
         val staging = File(modelRoot, ".$modelId.downloading")
         require(staging.canonicalFile.parentFile == modelRoot.canonicalFile) { "Model staging directory must stay inside the private model root." }
         val task = loadOrCreateDownloadTask(staging, descriptor, modelId)
 
-        val config = descriptor.files.firstOrNull { it.path == CONFIG_FILE }
-            ?: throw IOException("The catalog entry does not include config.json.")
-        downloadArtifact(descriptor, adapter, staging, task, config, 0L, null, onProgress)
-        val configOnDisk = File(staging, CONFIG_FILE)
-        if (configOnDisk.length() > MAX_CONFIG_BYTES) throw IOException("The model config exceeds the 1 MiB size limit.")
-        val configJson = try {
-            JSONObject(configOnDisk.readText())
-        } catch (_: JSONException) {
-            throw IOException("The model config is not valid JSON.")
+        if (task.phase == ModelInstallPhase.DOWNLOADING) {
+            val allArtifacts = resolveRequiredArtifacts(staging, descriptor, requireConfig = false)
+            val config = allArtifacts.first()
+            downloadArtifact(descriptor, adapter, staging, task, config, 0L, null, onProgress)
+            val resolvedArtifacts = resolveRequiredArtifacts(staging, descriptor)
+            val totalBytes = resolvedArtifacts.map(ModelFile::sizeBytes).takeIf { sizes -> sizes.all { it != null } }
+                ?.sumOf { it ?: 0L }
+            var completedBytes = File(staging, CONFIG_FILE).length()
+            resolvedArtifacts.drop(1).forEach { artifact ->
+                downloadArtifact(descriptor, adapter, staging, task, artifact, completedBytes, totalBytes, onProgress)
+                completedBytes += File(staging, artifact.path).length()
+            }
+            validateMnnPackage(staging, descriptor, modelId)
+            writeProvenanceManifest(staging, descriptor, resolvedArtifacts)
+            task.phase = ModelInstallPhase.VERIFIED
+            writeDownloadTask(staging, task)
         }
-        val requiredArtifacts = requiredArtifactNames(configJson).map { name ->
-            val file = descriptor.files.firstOrNull { it.path == name }
-                ?: throw IOException("The catalog entry is missing a required MNN artifact: $name.")
-            file
+
+        if (task.phase != ModelInstallPhase.VERIFIED && task.phase != ModelInstallPhase.PUBLISHING) {
+            throw IOException("The model download task has an invalid install phase.")
         }
-        if (requiredArtifacts.map(ModelFile::path) != descriptor.requiredArtifactPaths) {
-            throw IOException("The inspected artifact set no longer matches config.json.")
+        validateMnnPackage(staging, descriptor, modelId)
+        validateProvenanceManifest(staging, descriptor)
+        if (task.phase == ModelInstallPhase.VERIFIED) {
+            task.phase = ModelInstallPhase.PUBLISHING
+            writeDownloadTask(staging, task)
         }
-        val allArtifacts = listOf(config) + requiredArtifacts
-        val totalBytes = allArtifacts.map(ModelFile::sizeBytes).takeIf { sizes -> sizes.all { it != null } }
-            ?.sumOf { it ?: 0L }
-        var completedBytes = configOnDisk.length()
-        requiredArtifacts.forEach { artifact ->
-            downloadArtifact(descriptor, adapter, staging, task, artifact, completedBytes, totalBytes, onProgress)
-            completedBytes += File(staging, artifact.path).length()
+        try {
+            Files.move(staging.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        } catch (publishFailure: IOException) {
+            if (target.exists()) return recoverPublishedInstall(target, descriptor, modelId)
+            throw publishFailure
         }
-        when (val resolved = modelManager.resolve(staging, modelId, descriptor.displayName)) {
-            is MnnResult.Success -> Unit
-            is MnnResult.Failure -> throw IOException("Downloaded files are not a valid MNN model: ${resolved.error.message}")
-        }
-        writeProvenanceManifest(staging, descriptor, allArtifacts)
-        if (!File(staging, DOWNLOAD_TASK_FILE).delete()) throw IOException("Could not finalize the model download task.")
-        Files.move(staging.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
-        return descriptor.copy(
+        task.phase = ModelInstallPhase.INSTALLED
+        runCatching { writeDownloadTask(target, task) }
+        runCatching { File(target, DOWNLOAD_TASK_FILE).delete() }
+        return installedDescriptor(target, descriptor, modelId)
+    }
+
+    private fun installedDescriptor(target: File, descriptor: ModelDescriptor, modelId: String): ModelDescriptor =
+        descriptor.copy(
             logicalId = "local:$modelId",
             engineModelId = modelId,
             source = ModelSource(ModelSourceKind.LOCAL, target.absolutePath),
@@ -307,6 +369,128 @@ class ModelHubInstaller(
                 ?: target.walkTopDown().filter(File::isFile).sumOf(File::length),
             compatibility = ModelCompatibility.COMPATIBLE,
         )
+
+    private fun recoverPublishedInstall(target: File, descriptor: ModelDescriptor, modelId: String): ModelDescriptor {
+        validateMnnPackage(target, descriptor, modelId)
+        validateProvenanceManifest(target, descriptor)
+        val taskFile = File(target, DOWNLOAD_TASK_FILE)
+        if (taskFile.isFile) {
+            val manifest = try {
+                JSONObject(taskFile.readText())
+            } catch (_: JSONException) {
+                throw IOException("The published model has invalid recovery metadata.")
+            }
+            if (manifest.optInt("schemaVersion") != DOWNLOAD_TASK_SCHEMA_VERSION ||
+                manifest.optString("provider") != descriptor.source.kind.name ||
+                manifest.optString("repository") != descriptor.source.repository ||
+                manifest.optString("revision") != descriptor.source.revision ||
+                manifest.optString("modelId") != modelId ||
+                manifest.optString("phase") !in setOf(ModelInstallPhase.PUBLISHING.name, ModelInstallPhase.INSTALLED.name)
+            ) {
+                throw IOException("The published model recovery metadata does not match this source revision.")
+            }
+            manifest.put("phase", ModelInstallPhase.INSTALLED.name)
+            runCatching { writeJsonAtomically(taskFile, manifest) }
+            runCatching { taskFile.delete() }
+        }
+        return installedDescriptor(target, descriptor, modelId)
+    }
+
+    private fun resolveRequiredArtifacts(
+        root: File,
+        descriptor: ModelDescriptor,
+        requireConfig: Boolean = true,
+    ): List<ModelFile> {
+        val config = descriptor.files.firstOrNull { it.path == CONFIG_FILE }
+            ?: throw IOException("The catalog entry does not include config.json.")
+        val configFile = File(root, CONFIG_FILE)
+        if (!configFile.isFile) {
+            if (requireConfig) throw IOException("The model staging directory is missing config.json.")
+            return listOf(config) + descriptor.requiredArtifactPaths.map { path ->
+                descriptor.files.firstOrNull { it.path == path }
+                    ?: throw IOException("The catalog entry is missing a required MNN artifact: $path.")
+            }
+        }
+        if (configFile.length() > MAX_CONFIG_BYTES) throw IOException("The model config exceeds the 1 MiB size limit.")
+        val configJson = try {
+            JSONObject(configFile.readText())
+        } catch (_: JSONException) {
+            throw IOException("The model config is not valid JSON.")
+        }
+        val requiredArtifacts = requiredArtifactNames(configJson).map { name ->
+            descriptor.files.firstOrNull { it.path == name }
+                ?: throw IOException("The catalog entry is missing a required MNN artifact: $name.")
+        }
+        if (requiredArtifacts.map(ModelFile::path) != descriptor.requiredArtifactPaths) {
+            throw IOException("The inspected artifact set no longer matches config.json.")
+        }
+        return listOf(config) + requiredArtifacts
+    }
+
+    private fun validateMnnPackage(root: File, descriptor: ModelDescriptor, modelId: String) {
+        val artifacts = resolveRequiredArtifacts(root, descriptor)
+        artifacts.forEach { artifact ->
+            val file = File(root, artifact.path)
+            if (!file.isFile || (artifact.sizeBytes != null && file.length() != artifact.sizeBytes)) {
+                throw IOException("Model artifact ${artifact.path} does not match the inspected size.")
+            }
+            val expectedHash = artifact.sha256?.takeIf(::isTrustedSha256)?.lowercase()
+            if (expectedHash != null && installedSha256(file) != expectedHash) {
+                throw IOException("Model artifact ${artifact.path} failed SHA-256 verification.")
+            }
+        }
+        when (val resolved = modelManager.resolve(root, modelId, descriptor.displayName)) {
+            is MnnResult.Success -> Unit
+            is MnnResult.Failure -> throw IOException("Downloaded files are not a valid MNN model: ${resolved.error.message}")
+        }
+    }
+
+    private fun validateProvenanceManifest(root: File, descriptor: ModelDescriptor) {
+        val manifestFile = File(root, PROVENANCE_FILE)
+        if (!manifestFile.isFile) throw IOException("The model provenance manifest is missing.")
+        val manifest = try {
+            JSONObject(manifestFile.readText())
+        } catch (_: JSONException) {
+            throw IOException("The model provenance manifest is invalid.")
+        }
+        val artifacts = resolveRequiredArtifacts(root, descriptor)
+        if (manifest.optInt("schemaVersion") != PROVENANCE_SCHEMA_VERSION ||
+            manifest.optString("provider") != descriptor.source.kind.name ||
+            manifest.optString("repository") != descriptor.source.repository ||
+            manifest.optString("revision") != descriptor.source.revision
+        ) {
+            throw IOException("The installed model belongs to a different source revision.")
+        }
+        val entries = manifest.optJSONArray("files") ?: throw IOException("The model provenance manifest has no files.")
+        val recorded = (0 until entries.length()).mapNotNull { index ->
+            entries.optJSONObject(index)?.let { entry -> entry.optString("path") to entry }
+        }.toMap()
+        val expectedDigestStatus = if (artifacts.all { it.sha256?.let(::isTrustedSha256) == true }) {
+            "VERIFIED_SOURCE_SHA256"
+        } else {
+            "UNVERIFIED_SOURCE_DIGEST"
+        }
+        if (recorded.size != entries.length() || recorded.keys != artifacts.map(ModelFile::path).toSet() ||
+            manifest.optString("digestStatus") != expectedDigestStatus
+        ) {
+            throw IOException("The model provenance manifest does not match the required artifact set.")
+        }
+        artifacts.forEach { artifact ->
+            val file = File(root, artifact.path)
+            val entry = recorded.getValue(artifact.path)
+            val recordedSize = entry.optLong("sizeBytes", -1L)
+            val recordedInstalledHash = entry.optString("installedSha256")
+            val recordedSourceHash = entry.optString("sourceSha256").takeIf(String::isNotBlank)?.lowercase()
+            val expectedSourceHash = artifact.sha256?.takeIf(::isTrustedSha256)?.lowercase()
+            if (!file.isFile || file.length() != recordedSize ||
+                (artifact.sizeBytes != null && file.length() != artifact.sizeBytes) ||
+                !isTrustedSha256(recordedInstalledHash) || installedSha256(file) != recordedInstalledHash.lowercase() ||
+                recordedSourceHash != expectedSourceHash ||
+                (expectedSourceHash != null && recordedInstalledHash.lowercase() != expectedSourceHash)
+            ) {
+                throw IOException("Installed model artifact ${artifact.path} failed provenance verification.")
+            }
+        }
     }
 
     fun deleteInstalledModel(modelId: String) {
@@ -327,6 +511,7 @@ class ModelHubInstaller(
         onProgress: (ModelDownloadProgress) -> Unit,
     ) {
         require(isSafeRelativePath(artifact.path)) { "Model artifact path must stay inside the staging directory." }
+        require(artifact.sizeBytes == null || artifact.sizeBytes >= 0L) { "Model artifact size cannot be negative." }
         val checksum = artifact.sha256?.takeIf(::isTrustedSha256)
         val destination = File(staging, artifact.path)
         require(destination.canonicalPath.startsWith(staging.canonicalPath + File.separator)) {
@@ -352,17 +537,19 @@ class ModelHubInstaller(
             destination,
             checksum,
             adapter.accessToken(),
-        ) { received, artifactTotal ->
-            onProgress(
-                ModelDownloadProgress(
-                    artifactPath = artifact.path,
-                    artifactBytesReceived = received,
-                    artifactTotalBytes = artifactTotal ?: artifact.sizeBytes,
-                    overallBytesReceived = completedBytes + received,
-                    overallTotalBytes = overallTotalBytes,
-                ),
-            )
-        }
+            onProgress = { received, artifactTotal ->
+                onProgress(
+                    ModelDownloadProgress(
+                        artifactPath = artifact.path,
+                        artifactBytesReceived = received,
+                        artifactTotalBytes = artifactTotal ?: artifact.sizeBytes,
+                        overallBytesReceived = completedBytes + received,
+                        overallTotalBytes = overallTotalBytes,
+                    ),
+                )
+            },
+            expectedSizeBytes = artifact.sizeBytes,
+        )
         task.completedArtifacts[artifact.path] = DownloadedArtifactReceipt(
             sizeBytes = destination.length(),
             installedSha256 = installedSha256(destination),
@@ -381,7 +568,8 @@ class ModelHubInstaller(
         val receipt = task.completedArtifacts[artifact.path]
         val fileMatchesReceipt = receipt != null && destination.isFile &&
             destination.length() == receipt.sizeBytes && installedSha256(destination) == receipt.installedSha256 &&
-            receipt.sourceSha256 == expectedSha256?.lowercase()
+            receipt.sourceSha256 == expectedSha256?.lowercase() &&
+            (artifact.sizeBytes == null || destination.length() == artifact.sizeBytes)
         if (fileMatchesReceipt && (expectedSha256 == null || receipt.installedSha256 == expectedSha256.lowercase())) {
             return true
         }
@@ -414,6 +602,9 @@ class ModelHubInstaller(
                 entry == temporary && entry.isFile
             }
             if (unexpectedEntries.isNotEmpty()) {
+                if (File(staging, PROVENANCE_FILE).isFile) {
+                    return recoverVerifiedStagingWithoutTask(staging, descriptor, modelId, expectedSources)
+                }
                 throw IOException("An incomplete model download has no resumable task metadata.")
             }
             if (temporary.exists() && !temporary.delete()) {
@@ -434,7 +625,8 @@ class ModelHubInstaller(
         val storedSources = manifest.optJSONObject("sourceSha256ByPath")
             ?: throw IOException("The model download task metadata has no source fingerprints.")
         val storedSourceHashes = expectedSources.keys.associateWith { path -> storedSources.optString(path) }
-        if (manifest.optInt("schemaVersion") != DOWNLOAD_TASK_SCHEMA_VERSION ||
+        val schemaVersion = manifest.optInt("schemaVersion")
+        if (schemaVersion !in LEGACY_DOWNLOAD_TASK_SCHEMA_VERSION..DOWNLOAD_TASK_SCHEMA_VERSION ||
             manifest.optString("provider") != descriptor.source.kind.name ||
             manifest.optString("repository") != descriptor.source.repository ||
             manifest.optString("revision") != descriptor.source.revision ||
@@ -443,6 +635,12 @@ class ModelHubInstaller(
             storedSourceHashes != expectedSources
         ) {
             throw IOException("The existing download task belongs to a different model source or revision.")
+        }
+        val phase = if (schemaVersion == LEGACY_DOWNLOAD_TASK_SCHEMA_VERSION) {
+            ModelInstallPhase.DOWNLOADING
+        } else {
+            runCatching { ModelInstallPhase.valueOf(manifest.optString("phase")) }
+                .getOrElse { throw IOException("The model download task has an invalid install phase.", it) }
         }
 
         val completed = mutableMapOf<String, DownloadedArtifactReceipt>()
@@ -468,7 +666,32 @@ class ModelHubInstaller(
             requiredArtifactPaths = requiredArtifactPaths,
             sourceSha256ByPath = expectedSources,
             completedArtifacts = completed,
+            phase = phase,
         )
+    }
+
+    private fun recoverVerifiedStagingWithoutTask(
+        staging: File,
+        descriptor: ModelDescriptor,
+        modelId: String,
+        expectedSources: Map<String, String>,
+    ): ModelDownloadTaskState {
+        validateMnnPackage(staging, descriptor, modelId)
+        validateProvenanceManifest(staging, descriptor)
+        val artifacts = resolveRequiredArtifacts(staging, descriptor)
+        val task = newDownloadTask(descriptor, modelId, expectedSources).apply {
+            phase = ModelInstallPhase.VERIFIED
+            artifacts.forEach { artifact ->
+                val file = File(staging, artifact.path)
+                completedArtifacts[artifact.path] = DownloadedArtifactReceipt(
+                    sizeBytes = file.length(),
+                    installedSha256 = installedSha256(file),
+                    sourceSha256 = artifact.sha256?.takeIf(::isTrustedSha256)?.lowercase(),
+                )
+            }
+        }
+        writeDownloadTask(staging, task)
+        return task
     }
 
     private fun sourceSha256ByPath(descriptor: ModelDescriptor): Map<String, String> =
@@ -489,6 +712,7 @@ class ModelHubInstaller(
         requiredArtifactPaths = descriptor.requiredArtifactPaths,
         sourceSha256ByPath = sourceSha256ByPath,
         completedArtifacts = mutableMapOf(),
+        phase = ModelInstallPhase.DOWNLOADING,
     )
 
     private fun writeDownloadTask(staging: File, task: ModelDownloadTaskState) {
@@ -508,11 +732,15 @@ class ModelHubInstaller(
             .put("repository", task.repository)
             .put("revision", task.revision)
             .put("modelId", task.modelId)
+            .put("phase", task.phase.name)
             .put("requiredArtifactPaths", org.json.JSONArray(task.requiredArtifactPaths))
             .put("sourceSha256ByPath", sources)
             .put("completedArtifacts", completed)
-        val destination = File(staging, DOWNLOAD_TASK_FILE)
-        val temporary = File(staging, "$DOWNLOAD_TASK_FILE.tmp")
+        writeJsonAtomically(File(staging, DOWNLOAD_TASK_FILE), manifest)
+    }
+
+    private fun writeJsonAtomically(destination: File, manifest: JSONObject) {
+        val temporary = File(destination.parentFile, "${destination.name}.tmp")
         FileOutputStream(temporary).use { output ->
             output.write(manifest.toString(2).toByteArray(Charsets.UTF_8))
             output.fd.sync()
@@ -539,7 +767,7 @@ class ModelHubInstaller(
                 .put("installedSha256", installedSha256(File(staging, artifact.path))))
         }
         val manifest = JSONObject()
-            .put("schemaVersion", 1)
+            .put("schemaVersion", PROVENANCE_SCHEMA_VERSION)
             .put("provider", descriptor.source.kind.name)
             .put("repository", descriptor.source.repository)
             .put("revision", descriptor.source.revision)
@@ -587,7 +815,9 @@ class ModelHubInstaller(
         const val DEFAULT_TOKENIZER_FILE = "tokenizer.txt"
         const val PROVENANCE_FILE = ".pair-model.json"
         const val DOWNLOAD_TASK_FILE = ".pair-download.json"
-        const val DOWNLOAD_TASK_SCHEMA_VERSION = 1
+        const val LEGACY_DOWNLOAD_TASK_SCHEMA_VERSION = 1
+        const val DOWNLOAD_TASK_SCHEMA_VERSION = 2
+        const val PROVENANCE_SCHEMA_VERSION = 1
         const val MAX_CONFIG_BYTES = 1024 * 1024L
         val MODEL_ID = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
         val SAFE_PATH_SEGMENT = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,255}")

@@ -140,7 +140,8 @@ class PairRuntimeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        multicastLock.release()
+        runCatching { multicastLock.release() }
+            .onFailure { android.util.Log.w(TAG, "multicast lock release failed during service destruction") }
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -251,10 +252,12 @@ class PairRuntimeService : Service() {
                 } catch (failure: Exception) {
                     setPhase(STARTUP_FAILED, error = failure.message ?: "PAIR broker failed to start")
                 } finally {
-                    routerRepository.resetProxyStatuses()
-                    activeSession.compareAndSet(session, null)
-                    withContext(Dispatchers.IO) { session.close() }
-                    clusterRepository.clearPendingInvites()
+                    val sessionClosed = closeBrokerSession(session)
+                    if (!sessionClosed) {
+                        preferences.setDesiredRuntimeRunning(false)
+                        setDesiredRunning(false)
+                        setPhase(STARTUP_FAILED, error = "PAIR broker cleanup failed; runtime was stopped")
+                    }
                 }
 
                 if (!runtimeState.value.desiredRunning) break
@@ -279,14 +282,42 @@ class PairRuntimeService : Service() {
             preferences.setDesiredRuntimeRunning(false)
             setDesiredRunning(false)
         } finally {
-            routerRepository.resetProxyStatuses()
-            val container = mnnRuntimeContainer
-            mnnRuntimeContainer = null
-            if (container != null) {
-                withContext(NonCancellable + Dispatchers.IO) { container.close() }
+            try {
+                runCatching { routerRepository.resetProxyStatuses() }
+                    .onFailure { android.util.Log.w(TAG, "could not reset proxy status during shutdown") }
+                val container = mnnRuntimeContainer
+                mnnRuntimeContainer = null
+                if (container != null) {
+                    runCatching { withContext(NonCancellable + Dispatchers.IO) { container.close() } }
+                        .onFailure { android.util.Log.w(TAG, "local MNN runtime cleanup failed") }
+                }
+            } finally {
+                _mnnLocalEngine.value = MnnLocalEngineStatus(available = false)
+                multicastLock.release()
             }
-            _mnnLocalEngine.value = MnnLocalEngineStatus(available = false)
-            multicastLock.release()
+        }
+    }
+
+    private suspend fun closeBrokerSession(session: BrokerSession): Boolean {
+        runCatching { routerRepository.resetProxyStatuses() }
+            .onFailure { android.util.Log.w(TAG, "could not reset proxy status during broker shutdown") }
+        activeSession.compareAndSet(session, null)
+        try {
+            var failure: Exception? = null
+            repeat(BROKER_CLEANUP_ATTEMPTS) { attempt ->
+                try {
+                    withContext(NonCancellable + Dispatchers.IO) { session.close() }
+                    return true
+                } catch (cleanupFailure: Exception) {
+                    failure = cleanupFailure
+                    android.util.Log.w(TAG, "broker cleanup attempt ${attempt + 1} failed")
+                }
+            }
+            failure?.let { android.util.Log.e(TAG, "broker cleanup did not complete after retries", it) }
+            return false
+        } finally {
+            runCatching { clusterRepository.clearPendingInvites() }
+                .onFailure { android.util.Log.w(TAG, "could not clear transient invitations during shutdown") }
         }
     }
 
@@ -354,14 +385,20 @@ class PairRuntimeService : Service() {
         preferences.setDesiredRuntimeRunning(false)
         setDesiredRunning(false)
         if (runtimeState.value.phase != STOPPED) setPhase(STOPPING)
-        val session = activeSession.get()
-        closeMnnRuntime()
-        if (session != null) withContext(Dispatchers.IO) { session.close() }
-        runtimeJob?.cancelAndJoin()
-        runtimeJob = null
-        activeSession.set(null)
-        multicastLock.release()
-        if (runtimeState.value.phase != STOPPED) setPhase(STOPPED)
+        try {
+            closeMnnRuntime()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            android.util.Log.w(TAG, "local MNN runtime cleanup failed during Stop", failure)
+        }
+        try {
+            runtimeJob?.cancelAndJoin()
+        } finally {
+            runtimeJob = null
+            multicastLock.release()
+        }
+        if (runtimeState.value.phase == STOPPING) setPhase(STOPPED)
         if (foreground) {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             foreground = false
@@ -657,6 +694,7 @@ class PairRuntimeService : Service() {
         private const val STOP_REQUEST_CODE = 2
         private const val CLUSTER_MANAGER_PORT = 14321
         private const val MNN_MODELS_DIRECTORY = "mnn/models"
+        private const val BROKER_CLEANUP_ATTEMPTS = 2
         private val stateLock = Any()
         private val _runtimeState = MutableStateFlow(PairRuntimeState.stopped())
         private val pairRepository = PairRepository()

@@ -6,6 +6,10 @@
 package com.nv.pair.runtime
 
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -34,6 +38,54 @@ class PairProcessTest {
 
         assertTrue(exitCode >= 0)
         assertFalse("process should have exited", process.isAlive)
+    }
+
+    @Test
+    fun stopTerminatesProcessEvenWhenClosingStdinFails() {
+        val process = ProcessWithFailingStdinClose()
+
+        val failure = runCatching { PairProcess(emptyList()).stop(process, 1_000) }.exceptionOrNull()
+
+        assertTrue("stdin close failure should be reported", failure is IOException)
+        assertFalse("process termination must still be attempted", process.isAlive)
+    }
+
+    private class ProcessWithFailingStdinClose : Process() {
+        private var alive = true
+
+        override fun getOutputStream(): OutputStream = object : OutputStream() {
+            override fun write(value: Int) = Unit
+            override fun close() {
+                throw IOException("stdin close failed")
+            }
+        }
+
+        override fun getInputStream(): InputStream = InputStream.nullInputStream()
+
+        override fun getErrorStream(): InputStream = InputStream.nullInputStream()
+
+        override fun waitFor(): Int {
+            alive = false
+            return 0
+        }
+
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean {
+            alive = false
+            return true
+        }
+
+        override fun exitValue(): Int = 0
+
+        override fun destroy() {
+            alive = false
+        }
+
+        override fun destroyForcibly(): Process {
+            alive = false
+            return this
+        }
+
+        override fun isAlive(): Boolean = alive
     }
 
     private fun shellCommand(script: String): List<String> {

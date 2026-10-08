@@ -18,3 +18,4 @@ SPDX-License-Identifier: Apache-2.0
 - M10 PC-to-Android acceptance passed on a Galaxy Tab SM-T733 / Android 14 using `taobao-mnn/Qwen3-0.6B-MNN` pinned to `34dfccda1187ded6e07ea06426da576b0b793c6b`. Two-device pairing persistence, Stop/Start, notification permission denial, live Model Hub inspection/download/install, and runtime inference through the Model Hub installed copy also passed on the same device. Android OS process-kill recovery has not been exercised.
 - Cross-cluster and simultaneous-invite conflicts are covered by service-level tests, not the device scenario.
 - Native shutdown controls must not free a session still owned by a blocked native call.
+- Broker cleanup is bounded and retried, but Android cannot guarantee cleanup of a broker process that the operating system or device forcibly terminates. Published model recovery is covered with local installer tests; OS process-kill recovery on hardware remains unverified.

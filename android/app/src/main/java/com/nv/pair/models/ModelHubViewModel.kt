@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
 
 sealed interface CatalogPhase {
     data object Idle : CatalogPhase
@@ -262,8 +263,14 @@ class ModelHubViewModel @JvmOverloads constructor(
                     }
                 }
             }
-            val imported = withContext(Dispatchers.IO) {
-                LocalImportAdapter(modelRoot).importMnnModel(modelId, files)
+            val importer = LocalImportAdapter(modelRoot)
+            val committedImport = AtomicReference<ModelDescriptor?>()
+            val imported = try {
+                withContext(Dispatchers.IO) {
+                    importer.importMnnModel(modelId, files, committedImport::set)
+                }
+            } catch (cancelled: CancellationException) {
+                committedImport.get() ?: throw cancelled
             }
             catalog.addLocal(imported)
             refreshInstalledModels()

@@ -7,6 +7,7 @@ package com.nv.pair.models
 
 import java.net.InetAddress
 import java.io.InterruptedIOException
+import java.io.File
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
@@ -46,11 +47,13 @@ class ModelHubInstallerTest {
         val server = ArtifactServer(artifacts, expectedRequests = 6)
         val root = Files.createTempDirectory("pair-model-resume").toFile()
         val descriptor = catalogDescriptor(artifacts)
+        var interruptedAtBytes = 0L
         try {
             val firstFailure = runCatching {
                 ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                     .installMnnModel(descriptor, localHttpAdapter(server.port)) { progress ->
                         if (progress.artifactPath == "llm.mnn.weight" && progress.artifactBytesReceived > 0L) {
+                            interruptedAtBytes = progress.artifactBytesReceived
                             throw InterruptedIOException("Simulated process interruption.")
                         }
                     }
@@ -67,7 +70,11 @@ class ModelHubInstallerTest {
 
             assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
             assertTrue(artifacts.getValue("llm.mnn.weight").contentEquals(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").readBytes()))
-            assertEquals(listOf(null, null, null, null, "bytes=65536-", null), server.requestedRanges.toList())
+            assertEquals(
+                "unexpected resume request sequence",
+                listOf(null, null, null, null, "bytes=$interruptedAtBytes-", null),
+                server.requestedRanges.toList(),
+            )
         } finally {
             server.close()
             root.deleteRecursively()
@@ -90,6 +97,114 @@ class ModelHubInstallerTest {
             assertTrue(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").isFile)
             assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
             assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").exists().not())
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun retryForAnAlreadyPublishedSourceCompletesIdempotently() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts)
+        val root = Files.createTempDirectory("pair-model-hub-retry").toFile()
+        val descriptor = catalogDescriptor(artifacts)
+        try {
+            val installer = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+            installer.installMnnModel(descriptor, localHttpAdapter(server.port))
+            writeDownloadTask(root.resolve("Qwen3-0.6B-MNN"), descriptor, "PUBLISHING")
+
+            val retried = installer.installMnnModel(descriptor, localHttpAdapter(server.port))
+
+            assertEquals("Qwen3-0.6B-MNN", retried.engineModelId)
+            assertEquals(5, server.requestedPaths.size)
+            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
+            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-download.json").exists().not())
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun completedArtifactReceiptMustStillMatchProviderDeclaredSize() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts, expectedRequests = 7)
+        val root = Files.createTempDirectory("pair-model-size-recheck").toFile()
+        val descriptor = catalogDescriptor(artifacts)
+        try {
+            val installer = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+            val interrupted = runCatching {
+                installer.installMnnModel(descriptor, localHttpAdapter(server.port)) { progress ->
+                    if (progress.artifactPath == "tokenizer.txt" && progress.artifactBytesReceived == 0L) {
+                        throw InterruptedIOException("Stop after the preceding artifact receipts are persisted.")
+                    }
+                }
+            }.exceptionOrNull()
+            assertTrue(interrupted is InterruptedIOException)
+
+            val descriptorWithWrongWeightSize = descriptor.copy(
+                files = descriptor.files.map { artifact ->
+                    if (artifact.path == "llm.mnn.weight") artifact.copy(sizeBytes = artifact.sizeBytes!! - 1L) else artifact
+                },
+            )
+            val failure = runCatching {
+                installer.installMnnModel(descriptorWithWrongWeightSize, localHttpAdapter(server.port))
+            }.exceptionOrNull()
+
+            assertTrue("a receipt must not override the provider's expected size", failure is java.io.IOException)
+            assertTrue(root.resolve("Qwen3-0.6B-MNN").exists().not())
+            assertEquals(6, server.requestedPaths.size)
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun verifiedStagingRecoversAndPublishesWithoutDownloadingAgain() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts)
+        val root = Files.createTempDirectory("pair-model-verified-stage").toFile()
+        val descriptor = catalogDescriptor(artifacts)
+        val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+        try {
+            assertTrue(staging.mkdir())
+            artifacts.forEach { (path, content) -> staging.resolve(path).writeBytes(content) }
+            staging.resolve(".pair-model.json").writeText(provenanceManifest(descriptor, artifacts).toString(2))
+            writeDownloadTask(staging, descriptor, "VERIFIED")
+
+            val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+                .installMnnModel(descriptor, localHttpAdapter(server.port))
+
+            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
+            assertTrue(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").isFile)
+            assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").exists().not())
+            assertTrue("verified recovery must not fetch artifacts", server.requestedPaths.isEmpty())
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun completeLegacyStagingWithProvenanceRecoversMissingTaskManifest() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts)
+        val root = Files.createTempDirectory("pair-model-legacy-stage").toFile()
+        val descriptor = catalogDescriptor(artifacts)
+        val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+        try {
+            assertTrue(staging.mkdir())
+            artifacts.forEach { (path, content) -> staging.resolve(path).writeBytes(content) }
+            staging.resolve(".pair-model.json").writeText(provenanceManifest(descriptor, artifacts).toString(2))
+
+            val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+                .installMnnModel(descriptor, localHttpAdapter(server.port))
+
+            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
+            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
+            assertTrue(server.requestedPaths.isEmpty())
         } finally {
             server.close()
             root.deleteRecursively()
@@ -184,6 +299,55 @@ class ModelHubInstallerTest {
     private fun sha256(content: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(content)
         .joinToString("") { "%02x".format(it) }
+
+    private fun writeDownloadTask(directory: File, descriptor: ModelDescriptor, phase: String) {
+        val sourceHashes = org.json.JSONObject()
+        (listOf("config.json") + descriptor.requiredArtifactPaths).forEach { path ->
+            sourceHashes.put(path, descriptor.files.first { it.path == path }.sha256.orEmpty())
+        }
+        val completed = org.json.JSONArray()
+        descriptor.files.forEach { artifact ->
+            val contents = directory.resolve(artifact.path).readBytes()
+            completed.put(org.json.JSONObject()
+                .put("path", artifact.path)
+                .put("sizeBytes", contents.size)
+                .put("installedSha256", sha256(contents))
+                .put("sourceSha256", artifact.sha256.orEmpty()))
+        }
+        val task = org.json.JSONObject()
+            .put("schemaVersion", 2)
+            .put("provider", descriptor.source.kind.name)
+            .put("repository", descriptor.source.repository)
+            .put("revision", descriptor.source.revision)
+            .put("modelId", "Qwen3-0.6B-MNN")
+            .put("phase", phase)
+            .put("requiredArtifactPaths", org.json.JSONArray(descriptor.requiredArtifactPaths))
+            .put("sourceSha256ByPath", sourceHashes)
+            .put("completedArtifacts", completed)
+        directory.resolve(".pair-download.json").writeText(task.toString(2))
+    }
+
+    private fun provenanceManifest(
+        descriptor: ModelDescriptor,
+        artifacts: Map<String, ByteArray>,
+    ): org.json.JSONObject {
+        val files = org.json.JSONArray()
+        descriptor.files.forEach { artifact ->
+            val content = artifacts.getValue(artifact.path)
+            files.put(org.json.JSONObject()
+                .put("path", artifact.path)
+                .put("sizeBytes", content.size)
+                .put("sourceSha256", artifact.sha256)
+                .put("installedSha256", sha256(content)))
+        }
+        return org.json.JSONObject()
+            .put("schemaVersion", 1)
+            .put("provider", descriptor.source.kind.name)
+            .put("repository", descriptor.source.repository)
+            .put("revision", descriptor.source.revision)
+            .put("digestStatus", "VERIFIED_SOURCE_SHA256")
+            .put("files", files)
+    }
 
     private class ArtifactServer(
         private val artifacts: Map<String, ByteArray>,

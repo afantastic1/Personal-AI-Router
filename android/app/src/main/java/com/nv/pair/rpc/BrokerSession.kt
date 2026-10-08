@@ -32,6 +32,7 @@ class BrokerSession(
 ) : AutoCloseable {
     private val proxyEngines = proxyEngines.toList()
     private val stopping = AtomicBoolean()
+    private val cleanup = RetryableCleanup(actionCount = 4)
     private val ready = CompletableFuture<String>()
     private var process: Process? = null
     private var processRunner: PairProcess? = null
@@ -68,15 +69,13 @@ class BrokerSession(
         val readyVersion = try {
             ready.get(15, TimeUnit.SECONDS)
         } catch (timeout: TimeoutException) {
-            close()
-            throw IOException("broker did not emit app:ready within 15 seconds", timeout)
+            throw closeAfterStartupFailure(IOException("broker did not emit app:ready within 15 seconds", timeout))
         } catch (interrupted: InterruptedException) {
+            val startupFailure = closeAfterStartupFailure(IOException("interrupted while waiting for broker app:ready", interrupted))
             Thread.currentThread().interrupt()
-            close()
-            throw IOException("interrupted while waiting for broker app:ready", interrupted)
+            throw startupFailure
         } catch (failure: ExecutionException) {
-            close()
-            throw IOException("broker exited before app:ready", failure.cause)
+            throw closeAfterStartupFailure(IOException("broker exited before app:ready", failure.cause))
         }
 
         try {
@@ -87,10 +86,14 @@ class BrokerSession(
             }
             return BrokerRuntimeInfo(reportedVersion, ping.uptimeMillis)
         } catch (failure: Exception) {
-            close()
-            if (failure is IOException) throw failure
-            throw IOException("broker RPC verification failed", failure)
+            val startupFailure = if (failure is IOException) failure else IOException("broker RPC verification failed", failure)
+            throw closeAfterStartupFailure(startupFailure)
         }
+    }
+
+    private fun closeAfterStartupFailure(startupFailure: IOException): IOException {
+        runCatching { close() }.onFailure(startupFailure::addSuppressed)
+        return startupFailure
     }
 
     fun initializeDiscovery(repository: com.nv.pair.data.PairRepository) {
@@ -178,21 +181,64 @@ class BrokerSession(
         }
     }
 
+    @Synchronized
     override fun close() {
-        if (!stopping.compareAndSet(false, true)) return
-        val child = process
-        val runner = processRunner
-        if (child != null && runner != null && child.isAlive) {
-            runner.stop(child, 15_000)
-        }
-        rpc?.close()
-        stderrThread?.join(2_000)
+        stopping.set(true)
+        cleanup.run(
+            listOf(
+                {
+                    val child = process
+                    val runner = processRunner
+                    if (child != null && runner != null && child.isAlive) {
+                        try {
+                            runner.stop(child, PROCESS_STOP_TIMEOUT_MILLIS)
+                        } catch (stopFailure: Exception) {
+                            if (child.isAlive) throw stopFailure
+                        }
+                    }
+                },
+                { rpc?.close() },
+                { joinCleanupThread(stderrThread, STDERR_JOIN_TIMEOUT_MILLIS, "broker stderr reader") },
+                { joinCleanupThread(monitorThread, MONITOR_JOIN_TIMEOUT_MILLIS, "broker exit monitor") },
+            ),
+        )
+    }
+
+    private fun joinCleanupThread(thread: Thread?, timeoutMillis: Long, description: String) {
+        if (thread == null || thread === Thread.currentThread()) return
+        thread.join(timeoutMillis)
+        if (thread.isAlive) throw IOException("PAIR $description did not stop in time")
     }
 
     companion object {
+        private const val PROCESS_STOP_TIMEOUT_MILLIS = 15_000L
+        private const val STDERR_JOIN_TIMEOUT_MILLIS = 2_000L
+        private const val MONITOR_JOIN_TIMEOUT_MILLIS = 2_000L
         private val DEFAULT_PROXY_ENGINES = listOf("ollama", "lmstudio", "mnn")
 
         fun proxyEnginesForLocalMnn(mnnAvailable: Boolean): List<String> =
             if (mnnAvailable) DEFAULT_PROXY_ENGINES else DEFAULT_PROXY_ENGINES.filterNot { it == "mnn" }
+    }
+}
+
+internal class RetryableCleanup(private val actionCount: Int) {
+    private val completedActions = BooleanArray(actionCount)
+
+    @Synchronized
+    fun run(actions: List<() -> Unit>) {
+        require(actions.size == actionCount) { "Cleanup action count changed between attempts." }
+        var failure: IOException? = null
+        actions.forEachIndexed { index, action ->
+            if (!completedActions[index]) {
+                try {
+                    action()
+                    completedActions[index] = true
+                } catch (actionFailure: Exception) {
+                    val wrapped = IOException("PAIR cleanup action ${index + 1} failed.", actionFailure)
+                    failure = failure?.apply { addSuppressed(wrapped) } ?: wrapped
+                }
+            }
+        }
+        failure?.let { throw it }
     }
 }
