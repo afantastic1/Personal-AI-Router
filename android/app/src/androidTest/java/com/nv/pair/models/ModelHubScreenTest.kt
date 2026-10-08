@@ -107,16 +107,18 @@ class ModelHubScreenTest {
     @Test
     fun cloudCardListsGatewayCloudModelsAndHostOnlyNotice() {
         composeRule.setContent {
-            ModelHubScreen(
-                nodes = emptyList(),
-                gatewayModels = listOf(GatewayModel("cloud/work/chat", GatewayModelKind.CLOUD)),
-                preferredBackend = MnnBackend.CPU,
-                localEngineStatus = MnnLocalEngineStatus(available = false),
-                onBackendChange = {},
-                cloudProviderSettings = null,
-                onCloudEnabledChange = {},
-                onCloudPolicyChange = {},
-            )
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                ModelHubScreen(
+                    nodes = emptyList(),
+                    gatewayModels = listOf(GatewayModel("cloud/work/chat", GatewayModelKind.CLOUD)),
+                    preferredBackend = MnnBackend.CPU,
+                    localEngineStatus = MnnLocalEngineStatus(available = false),
+                    onBackendChange = {},
+                    cloudProviderSettings = null,
+                    onCloudEnabledChange = {},
+                    onCloudPolicyChange = {},
+                )
+            }
         }
 
         composeRule.onNodeWithText("Cloud resources").performScrollTo().assertIsDisplayed()
