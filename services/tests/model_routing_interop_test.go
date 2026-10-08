@@ -5,6 +5,7 @@ package tests
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -188,5 +189,68 @@ func TestGatewayBindConflictLeavesEngineProxiesReady(t *testing.T) {
 	}
 	if port := waitLMStudioProxyReady(t, stdin, msgs, 15*time.Second); port <= 0 {
 		t.Fatalf("lmstudio-proxy reported invalid port %d", port)
+	}
+}
+
+func TestGatewayStartsWithoutLocalFacadesAndRestarts(t *testing.T) {
+	if portBusy(14326) {
+		t.Skip("OpenAI Gateway port 14326 is already in use; skipping")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+	configDir := t.TempDir()
+	var cleanup func()
+	t.Cleanup(func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	})
+
+	for incarnation := 1; incarnation <= 2; incarnation++ {
+		stdin, messages, stderr, stop := startBrokerWithConfigDir(t, configDir,
+			"--proxy-path", proxyBin,
+			"--proxy-engines", "",
+		)
+		cleanup = stop
+		go func() {
+			for range stderr {
+			}
+		}()
+		waitForMethod(t, messages, "app:ready", 10*time.Second)
+
+		response, err := client.Get("http://127.0.0.1:14326/v1/models")
+		if err != nil {
+			t.Fatalf("Gateway unavailable on Broker incarnation %d: %v", incarnation, err)
+		}
+		var payload struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&payload)
+		_ = response.Body.Close()
+		if decodeErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("Gateway model response on incarnation %d: status=%d decode=%v", incarnation, response.StatusCode, decodeErr)
+		}
+		wantAliases := map[string]bool{"auto": false, "auto-fast": false, "auto-balanced": false, "auto-best": false}
+		for _, model := range payload.Data {
+			if _, wanted := wantAliases[model.ID]; wanted {
+				wantAliases[model.ID] = true
+			} else {
+				t.Errorf("no-facade model directory exposed unexpected model %q", model.ID)
+			}
+		}
+		for alias, found := range wantAliases {
+			if !found {
+				t.Errorf("no-facade model directory omitted %q", alias)
+			}
+		}
+
+		_ = stdin.Close()
+		stop()
+		cleanup = nil
+		if _, err := client.Get("http://127.0.0.1:14326/v1/models"); err == nil {
+			t.Fatalf("Gateway listener remained after Broker incarnation %d stopped", incarnation)
+		}
 	}
 }

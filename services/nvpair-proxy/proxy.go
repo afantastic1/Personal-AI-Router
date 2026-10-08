@@ -366,10 +366,11 @@ type Proxy struct {
 	// Keyed by engine because one process hosts every enabled engine's facade.
 	// Each owns its own listeners, ports and dialect; what they share is this
 	// host's transports, workload stream, and reservation map. See facade.go.
-	facadeMu  sync.Mutex
-	facades   map[string]*facade
-	gatewayMu sync.Mutex
-	gateway   *gatewayServer
+	facadeMu          sync.Mutex
+	facades           map[string]*facade
+	gatewayMu         sync.Mutex
+	gateway           *gatewayServer
+	gatewayDispatcher *gatewayDispatcher
 
 	// serveCtx is the process lifetime, and is what a facade's HTTP servers use
 	// as their BaseContext. It must not be an enable request's context: that one
@@ -427,11 +428,13 @@ type Proxy struct {
 // NewProxy builds a facade-less process host. Facades arrive via
 // enableFacade, so nothing is listening when this returns.
 func NewProxy(codec *Codec) *Proxy {
-	return &Proxy{
+	proxy := &Proxy{
 		codec:    codec,
 		runID:    newRunID(),
 		activity: nodeactivity.NewReporter(activityReportInterval),
 	}
+	proxy.gatewayDispatcher = newGatewayDispatcher(proxy)
+	return proxy
 }
 
 // facadeFor resolves the facade an addressed message names, or nil when that
@@ -812,6 +815,7 @@ func (p *Proxy) shutdown(ctx context.Context) {
 	for _, f := range p.enabledFacades() {
 		f.stopServing(ctx)
 	}
+	p.gatewayDispatcher.closeIdleConnections()
 	p.closeIdleTransports()
 }
 

@@ -858,9 +858,9 @@ func (b *Broker) ollamaFallbackPort(failed int) int {
 // simultaneous bursts to the same node believing it idle.
 //
 // A facade that fails to come up is logged and skipped, not fatal. The spawn
-// only fails if no engine came up at all, because a process with no listener
-// serves nobody and should be retried by the supervisor rather than left
-// running.
+// only fails when neither a facade nor the loopback Gateway comes up, because
+// a process with no listener serves nobody and should be retried by the
+// supervisor rather than left running.
 func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	// Both generations are captured before the spawn and advance together: they
 	// are per-incarnation stale-notification filters, and with one process the
@@ -916,16 +916,15 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 			failed = append(failed, profile)
 		}
 	}
-	if enabled > 0 {
-		params, _ := json.Marshal(map[string]int{"port": 14326})
-		if _, rpcErr, callErr := pp.Call(bringUp, "gateway/enable", params); callErr != nil || rpcErr != nil {
-			if callErr == nil {
-				callErr = fmt.Errorf("proxy rejected gateway/enable: %s", rpcErr.Message)
-			}
-			slog.Warn("local OpenAI gateway failed to start", "err", callErr)
-		}
+	params, _ := json.Marshal(map[string]int{"port": 14326})
+	_, gatewayRPCError, gatewayCallError := pp.Call(bringUp, "gateway/enable", params)
+	if gatewayCallError == nil && gatewayRPCError != nil {
+		gatewayCallError = fmt.Errorf("proxy rejected gateway/enable: %s", gatewayRPCError.Message)
 	}
-	if enabled == 0 {
+	if gatewayCallError != nil {
+		slog.Warn("local OpenAI gateway failed to start", "err", gatewayCallError)
+	}
+	if enabled == 0 && gatewayCallError != nil {
 		// The whole spawn failed, so the supervisor will retry it. Leave every
 		// engine's managed claim and its OLLAMA_HOST alias reservation exactly
 		// as they are: the retry needs them, and releasing the alias here would
@@ -948,10 +947,10 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 		// exists to prevent. A later successful spawn re-derives the real state.
 		b.markOllamaPortReady()
 		b.markLMStudioPortReady()
-		return nil, fmt.Errorf("no engine facade could be brought up in %s", b.proxyPath)
+		return nil, fmt.Errorf("no proxy listener could be brought up in %s", b.proxyPath)
 	}
 
-	// At least one facade is serving, so this process incarnation is staying
+	// At least one listener is serving, so this process incarnation is staying
 	// and will not be retried. Only now is a failed engine terminal for it.
 	for _, profile := range failed {
 		b.setEngineProxyHandle(profile, nil)
@@ -2175,7 +2174,7 @@ func (b *Broker) Serve(ctx context.Context) error {
 	// reservations of all facades in one place, which is the point of the
 	// unified proxy; the cost is shared fate, so a crash takes every engine's
 	// facade down and the supervisor brings them all back together.
-	anyProxyEnabled := false
+	anyProxyEnabled := b.proxyPath != ""
 	for _, profile := range engineProxyProfiles {
 		if b.proxyEnabled(profile) {
 			anyProxyEnabled = true

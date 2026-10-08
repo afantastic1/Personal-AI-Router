@@ -64,18 +64,18 @@ the port asked for. Enabling an engine that is already up is an idempotent
 success, so a redelivered enable never tears down a working listener.
 
 The broker also enables the process-scoped OpenAI gateway once per proxy
-incarnation:
+incarnation, including when no local engine facade is enabled:
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"gateway/enable","params":{"port":14326}}
 ```
 
 It binds only `127.0.0.1:14326` and serves `GET /v1/models` plus
-`POST /v1/chat/completions`. The directory unions the enabled facades' current
-discovery inventories. Chat requests resolve their explicit model to an engine
-and then enter that facade's existing routing handler, preserving scheduler
-selection, cancellation, streaming, and workload attribution. The gateway is
-not an engine facade or a LAN-advertised service.
+`POST /v1/chat/completions`. Local models use `local/<engine>/<model>` IDs; a
+bare model ID appears only when it is unique across enabled facades. Chat
+requests enter the selected facade's existing routing handler, preserving
+scheduler selection, cancellation, streaming, and workload attribution. The
+gateway is not an engine facade or a LAN-advertised service.
 
 The directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
 `auto-best`. These aliases select an eligible model and engine from current
@@ -85,8 +85,8 @@ the same facade handler and its existing node scheduler. Catalog entries absent
 from runtime inventory are never candidates. The gateway does not provide
 catalog search or download operations.
 Before scoring, eligibility intersects model-name capability heuristics with
-known engine protocol support. MNN supports chat only and is excluded for tools,
-vision, and embeddings requirements, regardless of model ID hints.
+known engine protocol support. MNN supports chat and streaming, but is excluded
+for tools, vision, and embeddings requirements, regardless of model ID hints.
 
 ### Flags
 

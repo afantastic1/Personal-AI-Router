@@ -25,9 +25,10 @@ The canonical inventory is `src/shared/constants/modular-binaries.ts`.
 
 Broker-owned workers:
 
-- `nvpair-proxy`, one process hosting a facade per enabled engine. It starts
- with no engine and no listener; the broker sends a `facade/enable` per engine
- carrying that engine's port. Clients still address each facade as
+- `nvpair-proxy`, one process hosting a facade per enabled engine and the
+ process-scoped loopback OpenAI gateway. It starts with no listeners; the broker
+ sends `facade/enable` for each enabled engine, then `gateway/enable` even when
+ no local engine is enabled. Clients still address each facade as
  `ollama-proxy:` / `lmstudio-proxy:`, and one supervisor covers them all, so a
  crash is reported against `nvpair-proxy` and restarts every facade together;
 - `nvpair-node-scanner`;

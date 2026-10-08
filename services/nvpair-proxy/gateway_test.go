@@ -55,7 +55,10 @@ func TestGatewayModelDirectoryUnionsEngineInventoriesWithoutNodeDetails(t *testi
 	proxy.facades["mnn"].discovery.AddManual(Node{ID: "phone-secret", Models: []string{"qwen3-1.7b"}})
 
 	models := proxy.gatewayModels()
-	want := []string{"llama", "qwen3-1.7b", "qwen3-8b", "shared"}
+	want := []string{
+		"llama", "local/lmstudio/shared", "local/mnn/qwen3-1.7b",
+		"local/ollama/qwen3-8b", "local/ollama/shared", "qwen3-1.7b", "qwen3-8b",
+	}
 	for _, id := range want {
 		found := false
 		for _, model := range models {
@@ -109,6 +112,26 @@ func TestGatewayAutoPoliciesSelectOnlyAdvertisedModels(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsAmbiguousBareModelID(t *testing.T) {
+	proxy := NewProxy(NewCodec(rwNop{}))
+	ollama, _ := profileFor("ollama")
+	lmstudio, _ := profileFor("lmstudio")
+	proxy.facades = map[string]*facade{
+		"ollama":   newFacade(proxy, ollama, NewDiscovery(), 11435),
+		"lmstudio": newFacade(proxy, lmstudio, NewDiscovery(), 1234),
+	}
+	proxy.facades["ollama"].discovery.AddManual(Node{ID: "pc", Models: []string{"shared"}})
+	proxy.facades["lmstudio"].discovery.AddManual(Node{ID: "workstation", Models: []string{"shared"}})
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"shared","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "model_conflict") {
+		t.Fatalf("ambiguous model response=%d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestGatewayAutoToolsRequestDoesNotRouteToMNN(t *testing.T) {
 	var hits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -127,7 +150,7 @@ func TestGatewayAutoToolsRequestDoesNotRouteToMNN(t *testing.T) {
 	response := httptest.NewRecorder()
 	proxy.serveGateway(response, request)
 
-	if response.Code != http.StatusNotFound {
+	if response.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("gateway status = %d body=%s, want no compatible model", response.Code, response.Body.String())
 	}
 	if hits.Load() != 0 {
@@ -307,5 +330,82 @@ func TestGatewayRejectsOversizedRequestBody(t *testing.T) {
 
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("gateway status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestGatewayRoutesAuthorizedCloudModelAndMapsPublicModelID(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("upstream path=%q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer provider-test-key" {
+			t.Errorf("upstream authorization=%q", got)
+		}
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+		}
+		var model string
+		if err := json.Unmarshal(payload["model"], &model); err != nil || model != "deepseek-chat" {
+			t.Errorf("upstream model=%q err=%v", model, err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","model":"deepseek-chat","choices":[],"provider_extra":{"kept":true}}`)
+	}))
+	defer server.Close()
+
+	proxy := NewProxy(nil)
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("gateway status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Model         string          `json:"model"`
+		ProviderExtra json.RawMessage `json:"provider_extra"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode Gateway response: %v", err)
+	}
+	if payload.Model != "cloud/deepseek/deepseek-chat" || string(payload.ProviderExtra) != `{"kept":true}` {
+		t.Fatalf("public response model=%q provider_extra=%s", payload.Model, payload.ProviderExtra)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("cloud upstream hit count=%d, want 1", got)
+	}
+}
+
+func TestGatewayCloudRoutingIsDisabledByDefault(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHits.Add(1)
+	}))
+	defer server.Close()
+	proxy := NewProxy(nil)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "cloud_not_allowed") {
+		t.Fatalf("disabled Cloud response=%d %s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("disabled cloud route reached upstream %d times", got)
 	}
 }

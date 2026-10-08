@@ -94,15 +94,17 @@ is a genuine limitation, not a safety margin (§5.6).
 
 ## 3. Process model
 
-The process starts with **no engine and no listener**. The broker then sends one
-`facade/enable` per engine, carrying that engine's port and any alias addresses.
-After at least one facade is enabled, it sends process-scoped
-`gateway/enable` with port `14326`. The gateway binds only `127.0.0.1`, is not a
-facade or discovery service, and serves the OpenAI model-list and chat
-completion routes. It resolves an explicit model to an engine using loaded
-inventory first and the centralized `mnn`, `ollama`, `lmstudio` preference for
-ties, then delegates to that facade's existing request handler. Node scheduling
-remains owned by the existing facade path.
+The process starts with **no engine and no listener**. The broker sends one
+`facade/enable` per selected engine, carrying that engine's port and any alias
+addresses, then sends process-scoped `gateway/enable` with port `14326` whether
+or not any local facade was enabled. The gateway binds only `127.0.0.1`, is not
+a facade or discovery service, and serves the OpenAI model-list and chat
+completion routes. A cloud-only installation can therefore serve the gateway
+without starting a local engine listener. Local models have stable
+`local/<engine>/<model>` IDs; an unqualified ID is listed only when unique
+across local engines. Explicit local requests delegate to that facade's
+existing request handler. Node scheduling remains owned by the existing
+facade path.
 
 The model directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
 `auto-best`. `auto` resolves to `auto-balanced`. These aliases choose a model
@@ -113,10 +115,10 @@ through the selected facade so node placement remains unchanged. The gateway
 does not browse catalogs or install models.
 
 Eligibility intersects model-name capability heuristics with known engine
-protocol support before scoring. MNN is chat-only; it cannot satisfy tools,
-vision, or embeddings requirements even when its model ID contains those
-capability hints. Unknown engine capabilities remain unknown and do not gain
-fabricated support from a model name.
+protocol support before scoring. MNN supports chat and streaming; it cannot
+satisfy tools, vision, or embeddings requirements even when its model ID
+contains those capability hints. Unknown engine capabilities remain unknown
+and do not gain fabricated support from a model name.
 
 A flag cannot express this. The broker plans a different port for each engine —
 Ollama's managed facade wants `:11434` while LM Studio's wants `:1234`, and

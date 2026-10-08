@@ -75,6 +75,18 @@ func TestMNNCanBeSelectedForChat(t *testing.T) {
 	}
 }
 
+func TestMNNCanBeSelectedForStreamingChat(t *testing.T) {
+	candidate := runtimeModel("qwen-small", "mnn", 600_000_000, false, 0, 0, map[string]bool{
+		"chat": true, "streaming": true,
+	})
+	selection := (AutoModelSelector{}).Select(AutoBalancedAlias, Requirements{
+		Capabilities: map[string]bool{"chat": true, "streaming": true},
+	}, []RuntimeModel{candidate})
+	if selection == nil || selection.Engine != "mnn" {
+		t.Fatalf("streaming chat selection = %+v, want MNN", selection)
+	}
+}
+
 func TestSameInputProducesSameSelectionRepeatedly(t *testing.T) {
 	first := runtimeModel("same-model", "ollama", 1_000_000_000, false, 500, 20, nil)
 	second := runtimeModel("same-model", "ollama", 1_000_000_000, false, 500, 20, nil)

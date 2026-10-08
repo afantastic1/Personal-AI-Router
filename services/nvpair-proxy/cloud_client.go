@@ -113,6 +113,7 @@ func (c *cloudHTTPClient) DoChat(
 	ctx context.Context,
 	provider cloudProviderRuntime,
 	target cloudModelTarget,
+	responseModel string,
 	credential string,
 	rawBody []byte,
 ) (*http.Response, error) {
@@ -169,7 +170,8 @@ func (c *cloudHTTPClient) DoChat(
 		strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
 		response.Body = &cloudSSEBody{
 			ReadCloser: response.Body, maxEventBytes: c.maxSSEEventBytes,
-			idleTimeout: c.streamIdleTimeout, cancel: cancel, release: release,
+			idleTimeout: c.streamIdleTimeout, responseModel: responseModel,
+			cancel: cancel, release: release,
 		}
 		return response, nil
 	}
@@ -189,9 +191,35 @@ func (c *cloudHTTPClient) DoChat(
 	if int64(len(responseData)) > c.maxResponseBytes {
 		return nil, newCloudAdapterError(cloudErrResponseTooLarge, nil)
 	}
+	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		responseData = rewriteCloudResponseModel(responseData, responseModel)
+	}
 	response.Body = io.NopCloser(bytes.NewReader(responseData))
 	response.ContentLength = int64(len(responseData))
 	return response, nil
+}
+
+func rewriteCloudResponseModel(responseBody []byte, publicModelID string) []byte {
+	if publicModelID == "" {
+		return responseBody
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(responseBody, &payload); err != nil || payload == nil {
+		return responseBody
+	}
+	if _, exists := payload["model"]; !exists {
+		return responseBody
+	}
+	encoded, err := json.Marshal(publicModelID)
+	if err != nil {
+		return responseBody
+	}
+	payload["model"] = encoded
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return responseBody
+	}
+	return rewritten
 }
 
 func rewriteCloudRequestModel(rawBody []byte, upstreamID string) ([]byte, error) {
@@ -289,9 +317,15 @@ type cloudSSEBody struct {
 	io.ReadCloser
 	maxEventBytes int
 	idleTimeout   time.Duration
-	eventBytes    int
+	responseModel string
+	event         []byte
 	line          []byte
-	data          []byte
+	input         []byte
+	inputOffset   int
+	inputErr      error
+	output        []byte
+	outputOffset  int
+	eventBytes    int
 	sawDone       bool
 	cancel        context.CancelFunc
 	release       func()
@@ -302,72 +336,158 @@ func (b *cloudSSEBody) Read(buffer []byte) (int, error) {
 	if len(buffer) == 0 {
 		return 0, nil
 	}
+	for {
+		if b.outputOffset < len(b.output) {
+			n := copy(buffer, b.output[b.outputOffset:])
+			b.outputOffset += n
+			if b.outputOffset == len(b.output) {
+				b.output = nil
+				b.outputOffset = 0
+			}
+			return n, nil
+		}
+		if b.sawDone {
+			return 0, io.EOF
+		}
+		if b.inputOffset < len(b.input) {
+			value := b.input[b.inputOffset]
+			b.inputOffset++
+			b.event = append(b.event, value)
+			b.eventBytes++
+			if b.eventBytes > b.maxEventBytes {
+				return 0, newCloudAdapterError(cloudErrSSEEventTooLarge, nil)
+			}
+			if value == '\n' {
+				line := bytes.TrimSuffix(b.line, []byte{'\r'})
+				if len(line) == 0 {
+					var terminal bool
+					b.output, terminal = rewriteCloudSSEEvent(b.event, b.responseModel)
+					b.sawDone = terminal
+					b.outputOffset = 0
+					b.event = nil
+					b.eventBytes = 0
+				} else {
+					b.line = b.line[:0]
+				}
+			} else if value != '\r' {
+				b.line = append(b.line, value)
+			}
+			continue
+		}
+		if b.inputErr != nil {
+			if errors.Is(b.inputErr, io.EOF) {
+				if b.sawDone {
+					return 0, io.EOF
+				}
+				return 0, newCloudAdapterError(cloudErrStreamTruncated, io.ErrUnexpectedEOF)
+			}
+			return 0, cloudTransportError(b.inputErr)
+		}
+		if err := b.readChunk(); err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (b *cloudSSEBody) readChunk() error {
 	type readResult struct {
 		data []byte
 		n    int
 		err  error
 	}
 	result := make(chan readResult, 1)
-	readBuffer := make([]byte, len(buffer))
+	readBuffer := make([]byte, 32<<10)
 	go func() {
 		n, err := b.ReadCloser.Read(readBuffer)
 		result <- readResult{data: readBuffer, n: n, err: err}
 	}()
 	timer := time.NewTimer(b.idleTimeout)
 	defer timer.Stop()
-	var read readResult
 	select {
-	case read = <-result:
+	case read := <-result:
+		b.input = read.data[:read.n]
+		b.inputOffset = 0
+		b.inputErr = read.err
+		if read.n == 0 && read.err == nil {
+			return nil
+		}
+		return nil
 	case <-timer.C:
 		b.cancel()
-		read = <-result
-		if read.n > 0 {
-			copy(buffer, read.data[:read.n])
-		}
-		return read.n, newCloudAdapterError(cloudErrProviderTimeout, context.DeadlineExceeded)
+		<-result
+		return newCloudAdapterError(cloudErrProviderTimeout, context.DeadlineExceeded)
 	}
-	if read.n > 0 {
-		copy(buffer, read.data[:read.n])
+}
+
+func rewriteCloudSSEEvent(event []byte, publicModelID string) ([]byte, bool) {
+	type dataField struct {
+		start      int
+		valueStart int
+		valueEnd   int
+		value      []byte
 	}
-	n, err := read.n, read.err
-	for _, value := range buffer[:n] {
-		b.eventBytes++
-		if b.eventBytes > b.maxEventBytes {
-			return n, newCloudAdapterError(cloudErrSSEEventTooLarge, nil)
+	var fields []dataField
+	for start := 0; start < len(event); {
+		lineEnd := bytes.IndexByte(event[start:], '\n')
+		contentEnd := len(event)
+		next := len(event)
+		if lineEnd >= 0 {
+			next = start + lineEnd + 1
+			contentEnd = next - 1
 		}
-		if value == '\n' {
-			line := bytes.TrimSuffix(b.line, []byte{'\r'})
-			if len(line) == 0 {
-				if bytes.Equal(b.data, []byte("[DONE]")) {
-					b.sawDone = true
-				}
-				b.data = b.data[:0]
-				b.eventBytes = 0
-			} else if bytes.HasPrefix(line, []byte("data:")) {
-				value := bytes.TrimPrefix(line, []byte("data:"))
-				if len(value) > 0 && value[0] == ' ' {
-					value = value[1:]
-				}
-				if len(b.data) > 0 {
-					b.data = append(b.data, '\n')
-				}
-				b.data = append(b.data, value...)
+		if contentEnd > start && event[contentEnd-1] == '\r' {
+			contentEnd--
+		}
+		line := event[start:contentEnd]
+		if bytes.HasPrefix(line, []byte("data:")) {
+			valueStart := start + len("data:")
+			if valueStart < contentEnd && event[valueStart] == ' ' {
+				valueStart++
 			}
-			b.line = b.line[:0]
-		} else if value != '\r' {
-			b.line = append(b.line, value)
+			fields = append(fields, dataField{
+				start: start, valueStart: valueStart, valueEnd: contentEnd,
+				value: event[valueStart:contentEnd],
+			})
 		}
+		if next <= start {
+			break
+		}
+		start = next
 	}
-	if err == io.EOF && !b.sawDone {
-		return n, newCloudAdapterError(cloudErrStreamTruncated, io.ErrUnexpectedEOF)
+	var data []byte
+	for index, field := range fields {
+		if index > 0 {
+			data = append(data, '\n')
+		}
+		data = append(data, field.value...)
 	}
-	if errors.Is(err, context.Canceled) {
-		return n, cloudTransportError(err)
+	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+		return event, true
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return n, cloudTransportError(err)
+	if publicModelID == "" || len(fields) != 1 {
+		return event, false
 	}
-	return n, err
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(fields[0].value, &payload); err != nil || payload == nil {
+		return event, false
+	}
+	if _, exists := payload["model"]; !exists {
+		return event, false
+	}
+	encodedModel, err := json.Marshal(publicModelID)
+	if err != nil {
+		return event, false
+	}
+	payload["model"] = encodedModel
+	encodedPayload, err := json.Marshal(payload)
+	if err != nil {
+		return event, false
+	}
+	rewritten := make([]byte, 0, len(event)-fields[0].valueEnd+fields[0].valueStart+len(encodedPayload))
+	rewritten = append(rewritten, event[:fields[0].valueStart]...)
+	rewritten = append(rewritten, encodedPayload...)
+	rewritten = append(rewritten, event[fields[0].valueEnd:]...)
+	return rewritten, false
 }
 
 func (b *cloudSSEBody) Close() error {

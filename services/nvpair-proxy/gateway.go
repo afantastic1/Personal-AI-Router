@@ -4,14 +4,11 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -50,30 +47,7 @@ type gatewayServer struct {
 }
 
 func (p *Proxy) gatewayModels() []gatewayModel {
-	ids := make(map[string]struct{})
-	for _, f := range p.enabledFacades() {
-		for _, node := range f.discovery.Nodes() {
-			for _, model := range node.Models {
-				if strings.TrimSpace(model) != "" {
-					ids[model] = struct{}{}
-				}
-			}
-		}
-	}
-	keys := make([]string, 0, len(ids))
-	for id := range ids {
-		keys = append(keys, id)
-	}
-	sort.Strings(keys)
-	models := make([]gatewayModel, 0, len(keys))
-	for _, id := range keys {
-		models = append(models, gatewayModel{ID: id, Object: "model", OwnedBy: "pair"})
-	}
-	for _, alias := range autoAliases {
-		models = append(models, gatewayModel{ID: alias, Object: "model", OwnedBy: "pair"})
-	}
-	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
-	return models
+	return p.gatewayDispatcher.modelDirectory()
 }
 
 func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
@@ -138,40 +112,16 @@ func modelFamily(model string) string {
 
 func modelCapabilities() map[string]bool {
 	// Discovery currently provides model IDs only. Do not infer optional
-	// capabilities from names; unknown models are eligible for basic chat only.
-	return map[string]bool{"chat": true}
+	// capabilities from names. Local facades expose basic chat and SSE.
+	return map[string]bool{"chat": true, "streaming": true}
 }
 
 func requiredGatewayCapabilities(body []byte) map[string]bool {
-	var request struct {
-		Tools    json.RawMessage `json:"tools"`
-		Messages []struct {
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(body, &request) != nil {
+	traits, err := parseGatewayRequestTraits(body)
+	if err != nil {
 		return nil
 	}
-	capabilities := map[string]bool{"chat": true}
-	var tools []json.RawMessage
-	if json.Unmarshal(request.Tools, &tools) == nil && len(tools) > 0 {
-		capabilities["tools"] = true
-	}
-	for _, message := range request.Messages {
-		var parts []struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(message.Content, &parts) != nil {
-			continue
-		}
-		for _, part := range parts {
-			if part.Type == "image_url" || part.Type == "image" {
-				capabilities["vision"] = true
-				break
-			}
-		}
-	}
-	return capabilities
+	return traits.capabilities
 }
 
 func enginePreference(engine string) int {
@@ -268,29 +218,7 @@ func (p *Proxy) serveGateway(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
 		return
 	}
-	f := p.resolveGatewayFacade(model)
-	if isGatewayAutoAlias(model) {
-		candidate := p.resolveGatewayModel(model, body)
-		if candidate == nil {
-			writeGatewayError(w, http.StatusNotFound, "no available model matches the requested auto policy", "model_not_found")
-			return
-		}
-		model = candidate.Model.EngineModelID
-		f = p.facades[candidate.Engine]
-		var err error
-		body, err = rewriteGatewayModel(body, model)
-		if err != nil {
-			writeGatewayError(w, http.StatusBadRequest, "request body must be a JSON object", "invalid_request_error")
-			return
-		}
-	}
-	if f == nil {
-		writeGatewayError(w, http.StatusNotFound, "model is unavailable", "model_not_found")
-		return
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	f.handleHTTP(w, r)
+	p.gatewayDispatcher.dispatch(w, r, body, model)
 }
 
 func isGatewayAutoAlias(model string) bool {

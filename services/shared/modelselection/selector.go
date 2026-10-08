@@ -165,8 +165,9 @@ func engineProtocolSupports(engine, capability string) bool {
 	if engine != "mnn" {
 		return true
 	}
-	// The Android MNN chat facade rejects tools, vision, and embeddings.
-	return capability == "chat"
+	// The Android MNN chat facade supports streaming but rejects tools, vision,
+	// and embeddings.
+	return capability == "chat" || capability == "streaming"
 }
 
 func qualityScore(parameters float64, contextLength int) float64 {

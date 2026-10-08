@@ -56,7 +56,7 @@ func TestCloudClientUsesProviderCredentialAndPreservesRequestFields(t *testing.T
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
 	request := `{"model":"cloud/deepseek/deepseek-chat","messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"call_1"}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}],"tools":[{"type":"function"}],"tool_choice":"required","response_format":{"type":"json_object"},"stream_options":{"include_usage":true},"stream":false}`
 
-	response, err := client.DoChat(context.Background(), provider, target, "provider-secret", []byte(request))
+	response, err := client.DoChat(context.Background(), provider, target, target.PublicID, "provider-secret", []byte(request))
 	if err != nil {
 		t.Fatalf("DoChat: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCloudClientUsesOneVersionPathAndDoesNotRetryPOST(t *testing.T) {
 			provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL + "/gateway/v1/", Enabled: true}
 			target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 			client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
-			response, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
+			response, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
 			if err != nil {
 				t.Fatalf("DoChat returned transport error: %v", err)
 			}
@@ -114,7 +114,7 @@ func TestCloudClientDoesNotReplayPOSTAfterUpstreamDisconnect(t *testing.T) {
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
-	_, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
+	_, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
 	if err == nil {
 		t.Fatal("disconnected provider request unexpectedly succeeded")
 	}
@@ -133,7 +133,7 @@ func TestCloudClientBlocksPrivateDNSAnswersAndRedirects(t *testing.T) {
 	})
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: "https://provider.example", Enabled: true}
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
-	if _, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`)); err == nil {
+	if _, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`)); err == nil {
 		t.Fatal("private DNS result was allowed")
 	} else if strings.Contains(err.Error(), "provider.example") {
 		t.Fatalf("network error exposed provider URL: %v", err)
@@ -153,7 +153,7 @@ func TestCloudClientBlocksPrivateDNSAnswersAndRedirects(t *testing.T) {
 	defer redirector.Close()
 	loopbackClient := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
 	localProvider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: redirector.URL, Enabled: true}
-	response, err := loopbackClient.DoChat(context.Background(), localProvider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
+	response, err := loopbackClient.DoChat(context.Background(), localProvider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[]}`))
 	if err != nil {
 		t.Fatalf("redirect response: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestCloudClientLimitsNonStreamingResponseBody(t *testing.T) {
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, maxResponseBytes: 16})
-	_, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":false}`))
+	_, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":false}`))
 	if err == nil || !strings.Contains(err.Error(), "size limit") {
 		t.Fatalf("oversized response error=%v", err)
 	}
@@ -201,7 +201,7 @@ func TestCloudClientTimesOutStalledNonStreamingResponse(t *testing.T) {
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, nonStreamTimeout: 25 * time.Millisecond})
-	_, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":false}`))
+	_, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":false}`))
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("stalled response error=%v", err)
 	}
@@ -237,7 +237,7 @@ func TestCloudClientBoundsConcurrentStreamsAndReleasesSlots(t *testing.T) {
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, maxConcurrent: 1})
 	firstTarget := cloudModelTarget{PublicID: "cloud/p/first", ProviderID: "p", UpstreamID: "upstream-one", Enabled: true}
-	first, err := client.DoChat(context.Background(), provider, firstTarget, "secret", []byte(`{"model":"cloud/p/first","messages":[],"stream":true}`))
+	first, err := client.DoChat(context.Background(), provider, firstTarget, firstTarget.PublicID, "secret", []byte(`{"model":"cloud/p/first","messages":[],"stream":true}`))
 	if err != nil {
 		t.Fatalf("first DoChat: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestCloudClientBoundsConcurrentStreamsAndReleasesSlots(t *testing.T) {
 	secondCallStarted := make(chan struct{})
 	go func() {
 		close(secondCallStarted)
-		response, requestErr := client.DoChat(context.Background(), provider, secondTarget, "secret", []byte(`{"model":"cloud/p/second","messages":[],"stream":true}`))
+		response, requestErr := client.DoChat(context.Background(), provider, secondTarget, secondTarget.PublicID, "secret", []byte(`{"model":"cloud/p/second","messages":[],"stream":true}`))
 		if requestErr == nil {
 			_, requestErr = io.ReadAll(response.Body)
 			_ = response.Body.Close()
@@ -292,7 +292,7 @@ func TestCloudClientCancelsUpstreamWhenCallerCancels(t *testing.T) {
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
 	ctx, cancel := context.WithCancel(context.Background())
-	response, err := client.DoChat(ctx, provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
+	response, err := client.DoChat(ctx, provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
 	if err != nil {
 		t.Fatalf("DoChat: %v", err)
 	}
@@ -327,10 +327,14 @@ func TestCloudClientPreservesSSEAndRejectsTruncatedOrOversizedEvents(t *testing.
 	for _, test := range []struct {
 		name         string
 		stream       string
+		wantBody     string
 		maxEventSize int
 		wantError    string
 	}{
-		{name: "done", stream: "data: {\"choices\":[]}\n\ndata: [DONE]\n\n", maxEventSize: 128},
+		{
+			name: "done", stream: "data: {\"model\":\"upstream\",\"choices\":[]}\n\ndata: [DONE]\n\n",
+			wantBody: "data: {\"choices\":[],\"model\":\"cloud/p/model\"}\n\ndata: [DONE]\n\n", maxEventSize: 128,
+		},
 		{name: "missing terminal event", stream: "data: {\"choices\":[]}\n\n", maxEventSize: 128, wantError: io.ErrUnexpectedEOF.Error()},
 		{name: "event size limit", stream: "data: " + strings.Repeat("x", 64) + "\n\n", maxEventSize: 24, wantError: "configured size limit"},
 	} {
@@ -343,7 +347,7 @@ func TestCloudClientPreservesSSEAndRejectsTruncatedOrOversizedEvents(t *testing.
 			provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 			target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 			client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, maxSSEEventBytes: test.maxEventSize})
-			response, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
+			response, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
 			if err != nil {
 				t.Fatalf("DoChat: %v", err)
 			}
@@ -355,7 +359,11 @@ func TestCloudClientPreservesSSEAndRejectsTruncatedOrOversizedEvents(t *testing.
 				}
 				return
 			}
-			if readErr != nil || string(body) != test.stream {
+			wantBody := test.wantBody
+			if wantBody == "" {
+				wantBody = test.stream
+			}
+			if readErr != nil || string(body) != wantBody {
 				t.Fatalf("stream body=%q err=%v", body, readErr)
 			}
 		})
@@ -375,7 +383,7 @@ func TestCloudClientEndsAnIdleStream(t *testing.T) {
 	provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
 	target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
 	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, streamIdleTimeout: 30 * time.Millisecond})
-	response, err := client.DoChat(context.Background(), provider, target, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
+	response, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", []byte(`{"model":"cloud/p/model","messages":[],"stream":true}`))
 	if err != nil {
 		t.Fatalf("DoChat: %v", err)
 	}
