@@ -132,14 +132,27 @@ remove or authorize membership in cluster B.
 
 Discovery continues to identify devices and reachable endpoints. It does not
 publish the complete list of a device's cluster memberships to unpaired LAN
-peers. Membership selection and request approval are exchanged through the
-explicit cluster protocol.
+peers. The current singular `clusterUuid` advertisement is removed because it
+cannot represent membership correctly and would tempt consumers to treat one
+publicly advertised value as the device's active security scope. Membership
+selection and request approval are exchanged through the explicit cluster
+protocol. Discovery and node telemetry are never admission authority.
 
-The Broker and Workload Manager consume per-cluster membership snapshots. A
-workload, node inventory, or cluster event is delivered only to members of its
+The Broker, node scanner, scheduler, and inter-node services consume
+per-cluster membership snapshots. Cluster-scoped node inventory, model
+availability, remote engine control, error sync, workload events, and
+inference routing are exposed only within the requesting membership. A
+workload, inventory, or cluster event is delivered only to members of its
 originating cluster. A device that belongs to clusters A and B may participate
 in both independently; it does not relay A's topology or payloads into B.
 Removing it from A updates A's peer set without disconnecting its B membership.
+
+The shared cluster-trust package authenticates the device certificate, then
+resolves authorization against the cluster ID on each scoped operation. Client
+pooling and pin lookup are keyed by device identity; admission checks and peer
+sets are keyed by cluster membership. Every inter-node service that currently
+uses `clustertrust` must use the same cluster-scoped decision rather than
+assuming that a globally pinned certificate is a member of every group.
 
 Cluster membership does not itself grant paid cloud-provider authorization.
 Existing explicit cloud provider and node authorization controls remain
@@ -157,6 +170,20 @@ separate.
 - Removal endpoints, workload/event envelopes, roster reconciliation, and
   admission proofs carry the cluster scope. The receiving backend validates the
   scope against the authenticated node's membership.
+- Replace the singular cluster marker in `shared/noderec`, mDNS records,
+  `/v1/node-info`, scanner directory records, and UI node snapshots with
+  identity/reachability data plus local, backend-derived per-cluster
+  relationship state. Do not serialize the full membership list to unpaired
+  LAN peers.
+- Audit and update all current `shared/clustertrust` consumers: `nvpair-proxy`,
+  `nvpair-engine-manager`, `nvpair-errors`, `nvpair-manual-nodes`,
+  `nvpair-node-info`, `nvpair-node-scanner`, and `nvpair-workload-manager`.
+  Update `nvpair-job-scheduler` and Broker peer/identity projection so their
+  candidate sets are scoped to the selected/requesting cluster.
+- Move durable membership authority out of the singular cluster-ID mirror in
+  `nvpair-node-settings`; retain only a selected-cluster UI preference there if
+  needed. Update Broker startup restore and identity-change handling so stale
+  preference data cannot recreate a membership.
 - Update Go producers, shared service contract generation, broker relay and
   state projection, Electron bridge/types/stores, Android RPC/models/repository,
   TUI if it consumes the changed methods, tests, and owned protocol docs in one
