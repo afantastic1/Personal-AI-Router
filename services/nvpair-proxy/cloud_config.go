@@ -164,11 +164,6 @@ func validateCloudBaseURL(raw string, options cloudConfigOptions) (string, error
 	return parsed.String(), nil
 }
 
-func isForbiddenCloudIP(address net.IP) bool {
-	return !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() ||
-		address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast()
-}
-
 func validCloudPublicID(id string) bool {
 	parts := strings.Split(id, "/")
 	if len(parts) < 3 || parts[0] != "cloud" {
