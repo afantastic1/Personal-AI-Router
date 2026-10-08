@@ -45,7 +45,7 @@ here.
   membership in each of several clusters, but cannot be duplicated within the
   same cluster.
 - Each membership has its own cluster name, admission epoch, roster entry,
-  invite/request lifecycle, and permissions.
+  invite lifecycle, and permissions.
 - Creating or joining a membership never replaces or silently leaves another
   membership. Leaving or removal revokes only the selected membership.
 
@@ -104,9 +104,11 @@ consumers are updated wherever they expose the affected cluster contract.
 
 The Cluster Manager persists a collection of memberships keyed by cluster ID.
 Each membership owns its friendly name, local admission epoch, members, pending
-invites, pending join requests, and removal proofs. State changes identify the
-cluster explicitly. A single selected-cluster value may remain as UI preference
-only; it is never an authorization source.
+invites, and removal proofs. Join requests are held in a device-level inbox
+until the receiving user selects a cluster to approve into; the resulting
+outbound invite is then scoped to that membership. Membership state changes
+identify the cluster explicitly. A single selected-cluster value may remain as
+UI preference only; it is never an authorization source.
 
 ### 4.2 Device authentication versus cluster authorization
 
