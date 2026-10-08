@@ -29,6 +29,8 @@ import {
 import type { JsonObject, JsonValue } from './json-rpc-subprocess'
 import { emptyInvite, parseClusterNodes, parseInvite, parseNodeIdentity } from './cluster-json'
 import { removeManualNodeEntry, resolveManualNodeKey } from './manual-nodes-store'
+import { loadCloudCredentials, saveCloudCredential } from '@/electron/cloud-credential-store'
+import { cloudProvidersSettingsParams, parseCloudProvidersSettings } from './cloud-providers'
 
 type BridgeHandler<C extends WsInvokeChannel> = (
     payload?: WsInvokeRequest<C>
@@ -65,6 +67,59 @@ function callCluster(
     timeoutMs?: number
 ): Promise<JsonValue | undefined> {
     return getModularSupervisor().callProcess('broker', method, params, timeoutMs)
+}
+
+async function restoreCloudCredentials(): Promise<void> {
+    let credentials: Array<{ authRef: string; credential: string }>
+    try {
+        credentials = await loadCloudCredentials()
+    } catch {
+        return
+    }
+    for (const { authRef, credential } of credentials) {
+        try {
+            await getModularSupervisor().callProcess('broker', 'cloudproviders:credential:set', {
+                authRef,
+                credential
+            })
+        } catch {
+            // No credential material is included in diagnostics.
+        }
+    }
+}
+
+async function handleCloudCredentialSet(
+    payload?: WsInvokeRequest<'cloudproviders:set-credential'>
+): Promise<WsInvokeResponse<'cloudproviders:set-credential'>> {
+    if (!payload || !payload.authRef) throw new Error('Provider credential reference is required')
+    const previousCredential = (await loadCloudCredentials()).find(
+        entry => entry.authRef === payload.authRef
+    )?.credential
+    try {
+        await saveCloudCredential(payload.authRef, payload.credential)
+    } catch {
+        throw new Error('Secure credential storage failed')
+    }
+    try {
+        const result = objectValue(
+            await getModularSupervisor().callProcess('broker', 'cloudproviders:credential:set', {
+                authRef: payload.authRef,
+                credential: payload.credential
+            })
+        )
+        const credentialConfigured = booleanValue(result?.credentialConfigured)
+        if (payload.credential && !credentialConfigured) {
+            throw new Error('Provider credential was not accepted')
+        }
+        return { credentialConfigured }
+    } catch (error) {
+        try {
+            await saveCloudCredential(payload.authRef, previousCredential ?? '')
+        } catch {
+            // Keep any vault persistence failure free of credential material.
+        }
+        throw error instanceof Error ? error : new Error('Provider credential was not accepted')
+    }
 }
 
 async function getClusterIdentity(): Promise<ClusterNodeIdentity> {
@@ -668,10 +723,13 @@ async function handleNodeRemoveMember(
 }
 
 const EMPTY_SERVICE_BRIDGE_HANDLERS: BridgeHandlerMap = {
-    'app:get-initial': async () => ({
-        connected: getModularSupervisor().ready,
-        selfId: await handleGetSelfId()
-    }),
+    'app:get-initial': async () => {
+        await restoreCloudCredentials()
+        return {
+            connected: getModularSupervisor().ready,
+            selfId: await handleGetSelfId()
+        }
+    },
 
     'nodes:get-initial': () => getModularBridgeState().getNodesInitial(),
     'nodes:remove-member': payload => handleNodeRemoveMember(payload),
@@ -718,7 +776,40 @@ const EMPTY_SERVICE_BRIDGE_HANDLERS: BridgeHandlerMap = {
     'errors:get-initial': () => handleErrorsGetInitial(),
     'errors:clear': payload => (payload ? handleErrorsClear(payload) : null),
 
-    'workloads:get-initial': () => handleWorkloadsGetInitial()
+    'workloads:get-initial': () => handleWorkloadsGetInitial(),
+    'cloudproviders:get': async () =>
+        parseCloudProvidersSettings(
+            await getModularSupervisor().callProcess('broker', 'cloudproviders:get')
+        ),
+    'cloudproviders:save': async payload => {
+        if (!payload) throw new Error('Cloud provider settings are required')
+        const result = objectValue(
+            await getModularSupervisor().callProcess(
+                'broker',
+                'cloudproviders:save',
+                cloudProvidersSettingsParams(payload)
+            )
+        )
+        const saved = booleanValue(result?.saved)
+        if (saved) {
+            const authRefs = new Set(payload.config.providers.map(provider => provider.auth_ref))
+            for (const { authRef } of await loadCloudCredentials()) {
+                if (!authRefs.has(authRef)) await saveCloudCredential(authRef, '')
+            }
+        }
+        return { saved }
+    },
+    'cloudproviders:set-credential': payload => handleCloudCredentialSet(payload),
+    'cloudproviders:test': async payload => {
+        if (!payload) throw new Error('Provider ID is required')
+        const result = objectValue(
+            await getModularSupervisor().callProcess('broker', 'cloudproviders:test', {
+                providerId: payload.providerId
+            })
+        )
+        if (!booleanValue(result?.connected)) throw new Error('Provider connection test failed')
+        return { connected: true }
+    }
 }
 
 export function handleServiceBridgeInvoke<C extends WsInvokeChannel>(

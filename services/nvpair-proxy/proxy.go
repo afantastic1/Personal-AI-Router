@@ -2722,6 +2722,48 @@ func (p *Proxy) handleMessage(msg *Message) {
 			log.Printf("failed to respond to gateway/enable: %v", err)
 		}
 
+	case "gateway/configure":
+		var params gatewayConfigureParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			p.codec.RespondError(msg.ID, -32602, "invalid cloud provider configuration")
+			return
+		}
+		if err := p.gatewayDispatcher.configure(params); err != nil {
+			p.codec.RespondError(msg.ID, -32602, err.Error())
+			return
+		}
+		if err := p.codec.Respond(msg.ID, map[string]bool{"configured": true}); err != nil {
+			log.Printf("failed to respond to gateway/configure: %v", err)
+		}
+
+	case "gateway/credential/set":
+		var params gatewayCredentialParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			p.codec.RespondError(msg.ID, -32602, "invalid credential parameters")
+			return
+		}
+		if err := p.setGatewayCredential(params); err != nil {
+			p.codec.RespondError(msg.ID, -32602, err.Error())
+			return
+		}
+		if err := p.codec.Respond(msg.ID, map[string]bool{"credentialConfigured": params.Credential != ""}); err != nil {
+			log.Printf("failed to respond to gateway/credential/set: %v", err)
+		}
+
+	case "gateway/provider/test":
+		var params gatewayTestProviderParams
+		if err := json.Unmarshal(msg.Params, &params); err != nil || params.ProviderID == "" {
+			p.codec.RespondError(msg.ID, -32602, "invalid provider test request")
+			return
+		}
+		if err := p.gatewayDispatcher.testProvider(params.ProviderID); err != nil {
+			p.codec.RespondError(msg.ID, -32000, "provider connection test failed")
+			return
+		}
+		if err := p.codec.Respond(msg.ID, map[string]bool{"connected": true}); err != nil {
+			log.Printf("failed to respond to gateway/provider/test: %v", err)
+		}
+
 	case "nodes/list":
 		f, ok := p.requireFacade(msg, engine)
 		if !ok {

@@ -114,6 +114,17 @@ selector applies capability eligibility and policy scoring, then delegates
 through the selected facade so node placement remains unchanged. The gateway
 does not browse catalogs or install models.
 
+### 3.1 Cloud provider control plane
+
+The broker stores the versioned provider registry and Gateway policy without
+secret values. `gateway/configure` validates and atomically applies that
+configuration. Provider credentials arrive separately through
+`gateway/credential/set`, keyed by the configured opaque `auth_ref`; they live
+only in process memory and are pruned when a provider is removed. The explicit
+`gateway/provider/test` operation checks a provider with `GET /v1/models`,
+without sending chat content or starting inference. The provider key is never
+returned in RPC responses, model listings, logs, or Workload events.
+
 Eligibility intersects model-name capability heuristics with known engine
 protocol support before scoring. MNN supports chat and streaming; it cannot
 satisfy tools, vision, or embeddings requirements even when its model ID

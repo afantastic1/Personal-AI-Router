@@ -13,6 +13,7 @@ type cloudErrorCode string
 const (
 	cloudErrUnavailable       cloudErrorCode = "cloud_not_available"
 	cloudErrInvalidCredential cloudErrorCode = "invalid_provider_credential"
+	cloudErrProviderRejected  cloudErrorCode = "provider_rejected_request"
 	cloudErrInvalidRequest    cloudErrorCode = "invalid_request"
 	cloudErrInvalidEndpoint   cloudErrorCode = "invalid_provider_endpoint"
 	cloudErrProviderTimeout   cloudErrorCode = "provider_timeout"

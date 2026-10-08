@@ -39,7 +39,10 @@
 - ⚠️ nvpair-node-settings → settings/set-cluster-auto-sync
 - ⚠️ nvpair-node-settings → settings/set-force-ports
 - ⚠️ nvpair-proxy → facade/enable
+- ⚠️ nvpair-proxy → gateway/configure
+- ⚠️ nvpair-proxy → gateway/credential/set
 - ⚠️ nvpair-proxy → gateway/enable
+- ⚠️ nvpair-proxy → gateway/provider/test
 - ⚠️ nvpair-proxy → node/selected
 - ⚠️ nvpair-proxy → node/set-local-backend
 - ⚠️ nvpair-ui-broker → discovery:unsubscribe
@@ -216,7 +219,10 @@
 | `proxy/request-started` | notification (we consume) | ➖ ignored |
 | `ready` | notification (we consume) | ✅ yes |
 | `facade/enable` | request (we call) | ⚠️ not called |
+| `gateway/configure` | request (we call) | ⚠️ not called |
+| `gateway/credential/set` | request (we call) | ⚠️ not called |
 | `gateway/enable` | request (we call) | ⚠️ not called |
+| `gateway/provider/test` | request (we call) | ⚠️ not called |
 | `node/add-manual` | request (we call) | ✅ yes |
 | `node/remove-manual` | request (we call) | ✅ yes |
 | `node/select` | request (we call) | ✅ yes |
@@ -247,6 +253,7 @@
 | Method | Direction | In bridge? |
 |---|---|---|
 | `app:ready` | notification (we consume) | ✅ yes |
+| `cloudproviders:changed` | notification (we consume) | ✅ yes |
 | `discovery:nodes-changed` | notification (we consume) | ✅ yes |
 | `engine:restore-enabled` | notification (we consume) | ➖ ignored |
 | `engine:settings-changed` | notification (we consume) | ✅ yes |
@@ -258,6 +265,10 @@
 | `lmstudio-proxy:ready` | notification (we consume) | ➖ ignored |
 | `ollama-proxy:ready` | notification (we consume) | ➖ ignored |
 | `workloads:upsert` | notification (we consume) | ✅ yes |
+| `cloudproviders:credential:set` | request (we call) | ✅ yes |
+| `cloudproviders:get` | request (we call) | ✅ yes |
+| `cloudproviders:save` | request (we call) | ✅ yes |
+| `cloudproviders:test` | request (we call) | ✅ yes |
 | `connection/cluster-auto-sync` | request (we call) | ➖ ignored |
 | `connection/cluster-identity` | request (we call) | ✅ yes |
 | `discovery:get-nodes` | request (we call) | ✅ yes |

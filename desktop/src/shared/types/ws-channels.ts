@@ -42,6 +42,7 @@ import type { ServiceError } from '@/shared/types/errors'
 import type { NodeItem } from '@/shared/types/nodes'
 import type { NodeItemMetrics } from '@/shared/types/metrics'
 import type { Workload } from '@/shared/types/workloads'
+import type { CloudProvidersSettings } from '@/shared/types/cloud-providers'
 import type {
     AvailableNode,
     ClusterIdentityPayload,
@@ -110,6 +111,16 @@ export interface WsInvokeChannelMap {
 
     // Workloads
     'workloads:get-initial': { request: void; response: Record<string, Workload> }
+
+    // Cloud provider control plane. Provider credentials travel only through the
+    // one-shot setter and are never included in settings snapshots.
+    'cloudproviders:get': { request: void; response: CloudProvidersSettings }
+    'cloudproviders:save': { request: CloudProvidersSettings; response: { saved: boolean } }
+    'cloudproviders:set-credential': {
+        request: { authRef: string; credential: string }
+        response: { credentialConfigured: boolean }
+    }
+    'cloudproviders:test': { request: { providerId: string }; response: { connected: boolean } }
 }
 
 export type WsInvokeChannel = keyof WsInvokeChannelMap
@@ -121,6 +132,7 @@ export type WsInvokeResponse<C extends WsInvokeChannel> = WsInvokeChannelMap[C][
 // -----------------------------------------------------------------------------
 
 export interface WsPushChannelMap {
+    'cloudproviders:changed': CloudProvidersSettings
     // Nodes / cluster state
     'nodes:upsert': NodeItem
     'nodes:remove': string

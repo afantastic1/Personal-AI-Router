@@ -201,6 +201,46 @@ func (c *cloudHTTPClient) DoChat(
 	return response, nil
 }
 
+func (c *cloudHTTPClient) TestProvider(ctx context.Context, provider cloudProviderRuntime, credential string) error {
+	if provider.ID == "" || strings.TrimSpace(credential) == "" || len(credential) > 16<<10 || strings.ContainsAny(credential, "\r\n") {
+		return newCloudAdapterError(cloudErrInvalidCredential, nil)
+	}
+	endpoint, err := cloudModelsEndpoint(provider.BaseURL)
+	if err != nil {
+		return newCloudAdapterError(cloudErrInvalidEndpoint, err)
+	}
+	select {
+	case c.slots <- struct{}{}:
+		defer func() { <-c.slots }()
+	case <-ctx.Done():
+		return cloudTransportError(ctx.Err())
+	}
+	requestContext, cancel := context.WithTimeout(ctx, c.nonStreamTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return newCloudAdapterError(cloudErrInvalidEndpoint, err)
+	}
+	request.Header.Set("Authorization", "Bearer "+credential)
+	request.Header.Set("Accept", "application/json")
+	response, err := c.client.Do(request)
+	if err != nil {
+		return cloudTransportError(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+	if err != nil {
+		return newCloudAdapterError(cloudErrResponseRead, err)
+	}
+	if int64(len(body)) > c.maxResponseBytes {
+		return newCloudAdapterError(cloudErrResponseTooLarge, nil)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return newCloudAdapterError(cloudErrProviderRejected, nil)
+	}
+	return nil
+}
+
 func rewriteCloudResponseModel(responseBody []byte, publicModelID string) []byte {
 	if publicModelID == "" {
 		return responseBody
@@ -247,6 +287,21 @@ func cloudChatEndpoint(baseURL string) (string, error) {
 		parsed.Path = path + "/chat/completions"
 	} else {
 		parsed.Path = path + "/v1/chat/completions"
+	}
+	parsed.RawPath = ""
+	return parsed.String(), nil
+}
+
+func cloudModelsEndpoint(baseURL string) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Hostname() == "" {
+		return "", errors.New("provider API base URL is invalid")
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(path, "/v1") {
+		parsed.Path = path + "/models"
+	} else {
+		parsed.Path = path + "/v1/models"
 	}
 	parsed.RawPath = ""
 	return parsed.String(), nil

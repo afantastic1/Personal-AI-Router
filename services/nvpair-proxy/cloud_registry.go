@@ -79,6 +79,20 @@ func (s *cloudRegistrySnapshot) provider(providerID string) (cloudProviderRuntim
 	return provider, ok && provider.Enabled
 }
 
+func (s *cloudRegistrySnapshot) providerByID(providerID string) (cloudProviderRuntime, bool) {
+	provider, ok := s.providers[providerID]
+	return provider, ok
+}
+
+func (s *cloudRegistrySnapshot) providerByAuthRef(authRef string) bool {
+	for _, provider := range s.providers {
+		if provider.AuthRef == authRef {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneCloudCapabilities(capabilities map[string]bool) map[string]bool {
 	cloned := make(map[string]bool, len(capabilities))
 	for capability, enabled := range capabilities {

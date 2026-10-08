@@ -143,6 +143,24 @@ Shared lifecycle for all workers:
 
 ## JSON-RPC Surface
 
+### Cloud provider control
+
+The broker owns the persisted, non-secret cloud provider settings in
+`cloud-providers.json`. These methods are explicit commands; reading the
+settings never returns provider keys:
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `cloudproviders:get` | none | versioned provider config and Gateway settings |
+| `cloudproviders:save` | the same settings object | `{"saved":true}` after Proxy validation and durable save |
+| `cloudproviders:credential:set` | `{ "authRef": string, "credential": string }` | configured status only; the credential is relayed to Proxy memory and retained only in Electron's encrypted vault for restart recovery |
+| `cloudproviders:test` | `{ "providerId": string }` | `{"connected":true}` after an explicit `GET /v1/models` |
+
+Credential commands and their responses are never logged. Removing a provider
+prunes its credential from the active Proxy configuration; Electron also
+removes its encrypted vault entry. Connection testing never submits chat
+content and is not triggered by saving settings.
+
 ### Notifications (broker → caller)
 
 #### `app:ready`

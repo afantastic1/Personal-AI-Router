@@ -32,6 +32,7 @@ import { serviceLogLevel } from './service-log-level'
 import { engineManagerName, engineTypeFromManagerName } from '@/shared/utils/engines'
 import { isFirstRun } from '@/electron/config/ui-config'
 import { parseClusterNodes, parseInvite, parseNodeIdentity } from './cluster-json'
+import { parseCloudProvidersSettings } from './cloud-providers'
 import { startNodeInfoPoller, stopNodeInfoPoller } from './node-info-poller'
 import {
     MODULAR_DEFAULT_LOG_LEVEL,
@@ -1192,6 +1193,13 @@ class ModularSupervisor {
     }
 
     private handleNotification(notification: JsonRpcNotification): void {
+        if (notification.method === 'cloudproviders:changed') {
+            emitBridgePush(
+                'cloudproviders:changed',
+                parseCloudProvidersSettings(notification.params)
+            )
+            return
+        }
         log.verbose({
             sublevel: notification.source,
             message: notification.method,

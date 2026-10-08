@@ -409,3 +409,43 @@ func TestCloudClientEndsAnIdleStream(t *testing.T) {
 		t.Fatalf("idle stream error type=%T code=%q", err, code)
 	}
 }
+
+func TestCloudProviderConnectionCheckUsesModelsEndpointWithoutInference(t *testing.T) {
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts.Add(1)
+			t.Fatalf("connection check sent an inference POST")
+		}
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("models endpoint=%q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("authorization=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	}))
+	defer server.Close()
+	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	provider := cloudProviderRuntime{ID: "test", BaseURL: server.URL, Enabled: true}
+	if err := client.TestProvider(context.Background(), provider, "test-key"); err != nil {
+		t.Fatalf("TestProvider: %v", err)
+	}
+	if got := posts.Load(); got != 0 {
+		t.Fatalf("inference POST count=%d, want 0", got)
+	}
+}
+
+func TestCloudProviderConnectionCheckDoesNotExposeProviderErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"secret provider response"}`)
+	}))
+	defer server.Close()
+	client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	err := client.TestProvider(context.Background(), cloudProviderRuntime{ID: "test", BaseURL: server.URL}, "test-key")
+	if err == nil || strings.Contains(err.Error(), "secret provider response") {
+		t.Fatalf("provider test error=%v", err)
+	}
+}

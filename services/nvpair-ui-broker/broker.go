@@ -147,6 +147,8 @@ type ProxyStatusResult struct {
 // client connection in listen mode so future per-session caches (auth
 // tokens, watched-resource cursors, etc.) don't bleed across clients.
 type Broker struct {
+	cloudCredentialMu sync.RWMutex
+	cloudCredentials  map[string]string
 	// settingsApplyMu serializes engine settings applies end to end, including
 	// the engine stop and restart. engineConfigMu guards only the journal and
 	// is released while an engine restarts, so this is what keeps two applies —
@@ -923,6 +925,19 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	}
 	if gatewayCallError != nil {
 		slog.Warn("local OpenAI gateway failed to start", "err", gatewayCallError)
+	} else {
+		cloudSettings, settingsErr := loadCloudProvidersSettings()
+		if settingsErr != nil {
+			slog.Warn("stored cloud provider settings are unavailable; gateway remains local-only")
+		} else {
+			configParams, _ := json.Marshal(gatewaySettingsRPCParams(cloudSettings))
+			_, configureRPCError, configureCallError := pp.Call(bringUp, "gateway/configure", configParams)
+			if configureCallError != nil || configureRPCError != nil {
+				slog.Warn("stored cloud provider settings were not applied; gateway remains local-only")
+			} else {
+				b.restoreCloudCredentials(pp)
+			}
+		}
 	}
 	if enabled == 0 && gatewayCallError != nil {
 		// The whole spawn failed, so the supervisor will retry it. Leave every
@@ -3161,6 +3176,9 @@ func (b *Broker) handleMessage(msg *Message) {
 	}
 
 	switch msg.Method {
+	case "cloudproviders:get", "cloudproviders:save", "cloudproviders:credential:set", "cloudproviders:test":
+		go b.handleCloudProvidersRPC(msg)
+
 	case "engine:get-settings", "engine:preview-settings", "engine:apply-settings":
 		go b.handleEngineSettings(msg)
 	case "ping":

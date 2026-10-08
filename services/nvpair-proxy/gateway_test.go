@@ -334,6 +334,30 @@ func TestGatewayRejectsOversizedRequestBody(t *testing.T) {
 	}
 }
 
+func TestExplicitGatewayModelsRespectExclusivePolicy(t *testing.T) {
+	proxy := NewProxy(nil)
+	body := []byte(`{"model":"x","messages":[]}`)
+	tests := []struct {
+		name   string
+		policy gatewayPolicy
+		model  string
+	}{
+		{name: "local only rejects explicit cloud", policy: gatewayPolicyLocalOnly, model: "cloud/provider/model"},
+		{name: "cloud only rejects explicit local", policy: gatewayPolicyCloudOnly, model: "local/ollama/model"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+				policy: test.policy, cloudEnabled: true,
+			})
+			_, dispatchErr := proxy.gatewayDispatcher.resolve(test.model, body)
+			if dispatchErr == nil || dispatchErr.status != http.StatusForbidden || dispatchErr.kind != "cloud_not_allowed" {
+				t.Fatalf("dispatch error=%+v, want cloud_not_allowed", dispatchErr)
+			}
+		})
+	}
+}
+
 func TestGatewayRoutesAuthorizedCloudModelAndMapsPublicModelID(t *testing.T) {
 	var upstreamHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

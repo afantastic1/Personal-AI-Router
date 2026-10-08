@@ -14,6 +14,7 @@ import type { ServiceError } from '@/shared/types/errors'
 import type { NodeItemMetrics } from '@/shared/types/metrics'
 import type { Workload } from '@/shared/types/workloads'
 import type { AppInitialSnapshot, ClusterInitialSnapshot } from '@/shared/types/bootstrap'
+import type { CloudProvidersSettings } from '@/shared/types/cloud-providers'
 
 // ---------------------------------------------------------------------------
 // Sub-API interfaces
@@ -104,6 +105,14 @@ export interface IMetricsApi {
     onUpdate(callback: (metrics: NodeItemMetrics) => void): () => void
 }
 
+export interface ICloudProvidersApi {
+    getSettings(): Promise<CloudProvidersSettings>
+    saveSettings(settings: CloudProvidersSettings): Promise<{ saved: boolean }>
+    setCredential(authRef: string, credential: string): Promise<{ credentialConfigured: boolean }>
+    testConnection(providerId: string): Promise<{ connected: boolean }>
+    onSettingsChanged(callback: (settings: CloudProvidersSettings) => void): () => void
+}
+
 // ---------------------------------------------------------------------------
 // Composite API
 // ---------------------------------------------------------------------------
@@ -122,6 +131,7 @@ export interface IPairApi {
     workloads: IWorkloadsApi
     errors: IErrorsApi
     metrics: IMetricsApi
+    cloudProviders: ICloudProvidersApi
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +193,15 @@ export function createPairApi(transport: ServiceTransport): IPairApi {
         },
         metrics: {
             onUpdate: cb => transport.subscribePush('metrics:update', cb)
+        },
+        cloudProviders: {
+            getSettings: () => transport.invoke('cloudproviders:get'),
+            saveSettings: settings => transport.invoke('cloudproviders:save', settings),
+            setCredential: (authRef, credential) =>
+                transport.invoke('cloudproviders:set-credential', { authRef, credential }),
+            testConnection: providerId => transport.invoke('cloudproviders:test', { providerId }),
+            onSettingsChanged: callback =>
+                transport.subscribePush('cloudproviders:changed', callback)
         }
     }
 }

@@ -100,6 +100,15 @@ returned to callers.
 
 ## Credentials, authorization, and budgets
 
+Desktop provider control uses the broker's typed `cloudproviders:get` and
+`cloudproviders:save` methods for non-secret configuration, and a separate
+one-shot `cloudproviders:credential:set` command for keys. Electron encrypts
+keys with `safeStorage`; only process memory receives decrypted material.
+`cloudproviders:test` is manual and performs only an authenticated `GET
+/v1/models`, never an inference request. Saving settings never tests or calls a
+provider. Provider removal prunes the runtime credential and its encrypted
+vault entry.
+
 PAIR's local Gateway client token and the upstream provider key are separate
 credentials. Enabling paid cloud use requires explicit local authorization and
 budget policy. mTLS pairing alone does not authorize a peer to spend cloud

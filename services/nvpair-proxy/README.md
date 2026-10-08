@@ -88,6 +88,14 @@ Before scoring, eligibility intersects model-name capability heuristics with
 known engine protocol support. MNN supports chat and streaming, but is excluded
 for tools, vision, and embeddings requirements, regardless of model ID hints.
 
+Provider configuration arrives over the broker's control plane. `gateway/configure`
+atomically replaces the non-secret registry and routing/budget settings;
+`gateway/credential/set` changes one in-memory credential by its configured
+`auth_ref`; and `gateway/provider/test` sends an explicit authenticated
+`GET /v1/models` request without running inference. The provider key is never
+returned by these methods. The broker restores saved non-secret settings and
+process-scoped credentials when it restarts this worker.
+
 ### Flags
 
 Only process-scoped settings are flags. Anything per-engine is a `facade/enable`

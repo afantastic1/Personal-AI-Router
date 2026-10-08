@@ -60,16 +60,18 @@ type gatewayRoute struct {
 }
 
 type gatewayDispatcher struct {
-	proxy             *Proxy
-	registry          *cloudRegistry
-	client            *cloudHTTPClient
-	settings          atomic.Pointer[gatewayRoutingSettings]
-	auth              *gatewayAuthenticator
-	budget            *cloudBudgetLedger
-	budgetErr         error
-	budgetOnce        sync.Once
-	credentialMu      sync.RWMutex
-	resolveCredential func(string) (string, error)
+	proxy               *Proxy
+	cloudControlMu      sync.Mutex
+	registry            *cloudRegistry
+	client              *cloudHTTPClient
+	settings            atomic.Pointer[gatewayRoutingSettings]
+	auth                *gatewayAuthenticator
+	budget              *cloudBudgetLedger
+	budgetErr           error
+	budgetOnce          sync.Once
+	credentialMu        sync.RWMutex
+	resolveCredential   func(string) (string, error)
+	providerCredentials map[string]string
 }
 
 func newGatewayDispatcher(proxy *Proxy) *gatewayDispatcher {
@@ -187,6 +189,12 @@ func (d *gatewayDispatcher) resolve(model string, body []byte) (gatewayRoute, *g
 	settings := d.settings.Load()
 	if isGatewayAutoAlias(model) {
 		return d.resolveAuto(settings, traits, body)
+	}
+	if settings.policy == gatewayPolicyLocalOnly && strings.HasPrefix(model, "cloud/") {
+		return gatewayRoute{}, cloudNotAllowedError()
+	}
+	if settings.policy == gatewayPolicyCloudOnly && !strings.HasPrefix(model, "cloud/") {
+		return gatewayRoute{}, cloudNotAllowedError()
 	}
 	if strings.HasPrefix(model, "cloud/") {
 		return d.resolveCloud(d.registry.Snapshot(), model, model, traits, settings)
@@ -678,4 +686,36 @@ func (d *gatewayDispatcher) setCredentialResolver(resolver func(string) (string,
 	d.credentialMu.Lock()
 	d.resolveCredential = resolver
 	d.credentialMu.Unlock()
+}
+
+func (d *gatewayDispatcher) setProviderCredential(providerID, credential string) {
+	d.credentialMu.Lock()
+	if d.providerCredentials == nil {
+		d.providerCredentials = make(map[string]string)
+	}
+	if credential == "" {
+		delete(d.providerCredentials, providerID)
+	} else {
+		d.providerCredentials[providerID] = credential
+	}
+	d.resolveCredential = func(authRef string) (string, error) {
+		d.credentialMu.RLock()
+		defer d.credentialMu.RUnlock()
+		credential := d.providerCredentials[authRef]
+		if credential == "" {
+			return "", errors.New("provider credential is not configured")
+		}
+		return credential, nil
+	}
+	d.credentialMu.Unlock()
+}
+
+func (d *gatewayDispatcher) pruneProviderCredentials(snapshot *cloudRegistrySnapshot) {
+	d.credentialMu.Lock()
+	defer d.credentialMu.Unlock()
+	for authRef := range d.providerCredentials {
+		if !snapshot.providerByAuthRef(authRef) {
+			delete(d.providerCredentials, authRef)
+		}
+	}
 }
