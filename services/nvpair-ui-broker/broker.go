@@ -232,6 +232,7 @@ type Broker struct {
 	serveCtx    context.Context
 	scanner     *scannerProcess
 	nodeInfo    *nodeInfoProcess
+	proxyProc   *proxyProcess
 	workloadMgr *workloadManagerProcess
 	errorsProc  *errorsProcess
 	engineMgr   *rpcWorker
@@ -479,6 +480,18 @@ func (b *Broker) setProxy(p *proxyProcess) {
 
 func (b *Broker) getProxy() *proxyProcess {
 	return b.engineProxyHandle(ollamaProxyProfile)
+}
+
+func (b *Broker) setProxyProcess(proxy *proxyProcess) {
+	b.workersMu.Lock()
+	b.proxyProc = proxy
+	b.workersMu.Unlock()
+}
+
+func (b *Broker) getProxyProcess() *proxyProcess {
+	b.workersMu.Lock()
+	defer b.workersMu.Unlock()
+	return b.proxyProc
 }
 
 func (b *Broker) setWorkloadMgr(m *workloadManagerProcess) {
@@ -883,6 +896,7 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	if err != nil {
 		return nil, err
 	}
+	b.setProxyProcess(pp)
 	// Published for every engine before any facade is enabled, so a facade's
 	// own ready notification finds the handle it belongs to.
 	for _, profile := range engineProxyProfiles {
@@ -949,6 +963,7 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 		// A first-spawn failure and an exhausted restart budget are the paths
 		// that give up for good, and the supervisor owns both.
 		pp.Stop()
+		b.setProxyProcess(nil)
 		for _, profile := range engineProxyProfiles {
 			b.setEngineProxyHandle(profile, nil)
 		}
@@ -2314,6 +2329,7 @@ func (b *Broker) shutdownInferenceStack() {
 	// each facade before releasing the shared transport pool.
 	if b.proxySup != nil {
 		b.proxySup.Stop()
+		b.setProxyProcess(nil)
 		for _, profile := range engineProxyProfiles {
 			b.setEngineProxyHandle(profile, nil)
 		}

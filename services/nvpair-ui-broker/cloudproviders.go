@@ -151,7 +151,7 @@ func (b *Broker) handleCloudProvidersRPC(msg *Message) {
 			return
 		}
 		params, _ := json.Marshal(gatewaySettingsRPCParams(settings))
-		proxy := b.getProxy()
+		proxy := b.getProxyProcess()
 		if proxy == nil {
 			_ = saveCloudProvidersSettings(previous)
 			cloudProvidersStoreMu.Unlock()
@@ -185,7 +185,7 @@ func (b *Broker) handleCloudProvidersRPC(msg *Message) {
 			b.codec.RespondError(msg.ID, -32602, "invalid provider test request")
 			return
 		}
-		proxy := b.getProxy()
+		proxy := b.getProxyProcess()
 		if proxy == nil {
 			b.codec.RespondError(msg.ID, -32000, "proxy is not available")
 			return
@@ -208,7 +208,7 @@ func (b *Broker) handleCloudProvidersRPC(msg *Message) {
 		b.codec.RespondError(msg.ID, -32602, "invalid provider credential request")
 		return
 	}
-	proxy := b.getProxy()
+	proxy := b.getProxyProcess()
 	if proxy == nil {
 		b.codec.RespondError(msg.ID, -32000, "proxy is not available")
 		return

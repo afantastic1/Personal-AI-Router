@@ -42,7 +42,38 @@ func TestCloudOnlyGatewayStartsWithoutFacadesAndRestoresAfterRestart(t *testing.
 		t.Fatalf("start Gateway without local facades: %v", err)
 	}
 	t.Cleanup(first.Stop)
+	if broker.getProxy() != nil {
+		t.Fatal("cloud-only Gateway unexpectedly published an Ollama facade handle")
+	}
+	if broker.getProxyProcess() != first {
+		t.Fatal("cloud-only Gateway process handle was not published")
+	}
 	assertCloudOnlyGatewayModelAvailable(t)
+
+	settings.Config = json.RawMessage(`{"schema_version":1,"providers":[{"id":"test-provider","protocol":"openai_chat_completions","base_url":"https://api.openai.com/v1","auth_ref":"test-vault:provider","enabled":true,"models":[{"public_id":"cloud/test/updated","upstream_id":"test-chat","capabilities":["chat","streaming"]}]}]}`)
+	settingsParams, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatalf("marshal updated Cloud settings: %v", err)
+	}
+	saveID := json.RawMessage("1")
+	broker.handleCloudProvidersRPC(&Message{Method: "cloudproviders:save", ID: &saveID, Params: settingsParams})
+	assertCloudOnlyGatewayModelAvailable(t, "cloud/test/updated")
+
+	credentialParams, err := json.Marshal(map[string]string{
+		"authRef":    "test-vault:provider",
+		"credential": "synthetic-cloud-gateway-test-secret",
+	})
+	if err != nil {
+		t.Fatalf("marshal provider credential request: %v", err)
+	}
+	credentialID := json.RawMessage("2")
+	broker.handleCloudProvidersRPC(&Message{Method: "cloudproviders:credential:set", ID: &credentialID, Params: credentialParams})
+	broker.cloudCredentialMu.RLock()
+	credential := broker.cloudCredentials["test-vault:provider"]
+	broker.cloudCredentialMu.RUnlock()
+	if credential != "synthetic-cloud-gateway-test-secret" {
+		t.Fatal("cloud-only Gateway did not accept and retain the provider credential")
+	}
 	first.Stop()
 
 	blockedPort, err := net.Listen("tcp", "127.0.0.1:14326")
@@ -64,7 +95,7 @@ func TestCloudOnlyGatewayStartsWithoutFacadesAndRestoresAfterRestart(t *testing.
 		t.Fatalf("restart Gateway without local facades: %v", err)
 	}
 	t.Cleanup(second.Stop)
-	assertCloudOnlyGatewayModelAvailable(t)
+	assertCloudOnlyGatewayModelAvailable(t, "cloud/test/updated")
 }
 
 func buildProxyBinary(t *testing.T, destination string) string {
@@ -82,7 +113,7 @@ func buildProxyBinary(t *testing.T, destination string) string {
 	return path
 }
 
-func assertCloudOnlyGatewayModelAvailable(t *testing.T) {
+func assertCloudOnlyGatewayModelAvailable(t *testing.T, expectedID ...string) {
 	t.Helper()
 	request, err := http.NewRequestWithContext(
 		context.Background(), http.MethodGet, "http://127.0.0.1:14326/v1/models", nil,
@@ -109,7 +140,11 @@ func assertCloudOnlyGatewayModelAvailable(t *testing.T) {
 		t.Fatalf("decode cloud-only model directory: %v", err)
 	}
 	for _, model := range directory.Data {
-		if model.ID == "cloud/test/chat" {
+		want := "cloud/test/chat"
+		if len(expectedID) > 0 {
+			want = expectedID[0]
+		}
+		if model.ID == want {
 			return
 		}
 	}
