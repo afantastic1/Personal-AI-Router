@@ -52,6 +52,7 @@ type pairingEnvelope struct {
 func (m *Manager) runHTTP(ctx context.Context) error {
 	pairingMux := http.NewServeMux()
 	pairingMux.HandleFunc(pairingPath, m.handlePairing)
+	pairingMux.HandleFunc(joinRequestsPath, m.handleJoinRequests)
 
 	trustedMux := http.NewServeMux()
 	trustedMux.HandleFunc(pairingPath, m.handlePairing)

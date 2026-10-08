@@ -39,6 +39,10 @@ type Manager struct {
 
 	membershipStore *MembershipStore
 	memberships     map[string]Membership
+	joinRequests    *JoinRequestStore
+	requestMu       sync.Mutex
+	requestRateMu   sync.Mutex
+	requestRate     map[string][]int64
 
 	identity *NodeIdentity
 	trust    *TrustStore
@@ -229,6 +233,7 @@ func NewManager(codec *Codec, configDir string, port int) (*Manager, error) {
 		clusterDir:      clusterDir,
 		port:            port,
 		membershipStore: OpenMembershipStore(clusterDir),
+		joinRequests:    OpenJoinRequestStore(clusterDir),
 		identity:        identity,
 		trust:           trust,
 		mesh:            mesh,
@@ -237,6 +242,7 @@ func NewManager(codec *Codec, configDir string, port int) (*Manager, error) {
 			ResolvePin: trust.DER,
 		}),
 		members:       make(map[string]*ClusterNode),
+		requestRate:   make(map[string][]int64),
 		invites:       make(map[string]*Invite),
 		tombstones:    make(map[string]Tombstone),
 		removalProofs: make(map[string]RemovalProof),
@@ -421,6 +427,10 @@ func (m *Manager) handleMessage(msg *Message) {
 	switch msg.Method {
 	case "cluster:get-node-id":
 		m.handleGetNodeID(msg)
+	case "cluster:list-memberships":
+		m.handleListMemberships(msg)
+	case "cluster:list-join-requests":
+		m.handleListJoinRequests(msg)
 	case "cluster:set-identity":
 		m.handleSetIdentity(msg)
 	case "cluster:create":
