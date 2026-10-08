@@ -194,7 +194,9 @@ func (c *cloudHTTPClient) DoChat(
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 		responseData = rewriteCloudResponseModel(responseData, responseModel)
 	}
-	response.Body = io.NopCloser(bytes.NewReader(responseData))
+	response.Body = &cloudObservedBody{
+		ReadCloser: io.NopCloser(bytes.NewReader(responseData)), usage: providerCloudUsage(responseData),
+	}
 	response.ContentLength = int64(len(responseData))
 	return response, nil
 }
@@ -329,8 +331,48 @@ type cloudSSEBody struct {
 	sawDone       bool
 	cancel        context.CancelFunc
 	release       func()
+	usage         *CloudUsage
 	closeOnce     sync.Once
 }
+
+type cloudUsageReporter interface {
+	cloudUsage() *CloudUsage
+}
+
+type cloudObservedBody struct {
+	io.ReadCloser
+	usage *CloudUsage
+}
+
+func (b *cloudObservedBody) cloudUsage() *CloudUsage { return b.usage }
+
+func providerCloudUsage(body []byte) *CloudUsage {
+	var payload struct {
+		Usage *struct {
+			PromptTokens     *int64 `json:"prompt_tokens"`
+			CompletionTokens *int64 `json:"completion_tokens"`
+			InputTokens      *int64 `json:"input_tokens"`
+			OutputTokens     *int64 `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(body, &payload) != nil || payload.Usage == nil {
+		return nil
+	}
+	input := payload.Usage.PromptTokens
+	if input == nil {
+		input = payload.Usage.InputTokens
+	}
+	output := payload.Usage.CompletionTokens
+	if output == nil {
+		output = payload.Usage.OutputTokens
+	}
+	if input == nil || output == nil || *input < 0 || *output < 0 {
+		return nil
+	}
+	return &CloudUsage{InputTokens: *input, OutputTokens: *output}
+}
+
+func (b *cloudSSEBody) cloudUsage() *CloudUsage { return b.usage }
 
 func (b *cloudSSEBody) Read(buffer []byte) (int, error) {
 	if len(buffer) == 0 {
@@ -360,6 +402,9 @@ func (b *cloudSSEBody) Read(buffer []byte) (int, error) {
 			if value == '\n' {
 				line := bytes.TrimSuffix(b.line, []byte{'\r'})
 				if len(line) == 0 {
+					if usage := providerCloudUsageFromSSE(b.event); usage != nil {
+						b.usage = usage
+					}
 					var terminal bool
 					b.output, terminal = rewriteCloudSSEEvent(b.event, b.responseModel)
 					b.sawDone = terminal
@@ -387,6 +432,33 @@ func (b *cloudSSEBody) Read(buffer []byte) (int, error) {
 			return 0, err
 		}
 	}
+}
+
+func providerCloudUsageFromSSE(event []byte) *CloudUsage {
+	for start := 0; start < len(event); {
+		lineEnd := bytes.IndexByte(event[start:], '\n')
+		end := len(event)
+		next := len(event)
+		if lineEnd >= 0 {
+			next = start + lineEnd + 1
+			end = next - 1
+		}
+		if end > start && event[end-1] == '\r' {
+			end--
+		}
+		line := event[start:end]
+		if bytes.HasPrefix(line, []byte("data:")) {
+			value := bytes.TrimSpace(line[len("data:"):])
+			if usage := providerCloudUsage(value); usage != nil {
+				return usage
+			}
+		}
+		if next <= start {
+			break
+		}
+		start = next
+	}
+	return nil
 }
 
 func (b *cloudSSEBody) readChunk() error {

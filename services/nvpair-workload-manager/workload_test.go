@@ -19,6 +19,17 @@ func TestParseLifecycleValid(t *testing.T) {
 	}
 }
 
+func TestParseLifecycleAcceptsCloudWithoutAnEngine(t *testing.T) {
+	params := json.RawMessage(`{"workloadInfo":{"id":"cloud-1","model":"cloud/deepseek/chat","kind":"cloud","providerId":"deepseek","publicModelId":"cloud/deepseek/chat","state":"queued","originatedFrom":"node-A","createdAt":1,"startedAt":null,"completedAt":null,"error":null,"requesterId":null}}`)
+	workload, err := parseLifecycle(params)
+	if err != nil {
+		t.Fatalf("parse Cloud workload: %v", err)
+	}
+	if workload.Kind != "cloud" || workload.Engine != "" || workload.ProviderID != "deepseek" {
+		t.Fatalf("parsed workload = %+v", workload)
+	}
+}
+
 func TestParseLifecycleRejectsMissingFields(t *testing.T) {
 	cases := map[string]string{
 		"no workloadInfo":      `{}`,

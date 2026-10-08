@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +45,7 @@ func TestGatewayModelDirectoryUnionsEngineInventoriesWithoutNodeDetails(t *testi
 	ollama, _ := profileFor("ollama")
 	lmstudio, _ := profileFor("lmstudio")
 	mnn, _ := profileFor("mnn")
-	proxy := NewProxy(nil)
+	proxy := NewProxy(NewCodec(rwNop{}))
 	proxy.facades = map[string]*facade{
 		"ollama":   newFacade(proxy, ollama, NewDiscovery(), 11435),
 		"lmstudio": newFacade(proxy, lmstudio, NewDiscovery(), 1234),
@@ -356,17 +357,27 @@ func TestGatewayRoutesAuthorizedCloudModelAndMapsPublicModelID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	proxy := NewProxy(nil)
+	proxy := NewProxy(NewCodec(rwNop{}))
 	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
 	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
 		t.Fatalf("load provider config: %v", err)
 	}
 	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
-	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+		cloudEnabled: true, policy: gatewayPolicyCloudOnly,
+		monthlyBudgetUSD: 5, perRequestMaxEstimatedCostUSD: 1,
+	})
+	budget, err := newCloudBudgetLedger(filepath.Join(t.TempDir(), "budget.json"))
+	if err != nil {
+		t.Fatalf("create Cloud budget ledger: %v", err)
+	}
+	proxy.gatewayDispatcher.budget = budget
 	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
 	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
 		`{"model":"cloud/deepseek/deepseek-chat","messages":[{"role":"user","content":"hello"}]}`,
 	))
+	request.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
 	response := httptest.NewRecorder()
 	proxy.serveGateway(response, request)
 	if response.Code != http.StatusOK {
@@ -407,5 +418,93 @@ func TestGatewayCloudRoutingIsDisabledByDefault(t *testing.T) {
 	}
 	if got := upstreamHits.Load(); got != 0 {
 		t.Fatalf("disabled cloud route reached upstream %d times", got)
+	}
+}
+
+func TestGatewayRejectsCloudRequestWithoutClientToken(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	proxy := NewProxy(nil)
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	proxy.gatewayDispatcher.setCredentialResolver(func(string) (string, error) { return "provider-test-key", nil })
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "unauthorized") {
+		t.Fatalf("unauthorized cloud response=%d %s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("unauthorized cloud route reached upstream %d times", got)
+	}
+}
+
+func TestGatewayRejectsCloudRequestWithoutBudgetBeforeUpstream(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	proxy := NewProxy(NewCodec(rwNop{}))
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	request.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "cloud_not_allowed") {
+		t.Fatalf("zero budget response=%d %s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("zero-budget Cloud route reached upstream %d times", got)
+	}
+}
+
+func TestGatewayHealthDoesNotRevealCloudConfigurationOrRequireToken(t *testing.T) {
+	proxy := NewProxy(nil)
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:14326/healthz", nil))
+	if response.Code != http.StatusOK || response.Body.String() != "{\"status\":\"ok\"}" {
+		t.Fatalf("health response=%d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestGatewayModelDirectoryRequiresTokenWhenCloudIsEnabled(t *testing.T) {
+	proxy := NewProxy(nil)
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyLocalOnly})
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:14326/v1/models", nil)
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated model directory status=%d body=%s", response.Code, response.Body.String())
+	}
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:14326/v1/models", nil)
+	request.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
+	response = httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("authorized model directory status=%d body=%s", response.Code, response.Body.String())
 	}
 }

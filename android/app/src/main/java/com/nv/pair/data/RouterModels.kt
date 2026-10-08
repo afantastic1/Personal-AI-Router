@@ -23,4 +23,10 @@ data class PairWorkload(
     val startedAt: Long?,
     val completedAt: Long?,
     val error: String?,
+    val kind: String = "local",
+    val providerId: String? = null,
+    val publicModelId: String? = null,
+    val inputTokens: Long? = null,
+    val outputTokens: Long? = null,
+    val costEstimate: Double? = null,
 )

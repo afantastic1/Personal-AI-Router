@@ -70,7 +70,7 @@ private fun JSONArray.toWorkloads(): List<PairWorkload> = List(length()) { index
 private fun JSONObject.toPairWorkload(): PairWorkload = PairWorkload(
     id = requiredRouterString("id"),
     model = optString("model"),
-    engine = requiredRouterString("engine"),
+    engine = optString("engine"),
     runId = optString("runId"),
     state = requiredRouterString("state"),
     originatedFrom = optString("originatedFrom"),
@@ -79,7 +79,16 @@ private fun JSONObject.toPairWorkload(): PairWorkload = PairWorkload(
     startedAt = if (isNull("startedAt")) null else optLong("startedAt"),
     completedAt = if (isNull("completedAt")) null else optLong("completedAt"),
     error = if (isNull("error")) null else optString("error"),
+    kind = optString("kind", "local"),
+    providerId = if (isNull("providerId")) null else optString("providerId"),
+    publicModelId = if (isNull("publicModelId")) null else optString("publicModelId"),
+    inputTokens = valueOptJSONObject("usage")?.optLong("inputTokens"),
+    outputTokens = valueOptJSONObject("usage")?.optLong("outputTokens"),
+    costEstimate = if (isNull("costEstimate")) null else optDouble("costEstimate"),
 )
+
+private fun JSONObject.valueOptJSONObject(key: String): JSONObject? =
+    if (isNull(key)) null else optJSONObject(key)
 
 private fun JSONObject.requiredRouterString(key: String): String {
     val value = optString(key)

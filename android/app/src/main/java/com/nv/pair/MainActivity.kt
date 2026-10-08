@@ -328,7 +328,8 @@ private fun WorkloadCard(workload: PairWorkload) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(workload.model.ifBlank { "Inference request" }, style = MaterialTheme.typography.titleMedium)
-            Text("${workload.engine} · ${workload.state}")
+            val source = if (workload.kind == "cloud") "Cloud ${workload.providerId.orEmpty()}" else workload.engine
+            Text("$source · ${workload.state}")
             if (workload.scheduledOn.isNotBlank()) {
                 Text("Destination · ${workload.scheduledOn}", style = MaterialTheme.typography.bodySmall)
             }

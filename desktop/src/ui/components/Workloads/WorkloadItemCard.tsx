@@ -137,11 +137,16 @@ function WorkloadItemCard({ workload }: { workload: Workload }) {
             <div className="workload-badge hidden" style={{ backgroundColor: barColor }}></div>
             <Stack gap="0" className="min-w-0">
                 <Flex align="center" gap="2" className="min-w-0">
-                    <EngineIcon type={workload.engine} size={16} />
+                    {workload.engine && <EngineIcon type={workload.engine} size={16} />}
                     <Text kind="body/bold/sm" className="min-w-0 truncate">
                         {formatModelDisplayName(workload.model, workload.engine)}
                     </Text>
                 </Flex>
+                {workload.kind === 'cloud' && workload.providerId && (
+                    <Text kind="body/regular/sm" className="text-subtle-color">
+                        Cloud · {workload.providerId}
+                    </Text>
+                )}
 
                 {(requestedFromNodeText || executionNodeText) && (
                     <Stack gap="0" className="mt-1">

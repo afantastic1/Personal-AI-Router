@@ -58,7 +58,7 @@ class RouterRepository {
         }
     }
 
-    private fun PairWorkload.key(): String = "$originatedFrom\u0000$engine\u0000$runId\u0000$id"
+    private fun PairWorkload.key(): String = "$originatedFrom\u0000$kind\u0000$engine\u0000${providerId.orEmpty()}\u0000$runId\u0000$id"
 
     private fun emptyProxyStatuses(): List<EngineProxyStatus> =
         ROUTER_ENGINES.map { engine -> EngineProxyStatus(engine, false, 0) }

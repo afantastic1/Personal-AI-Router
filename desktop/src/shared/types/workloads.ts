@@ -9,7 +9,12 @@ export type WorkloadState = (typeof WorkloadStates)[number]
 export interface Workload {
     id: string
     model: string
-    engine: EngineType
+    kind?: 'local' | 'cloud'
+    engine?: EngineType
+    providerId?: string
+    publicModelId?: string
+    usage?: { inputTokens: number; outputTokens: number }
+    costEstimate?: number
     state: WorkloadState
     /**
      * Owner/origin node of the workload — the node whose proxy received the

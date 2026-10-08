@@ -34,7 +34,7 @@ Tracks inference workloads cluster-wide as they are queued, executed, and retire
 
 ## 4. Open Questions / Risks
 - **`initializing` state (closed)**: removed. It had no `workload:*` method and nothing ever produced it, so it was an unreachable member of a closed enum. The proxy has no distinct pre-dispatch moment to represent — admission and the first dispatch are effectively simultaneous — so the value was deleted rather than given a method.
-- **`EngineType` values (open — needs third-party feedback)**: the valid `engine` set is undefined. Pending the inference-engine team's list, `engine` is treated as an opaque pass-through string (must be present and non-empty, value not validated).
+- **`EngineType` values (open — needs third-party feedback)**: the valid local `engine` set is undefined. Pending the inference-engine team's list, it is treated as an opaque pass-through string (must be present and non-empty for local workloads, value not validated).
 - **Risk — late joiners / partial backfill**: newly discovered peers receive a re-assertion of this node's active and recently terminal workloads. Retired workloads and removals are not replayed, so backfill is not a complete event history.
 - **Risk — best-effort fan-out**: an unreachable peer misses events; later lifecycle re-assertions can repair tracked state when delivered, but a missed removal has no heartbeat or backfill repair path.
 - **Risk — snapshot staleness**: the target set is only as current as the last `discovery:nodes` snapshot, so a departed node lingers as a target and a new node appears slowly, bounded by the discovery daemon's own liveness handling rather than by anything this service controls.
@@ -66,7 +66,12 @@ Tracks inference workloads cluster-wide as they are queued, executed, and retire
 {
   id: string
   model: string
-  engine: EngineType
+  kind?: "local" | "cloud" // Missing means local for legacy producers.
+  engine?: EngineType // Required for local workloads; omitted for cloud.
+  providerId?: string // Cloud workload provider identity; no URL or credential reference.
+  publicModelId?: string // Stable model ID exposed to the caller.
+  usage?: { inputTokens: number; outputTokens: number } // Aggregate counts only.
+  costEstimate?: number // Absent when unknown, never guessed as zero.
   state: WorkloadState
   runId?: string          // Producing process's nonce, minted at proxy startup. Optional/additive (§7.3). Part of the dedup key: `id` is a per-process counter, both engine proxies count from 1, and it resets on restart, so runId is what keeps a reused id from colliding with an older workload. Absent from a producer that does not stamp it, in which case dedup degrades to a coarser key.
   seq?: number            // Producer's event counter for this workload, from 1, in emission order. Optional/additive (§7.3). Part of the dedup key, and the component that makes it exact: the index is a permanent set, so any key derived only from a workload's current shape collides when the workload revisits a shape it already had (a retry re-dispatching to a node it already tried). Absent from a producer that does not stamp it, in which case dedup degrades to shape-only and such a repeat is dropped as a duplicate.
@@ -85,9 +90,12 @@ Tracks inference workloads cluster-wide as they are queued, executed, and retire
 - `cancelled` is terminal and means the requester stopped waiting — a disconnected client, a dead client whose write deadline tripped, or an in-flight request cancelled by the producer's own shutdown. It rides `workload:errored` rather than having a method of its own, because state is not validated against the method that carried it and consumers read `state` from the payload. Keeping it distinct from `failed` is what lets a consumer's failed bucket mean "an outcome someone might act on" instead of also collecting every time a user pressed stop.
 
 Validation: check every inbound envelope before processing. A `Workload` must
-carry `id`, `model`, `engine`, `state`, and `originatedFrom`; `runId`, `seq`,
-and `scheduledOn` are optional/additive, and the timestamp and nullable fields
-are passed through opaquely. Note the asymmetry with the dedup key: `runId` and
+carry `id`, `model`, `state`, and `originatedFrom`; local workloads also require
+`engine`, while cloud workloads require `kind: "cloud"`, `providerId`, and
+`publicModelId` and omit `engine` and `scheduledOn`. Legacy workloads without
+`kind` are local. `runId`, `seq`, and `scheduledOn` are optional/additive, and
+the timestamp and nullable fields are passed through opaquely. Note the
+asymmetry with the dedup key: `runId` and
 `seq` are part of that key but are not required, so a producer that omits them
 is accepted and simply gets coarser deduplication rather than a rejection.
 Inter-node and local interfaces both accept the four `workload:*` methods (with
@@ -125,6 +133,7 @@ Example `workloads:upsert` (`stdout`):
     "workloadInfo": {
       "id": "wl-1a2b3c",
       "model": "llama-3-70b",
+      "kind": "local",
       "engine": "trt-llm",
       "state": "running",
       "runId": "9f3c1a7b",

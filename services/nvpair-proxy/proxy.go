@@ -181,18 +181,23 @@ func isInferenceRequest(p engineProfile, method, path string) bool {
 // Pointer fields serialize as JSON null when unset, matching the spec's
 // nullable columns.
 type Workload struct {
-	ID             string  `json:"id"`
-	Model          string  `json:"model"`
-	Engine         string  `json:"engine"`
-	RunID          string  `json:"runId"`
-	State          string  `json:"state"`
-	OriginatedFrom string  `json:"originatedFrom"`
-	ScheduledOn    string  `json:"scheduledOn,omitempty"`
-	CreatedAt      int64   `json:"createdAt"`
-	StartedAt      *int64  `json:"startedAt"`
-	CompletedAt    *int64  `json:"completedAt"`
-	Error          *string `json:"error"`
-	RequesterID    *string `json:"requesterId"`
+	ID             string      `json:"id"`
+	Model          string      `json:"model"`
+	Kind           string      `json:"kind,omitempty"`
+	Engine         string      `json:"engine,omitempty"`
+	ProviderID     string      `json:"providerId,omitempty"`
+	PublicModelID  string      `json:"publicModelId,omitempty"`
+	Usage          *CloudUsage `json:"usage,omitempty"`
+	CostEstimate   *float64    `json:"costEstimate,omitempty"`
+	RunID          string      `json:"runId"`
+	State          string      `json:"state"`
+	OriginatedFrom string      `json:"originatedFrom"`
+	ScheduledOn    string      `json:"scheduledOn,omitempty"`
+	CreatedAt      int64       `json:"createdAt"`
+	StartedAt      *int64      `json:"startedAt"`
+	CompletedAt    *int64      `json:"completedAt"`
+	Error          *string     `json:"error"`
+	RequesterID    *string     `json:"requesterId"`
 	// Seq counts this workload's events, from 1, in emission order.
 	//
 	// The workload-manager's inter-node dedup is a permanent set, so an event
@@ -207,6 +212,13 @@ type Workload struct {
 	// broadcast retry resends an identical frame, sequence included, so a true
 	// redelivery is still suppressed.
 	Seq int64 `json:"seq"`
+}
+
+// CloudUsage contains aggregate token counts only; prompt and completion text
+// never enter workload notifications.
+type CloudUsage struct {
+	InputTokens  int64 `json:"inputTokens"`
+	OutputTokens int64 `json:"outputTokens"`
 }
 
 // workloadParams is the params envelope for a workload:* notification
@@ -422,7 +434,8 @@ type Proxy struct {
 	// separates two facades' records and only the process needs the nonce. It
 	// exists because each facade's request counter restarts at 1, so without it
 	// a reused id after a restart would collide in the broker's store.
-	runID string
+	runID          string
+	cloudRequestID atomic.Uint64
 }
 
 // NewProxy builds a facade-less process host. Facades arrive via
@@ -1330,6 +1343,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		wl = &Workload{
 			ID:        reqID,
 			Model:     model,
+			Kind:      "local",
 			Engine:    f.profile.Name,
 			RunID:     p.runID,
 			State:     "queued",

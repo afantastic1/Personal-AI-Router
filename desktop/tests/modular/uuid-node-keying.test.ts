@@ -17,6 +17,35 @@ import {
 // UUID-keyed entry (no hostname ghost), and cross-domain attribution refuses a
 // telemetry response whose reported UUID does not match the polled node.
 describe('UUID node keying', () => {
+    it('parses Cloud workloads without an engine and keeps aggregate metadata', () => {
+        const workloads = parseWorkloadsInitial({
+            workloads: [
+                {
+                    id: 'cloud-1',
+                    model: 'auto',
+                    kind: 'cloud',
+                    providerId: 'deepseek',
+                    publicModelId: 'cloud/deepseek/chat',
+                    state: 'completed',
+                    originatedFrom: 'node-a',
+                    createdAt: 1,
+                    usage: { inputTokens: 10, outputTokens: 4 },
+                    costEstimate: 0.0002
+                }
+            ]
+        })
+
+        expect(workloads).toHaveLength(1)
+        expect(workloads[0]).toMatchObject({
+            kind: 'cloud',
+            providerId: 'deepseek',
+            publicModelId: 'cloud/deepseek/chat',
+            usage: { inputTokens: 10, outputTokens: 4 },
+            costEstimate: 0.0002
+        })
+        expect(workloads[0].engine).toBeUndefined()
+    })
+
     it('merges a broker node and a same-hostUuid proxy node into one UUID-keyed entry', () => {
         const state = getModularBridgeState()
         state.handleNotification({

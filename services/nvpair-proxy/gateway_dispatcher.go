@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"nvpair-shared/appdir"
 	"nvpair-shared/modelselection"
 )
 
@@ -30,9 +31,11 @@ const (
 )
 
 type gatewayRoutingSettings struct {
-	policy            gatewayPolicy
-	cloudEnabled      bool
-	allowPaidFallback bool
+	policy                        gatewayPolicy
+	cloudEnabled                  bool
+	allowPaidFallback             bool
+	monthlyBudgetUSD              float64
+	perRequestMaxEstimatedCostUSD float64
 }
 
 type gatewayRequestTraits struct {
@@ -61,6 +64,10 @@ type gatewayDispatcher struct {
 	registry          *cloudRegistry
 	client            *cloudHTTPClient
 	settings          atomic.Pointer[gatewayRoutingSettings]
+	auth              *gatewayAuthenticator
+	budget            *cloudBudgetLedger
+	budgetErr         error
+	budgetOnce        sync.Once
 	credentialMu      sync.RWMutex
 	resolveCredential func(string) (string, error)
 }
@@ -68,9 +75,24 @@ type gatewayDispatcher struct {
 func newGatewayDispatcher(proxy *Proxy) *gatewayDispatcher {
 	dispatcher := &gatewayDispatcher{
 		proxy: proxy, registry: newCloudRegistry(), client: newCloudHTTPClient(cloudHTTPOptions{}),
+		auth: newGatewayAuthenticator(),
 	}
 	dispatcher.settings.Store(&gatewayRoutingSettings{policy: gatewayPolicyLocalOnly})
 	return dispatcher
+}
+
+func (d *gatewayDispatcher) cloudBudgetLedger() (*cloudBudgetLedger, error) {
+	if d.budget != nil {
+		return d.budget, nil
+	}
+	d.budgetOnce.Do(func() {
+		budgetPath, err := appdir.Path("cloud-budget.json")
+		if err == nil {
+			d.budget, err = newCloudBudgetLedger(budgetPath)
+		}
+		d.budgetErr = err
+	})
+	return d.budget, d.budgetErr
 }
 
 func (d *gatewayDispatcher) modelDirectory() []gatewayModel {
@@ -114,6 +136,10 @@ func (d *gatewayDispatcher) modelDirectory() []gatewayModel {
 }
 
 func (d *gatewayDispatcher) dispatch(w http.ResponseWriter, r *http.Request, body []byte, model string) {
+	if d.requiresCloudAuthorization(model) && !d.auth.authorized(r.Header.Get("Authorization")) {
+		writeGatewayError(w, http.StatusUnauthorized, "a valid Gateway bearer token is required", "unauthorized")
+		return
+	}
 	route, dispatchErr := d.resolve(model, body)
 	if dispatchErr != nil {
 		writeGatewayError(w, dispatchErr.status, dispatchErr.message, dispatchErr.kind)
@@ -131,6 +157,25 @@ func (d *gatewayDispatcher) dispatch(w http.ResponseWriter, r *http.Request, bod
 		return
 	}
 	d.dispatchCloud(w, r, body, route)
+}
+
+func (d *gatewayDispatcher) requiresCloudAuthorization(model string) bool {
+	settings := d.settings.Load()
+	if !settings.cloudEnabled {
+		return false
+	}
+	if strings.HasPrefix(model, "cloud/") {
+		return true
+	}
+	return isGatewayAutoAlias(model) && settings.policy != gatewayPolicyLocalOnly
+}
+
+func (d *gatewayDispatcher) authorizeModelDirectory(authorization string) bool {
+	return !d.settings.Load().cloudEnabled || d.auth.authorized(authorization)
+}
+
+func (d *gatewayDispatcher) setClientToken(token string) {
+	d.auth.setToken(token)
 }
 
 func (d *gatewayDispatcher) resolve(model string, body []byte) (gatewayRoute, *gatewayDispatchError) {
@@ -370,44 +415,132 @@ func (d *gatewayDispatcher) dispatchCloud(w http.ResponseWriter, r *http.Request
 		writeGatewayError(w, http.StatusForbidden, "cloud access is not authorized", "cloud_not_allowed")
 		return
 	}
+	settings := d.settings.Load()
+	if !validPositiveMoney(settings.monthlyBudgetUSD) || !validPositiveMoney(settings.perRequestMaxEstimatedCostUSD) {
+		writeGatewayError(w, http.StatusForbidden, "cloud use requires an explicit monthly budget and per-request limit", "cloud_not_allowed")
+		return
+	}
+	budget, budgetErr := d.cloudBudgetLedger()
+	if budgetErr != nil || budget == nil {
+		writeGatewayError(w, http.StatusServiceUnavailable, "cloud budget ledger is unavailable", "quota_unavailable")
+		return
+	}
+	reservation, err := budget.reserve(settings.monthlyBudgetUSD, settings.perRequestMaxEstimatedCostUSD)
+	if err != nil {
+		if errors.Is(err, errCloudQuotaExceeded) {
+			writeGatewayError(w, http.StatusTooManyRequests, "cloud monthly budget is exhausted", "quota_exceeded")
+		} else if errors.Is(err, errCloudBudgetUnavailable) {
+			writeGatewayError(w, http.StatusForbidden, "cloud use requires an explicit monthly budget and per-request limit", "cloud_not_allowed")
+		} else {
+			writeGatewayError(w, http.StatusServiceUnavailable, "cloud budget ledger is unavailable", "quota_unavailable")
+		}
+		return
+	}
+	workload := newGatewayCloudWorkload(d.proxy, route)
 	response, err := d.client.DoChat(r.Context(), route.provider, route.cloudTarget, route.requestModel, credential, body)
 	if err != nil {
+		settleCloudBudget(reservation, route)
+		if r.Context().Err() != nil {
+			workload.finish("cancelled", "cloud request was cancelled", nil, nil)
+		} else {
+			workload.finish("failed", "cloud provider request failed", nil, nil)
+		}
 		status, message, kind := mapCloudGatewayError(err)
 		writeGatewayError(w, status, message, kind)
 		return
 	}
 	defer response.Body.Close()
+	workload.started()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		usage := reportedCloudUsage(response.Body)
+		settleCloudBudget(reservation, route)
+		writeProviderHTTPError(w, response.StatusCode)
+		workload.finish("failed", "cloud provider request failed", usage, nil)
+		return
+	}
 	for _, header := range []string{"Content-Type", "Cache-Control", "Retry-After"} {
 		if value := response.Header.Get(header); value != "" {
 			w.Header().Set(header, value)
 		}
 	}
 	w.WriteHeader(response.StatusCode)
+	var copyErr error
 	if route.traits.stream && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices &&
 		strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			return
+		copyErr = copyCloudStream(w, response.Body)
+	} else {
+		_, copyErr = io.Copy(w, response.Body)
+	}
+	usage := reportedCloudUsage(response.Body)
+	settleCloudBudget(reservation, route)
+	if copyErr != nil {
+		if r.Context().Err() != nil {
+			workload.finish("cancelled", "cloud request was cancelled", usage, nil)
+		} else {
+			workload.finish("failed", "cloud response ended before completion", usage, nil)
+			slogCloudStreamError(route, response.StatusCode, copyErr)
 		}
-		buffer := make([]byte, 32<<10)
-		for {
-			n, readErr := response.Body.Read(buffer)
-			if n > 0 {
-				if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-					return
-				}
-				flusher.Flush()
+		return
+	}
+	workload.complete(usage, nil)
+}
+
+func copyCloudStream(w http.ResponseWriter, body io.Reader) error {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return errors.New("streaming response writer does not support flushing")
+	}
+	buffer := make([]byte, 32<<10)
+	for {
+		n, readErr := body.Read(buffer)
+		if n > 0 {
+			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+				return writeErr
 			}
-			if readErr != nil {
-				if !errors.Is(readErr, io.EOF) && r.Context().Err() == nil {
-					slogCloudStreamError(route, response.StatusCode, readErr)
-				}
-				return
+			flusher.Flush()
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
 			}
+			return readErr
 		}
 	}
-	if _, err := io.Copy(w, response.Body); err != nil && r.Context().Err() == nil {
-		slogCloudStreamError(route, response.StatusCode, err)
+}
+
+func reportedCloudUsage(body io.ReadCloser) *CloudUsage {
+	reporter, ok := body.(cloudUsageReporter)
+	if !ok {
+		return nil
+	}
+	usage := reporter.cloudUsage()
+	if usage == nil {
+		return nil
+	}
+	copy := *usage
+	return &copy
+}
+
+func settleCloudBudget(reservation *cloudBudgetReservation, route gatewayRoute) {
+	// The first version reserves and charges its configured request ceiling.
+	// Usage is still recorded; precise settlement waits until a price table is
+	// configured instead of pretending an unknown bill is zero.
+	if err := reservation.settle(nil); err != nil {
+		slog.Warn("failed to persist cloud budget settlement", "provider_id", route.cloudTarget.ProviderID,
+			"model", route.requestModel)
+	}
+}
+
+func writeProviderHTTPError(w http.ResponseWriter, status int) {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		writeGatewayError(w, http.StatusBadGateway, "cloud provider authorization failed", "provider_auth_failed")
+	case status == http.StatusTooManyRequests:
+		writeGatewayError(w, http.StatusTooManyRequests, "cloud provider rate limit was reached", "provider_rate_limited")
+	case status >= http.StatusInternalServerError:
+		writeGatewayError(w, http.StatusBadGateway, "cloud provider request failed", "provider_error")
+	default:
+		writeGatewayError(w, http.StatusBadRequest, "cloud provider rejected the request", "provider_error")
 	}
 }
 

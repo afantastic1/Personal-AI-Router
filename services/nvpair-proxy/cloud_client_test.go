@@ -370,6 +370,16 @@ func TestCloudClientPreservesSSEAndRejectsTruncatedOrOversizedEvents(t *testing.
 	}
 }
 
+func TestProviderCloudUsageRequiresBothTokenCounts(t *testing.T) {
+	if usage := providerCloudUsage([]byte(`{"usage":{"prompt_tokens":8}}`)); usage != nil {
+		t.Fatalf("partial usage = %+v, want unknown", usage)
+	}
+	usage := providerCloudUsage([]byte(`{"usage":{"prompt_tokens":8,"completion_tokens":0}}`))
+	if usage == nil || usage.InputTokens != 8 || usage.OutputTokens != 0 {
+		t.Fatalf("complete usage = %+v, want input=8 output=0", usage)
+	}
+}
+
 func TestCloudClientEndsAnIdleStream(t *testing.T) {
 	started := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

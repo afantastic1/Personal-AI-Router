@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"regexp"
@@ -199,7 +200,17 @@ func (p *Proxy) enableGateway(port int) (int, error) {
 }
 
 func (p *Proxy) serveGateway(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+		return
+	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+		if !p.gatewayDispatcher.authorizeModelDirectory(r.Header.Get("Authorization")) {
+			writeGatewayError(w, http.StatusUnauthorized, "a valid Gateway bearer token is required", "unauthorized")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": p.gatewayModels()})
@@ -249,7 +260,7 @@ func rewriteGatewayModel(body []byte, model string) ([]byte, error) {
 func writeGatewayError(w http.ResponseWriter, status int, message, kind string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": message, "type": kind}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": message, "type": kind, "code": kind}})
 }
 
 func (p *Proxy) stopGateway() {

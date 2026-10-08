@@ -90,11 +90,13 @@ bounded non-streaming response/event sizes. SSE is relayed event by event.
 Client disconnect cancels the upstream request and releases resources. An
 upstream stream ending without its terminal event is reported as truncated; the
 Gateway does not manufacture a successful completion or an extra `[DONE]`.
+Successful response bodies and SSE events expose the requested public model ID,
+while upstream requests receive only the configured upstream model ID.
 
 Cloud POSTs are not automatically retried, including after 429, 5xx, timeout,
-or uncertain response delivery. The caller receives the upstream status or a
-sanitized typed network error. Errors must not expose secrets, request bodies,
-or sensitive URL components.
+or uncertain response delivery. Provider errors are translated to static typed
+messages so response bodies, secrets, and sensitive URL components are not
+returned to callers.
 
 ## Credentials, authorization, and budgets
 
@@ -104,6 +106,20 @@ budget policy. mTLS pairing alone does not authorize a peer to spend cloud
 budget. Cloud routing defaults off. Requests rejected for disabled cloud,
 missing authorization, insufficient budget, or unsupported capability make no
 upstream request.
+
+The initial local Gateway token is read from `PAIR_GATEWAY_CLIENT_TOKEN` and
+must contain at least 32 characters. Once Cloud is enabled, `/v1/models` and
+Cloud-capable chat routes require that token; `/healthz` reveals only liveness.
+Cloud authorization also requires positive monthly and per-request USD limits.
+Before dispatch, PAIR durably reserves the configured per-request ceiling in
+the local budget ledger. Until a model price table is configured, the ceiling
+is charged conservatively because provider usage alone does not establish a
+cost; unknown cost is never recorded as zero.
+
+Cloud workload notifications use `kind: "cloud"`, `providerId`, and
+`publicModelId`, and omit `engine` and `scheduledOn`. Aggregate token usage may
+be included when returned by the provider. Prompt and response content,
+credential references, and keys are never workload fields.
 
 Cross-node cloud execution is out of scope for the first Gateway integration.
 It requires a separate terminal-executor authorization protocol; paired-node
@@ -118,9 +134,10 @@ trust does not transfer provider credentials or paid-use permission.
 | Public model ID not registered | 404 | `model_not_found` |
 | Requested capability unsupported | 422 | `unsupported_capability` |
 | Budget or concurrency limit reached | 429 | `quota_exceeded` / `rate_limited` |
+| Provider auth failure | 502 | `provider_auth_failed` |
+| Provider rate limit | 429 | `provider_rate_limited` |
 | Provider network failure or invalid response | 502 or 504 | `provider_error` / `provider_timeout` |
 
-Provider HTTP status and compatible error payload are preserved where safe.
 Network errors are typed and sanitized. Error messages and logs must not include
 API keys, authorization headers, prompts, tool arguments, or response bodies.
 

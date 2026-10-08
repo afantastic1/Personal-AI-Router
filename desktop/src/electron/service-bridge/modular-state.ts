@@ -359,18 +359,26 @@ function parseWorkload(value: JsonValue | undefined): Workload | null {
     if (!obj) return null
     const id = stringValue(obj.id)
     if (!id) return null
-    // The workload-manager stamps the engine-manager id (`lmstudio`); map it onto
-    // our closed `EngineType` union (`lm-studio`) before narrowing so LM Studio
-    // jobs are not silently dropped.
-    const engine = engineTypeFromManagerName(stringValue(obj.engine))
-    if (!engine) return null
+    const kindValue = stringValue(obj.kind)
+    if (kindValue !== '' && kindValue !== 'cloud' && kindValue !== 'local') return null
+    const kind = kindValue === 'cloud' ? 'cloud' : 'local'
+    let engine: EngineType | undefined
+    if (kind === 'cloud') {
+        if (!stringValue(obj.providerId) || !stringValue(obj.publicModelId)) return null
+    } else {
+        // The workload-manager stamps the engine-manager id (`lmstudio`); map it
+        // onto our closed EngineType union (`lm-studio`) before narrowing.
+        const parsedEngine = engineTypeFromManagerName(stringValue(obj.engine))
+        if (parsedEngine === null) return null
+        engine = parsedEngine
+    }
     const stateValue = stringValue(obj.state)
     if (!isWorkloadState(stateValue)) return null
 
     const workload: Workload = {
         id,
         model: stringValue(obj.model),
-        engine,
+        kind,
         state: stateValue,
         originatedFrom: nullableStringValue(obj.originatedFrom),
         createdAt: numberValue(obj.createdAt),
@@ -379,6 +387,21 @@ function parseWorkload(value: JsonValue | undefined): Workload | null {
         error: nullableStringValue(obj.error),
         requesterId: nullableStringValue(obj.requesterId)
     }
+    if (engine) workload.engine = engine
+    if (kind === 'cloud') {
+        workload.providerId = stringValue(obj.providerId)
+        workload.publicModelId = stringValue(obj.publicModelId)
+    }
+    const usage = objectValue(obj.usage)
+    if (usage) {
+        const inputTokens = usage.inputTokens
+        const outputTokens = usage.outputTokens
+        if (typeof inputTokens === 'number' && typeof outputTokens === 'number' && inputTokens >= 0 && outputTokens >= 0) {
+            workload.usage = { inputTokens, outputTokens }
+        }
+    }
+    const costEstimate = nullableNumberValue(obj.costEstimate)
+    if (costEstimate !== null && costEstimate >= 0) workload.costEstimate = costEstimate
     const scheduledOn = nullableStringValue(obj.scheduledOn)
     if (scheduledOn) workload.scheduledOn = scheduledOn
     return workload

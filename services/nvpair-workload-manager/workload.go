@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=...".
@@ -68,7 +69,12 @@ func isLifecycleMethod(method string) bool {
 type Workload struct {
 	ID             string        `json:"id"`
 	Model          string        `json:"model"`
-	Engine         string        `json:"engine"`
+	Kind           string        `json:"kind,omitempty"`
+	Engine         string        `json:"engine,omitempty"`
+	ProviderID     string        `json:"providerId,omitempty"`
+	PublicModelID  string        `json:"publicModelId,omitempty"`
+	Usage          *CloudUsage   `json:"usage,omitempty"`
+	CostEstimate   *float64      `json:"costEstimate,omitempty"`
 	RunID          string        `json:"runId,omitempty"`
 	State          WorkloadState `json:"state"`
 	OriginatedFrom string        `json:"originatedFrom"`
@@ -82,6 +88,12 @@ type Workload struct {
 	// producer. It exists so dedup can tell a new event from a redelivery even
 	// when the two carry the same state and placement — see keyLifecycle.
 	Seq int64 `json:"seq,omitempty"`
+}
+
+// CloudUsage carries provider token counts without retaining request content.
+type CloudUsage struct {
+	InputTokens  int64 `json:"inputTokens"`
+	OutputTokens int64 `json:"outputTokens"`
 }
 
 // lifecycleParams / removeParams are the params envelopes for the two kinds
@@ -119,8 +131,23 @@ func parseLifecycle(params json.RawMessage) (*Workload, error) {
 	if w.Model == "" {
 		return nil, fmt.Errorf("workloadInfo.model is required")
 	}
-	if w.Engine == "" {
-		return nil, fmt.Errorf("workloadInfo.engine is required")
+	if w.Kind == "cloud" {
+		if w.Engine != "" {
+			return nil, fmt.Errorf("workloadInfo.engine must be empty for cloud workloads")
+		}
+		if w.ProviderID == "" || w.PublicModelID == "" {
+			return nil, fmt.Errorf("cloud workloads require providerId and publicModelId")
+		}
+	} else if w.Kind != "" && w.Kind != "local" {
+		return nil, fmt.Errorf("workloadInfo.kind is unsupported")
+	} else if w.Engine == "" {
+		return nil, fmt.Errorf("workloadInfo.engine is required for local workloads")
+	}
+	if w.Usage != nil && (w.Usage.InputTokens < 0 || w.Usage.OutputTokens < 0) {
+		return nil, fmt.Errorf("workloadInfo.usage token counts must be non-negative")
+	}
+	if w.CostEstimate != nil && (*w.CostEstimate < 0 || math.IsNaN(*w.CostEstimate) || math.IsInf(*w.CostEstimate, 0)) {
+		return nil, fmt.Errorf("workloadInfo.costEstimate must be finite and non-negative")
 	}
 	if w.State == "" {
 		return nil, fmt.Errorf("workloadInfo.state is required")
