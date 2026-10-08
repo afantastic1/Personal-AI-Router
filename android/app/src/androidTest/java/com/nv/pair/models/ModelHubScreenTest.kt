@@ -39,6 +39,8 @@ class ModelHubScreenTest {
                     preferredBackend = MnnBackend.CPU,
                     localEngineStatus = MnnLocalEngineStatus(available = false),
                     onBackendChange = {},
+                    cloudProviderSettings = null,
+                    onCloudEnabledChange = {},
                 )
             }
         }
@@ -58,6 +60,8 @@ class ModelHubScreenTest {
                 preferredBackend = MnnBackend.CPU,
                 localEngineStatus = MnnLocalEngineStatus(available = true),
                 onBackendChange = { selectedBackend = it },
+                cloudProviderSettings = null,
+                onCloudEnabledChange = {},
             )
         }
 
@@ -79,11 +83,34 @@ class ModelHubScreenTest {
                     errorCode = MnnErrorCode.BACKEND_UNSUPPORTED,
                 ),
                 onBackendChange = {},
+                cloudProviderSettings = null,
+                onCloudEnabledChange = {},
             )
         }
 
         composeRule.onNodeWithText(
             "OpenCL is not available on this device/runtime. CPU remains available.",
         ).assertIsDisplayed()
+    }
+
+    @Test
+    fun cloudCardListsGatewayCloudModelsAndHostOnlyNotice() {
+        composeRule.setContent {
+            ModelHubScreen(
+                nodes = emptyList(),
+                gatewayModelIds = listOf("cloud/work/chat"),
+                preferredBackend = MnnBackend.CPU,
+                localEngineStatus = MnnLocalEngineStatus(available = false),
+                onBackendChange = {},
+                cloudProviderSettings = null,
+                onCloudEnabledChange = {},
+            )
+        }
+
+        composeRule.onNodeWithText("Cloud resources").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("cloud/work/chat").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText(
+            "Cloud access is currently available only on the host configured with the Provider key.",
+        ).performScrollTo().assertIsDisplayed()
     }
 }

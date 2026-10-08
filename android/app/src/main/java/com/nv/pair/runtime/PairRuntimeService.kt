@@ -107,6 +107,7 @@ class PairRuntimeService : Service() {
                 applyPreferredMnnBackend(MnnBackend.fromPreferenceValue(intent.getStringExtra(EXTRA_MNN_BACKEND)))
             }
             ACTION_DELETE_MODEL -> serviceScope.launch { deleteInstalledModel(intent) }
+            ACTION_CLOUD_ENABLED_CHANGED -> serviceScope.launch { updateCloudEnabled(intent.getBooleanExtra(EXTRA_CLOUD_ENABLED, false)) }
             ACTION_CLUSTER_CREATE, ACTION_CLUSTER_INVITE, ACTION_CLUSTER_RESPOND,
             ACTION_CLUSTER_CANCEL, ACTION_CLUSTER_LEAVE, ACTION_CLUSTER_REMOVE ->
                 serviceScope.launch { performClusterAction(intent.action.orEmpty(), intent) }
@@ -244,6 +245,7 @@ class PairRuntimeService : Service() {
                         clusterRepository.setError("Cluster manager is unavailable; cluster features are disabled.")
                     }
                     withContext(Dispatchers.IO) { RouterApi(session).initializeWorkloads(routerRepository) }
+                    _cloudProviderSettings.value = withContext(Dispatchers.IO) { RouterApi(session).cloudProviderSettings() }
                     setPhase(RUNNING, version = info.version, uptimeMillis = info.uptimeMillis)
                     val proxyMonitor = serviceScope.launch { monitorProxyStatus(session) }
                     try {
@@ -497,6 +499,19 @@ class PairRuntimeService : Service() {
         }
     }
 
+    private suspend fun updateCloudEnabled(enabled: Boolean) {
+        val session = activeSession.get() ?: return
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val api = RouterApi(session)
+                val current = api.cloudProviderSettings()
+                api.setCloudEnabled(current, enabled)
+                api.cloudProviderSettings()
+            }
+        }.onSuccess { _cloudProviderSettings.value = it }
+            .onFailure { android.util.Log.w(TAG, "cloud setting update failed") }
+    }
+
     private fun performClusterAction(action: String, intent: Intent) {
         val session = activeSession.get() ?: run {
             clusterRepository.setError("Start PAIR before managing cluster membership.")
@@ -703,6 +718,8 @@ class PairRuntimeService : Service() {
         const val ACTION_STOP = "com.nv.pair.action.STOP_RUNTIME"
         const val ACTION_MNN_BACKEND_CHANGED = "com.nv.pair.action.MNN_BACKEND_CHANGED"
         const val ACTION_DELETE_MODEL = "com.nv.pair.action.DELETE_MODEL"
+        const val ACTION_CLOUD_ENABLED_CHANGED = "com.nv.pair.action.CLOUD_ENABLED_CHANGED"
+        const val EXTRA_CLOUD_ENABLED = "com.nv.pair.extra.CLOUD_ENABLED"
         const val ACTION_CLUSTER_CREATE = "com.nv.pair.action.CLUSTER_CREATE"
         const val ACTION_CLUSTER_INVITE = "com.nv.pair.action.CLUSTER_INVITE"
         const val ACTION_CLUSTER_RESPOND = "com.nv.pair.action.CLUSTER_RESPOND"
@@ -729,6 +746,7 @@ class PairRuntimeService : Service() {
         private val pairRepository = PairRepository()
         private val clusterRepository = ClusterRepository()
         private val routerRepository = RouterRepository()
+        private val _cloudProviderSettings = MutableStateFlow<com.nv.pair.rpc.CloudProviderSettings?>(null)
 
         val runtimeState: StateFlow<PairRuntimeState> = _runtimeState.asStateFlow()
         val discoveredNodes = pairRepository.nodes
@@ -738,6 +756,7 @@ class PairRuntimeService : Service() {
         val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = _mnnLocalEngine.asStateFlow()
         private val _preferredMnnBackend = MutableStateFlow(MnnBackend.CPU)
         val workloads = routerRepository.workloads
+        val cloudProviderSettings: StateFlow<com.nv.pair.rpc.CloudProviderSettings?> = _cloudProviderSettings.asStateFlow()
         val modelDeletionResults = MutableSharedFlow<ModelDeletionResult>(extraBufferCapacity = 8)
     }
 }

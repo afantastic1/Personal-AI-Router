@@ -38,6 +38,15 @@ class PairRuntimeController(context: Context) {
     val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = PairRuntimeService.mnnLocalEngine
     val preferredMnnBackend: Flow<MnnBackend> = mnnSettings.preferredBackend
     val workloads: StateFlow<List<PairWorkload>> = PairRuntimeService.workloads
+    val cloudProviderSettings = PairRuntimeService.cloudProviderSettings
+
+    fun setCloudEnabled(enabled: Boolean) {
+        applicationContext.startService(
+            Intent(applicationContext, PairRuntimeService::class.java)
+                .setAction(PairRuntimeService.ACTION_CLOUD_ENABLED_CHANGED)
+                .putExtra(PairRuntimeService.EXTRA_CLOUD_ENABLED, enabled),
+        )
+    }
 
     suspend fun setPreferredMnnBackend(backend: MnnBackend) {
         mnnSettings.setPreferredBackend(backend)

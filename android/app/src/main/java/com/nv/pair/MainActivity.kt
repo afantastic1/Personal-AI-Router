@@ -83,6 +83,7 @@ class MainActivity : ComponentActivity() {
                 val cluster by runtimeController.cluster.collectAsState()
                 val proxies by runtimeController.proxies.collectAsState()
                 val workloads by runtimeController.workloads.collectAsState()
+                val cloudProviderSettings by runtimeController.cloudProviderSettings.collectAsState()
                 var gatewayModelIds by remember { mutableStateOf<List<String>?>(null) }
                 LaunchedEffect(state.phase) {
                     gatewayModelIds = null
@@ -108,6 +109,8 @@ class MainActivity : ComponentActivity() {
                     cluster = cluster,
                     proxies = proxies,
                     workloads = workloads,
+                    cloudProviderSettings = cloudProviderSettings,
+                    onCloudEnabledChange = runtimeController::setCloudEnabled,
                     gatewayModelIds = gatewayModelIds,
                     preferredMnnBackend = displayedMnnBackend,
                     mnnLocalEngine = mnnLocalEngine,
@@ -146,6 +149,8 @@ private fun PairHomeScreen(
     cluster: ClusterState,
     proxies: List<EngineProxyStatus>,
     workloads: List<PairWorkload>,
+    cloudProviderSettings: com.nv.pair.rpc.CloudProviderSettings?,
+    onCloudEnabledChange: (Boolean) -> Unit,
     gatewayModelIds: List<String>?,
     preferredMnnBackend: MnnBackend,
     mnnLocalEngine: MnnLocalEngineStatus,
@@ -265,6 +270,8 @@ private fun PairHomeScreen(
                 ModelHubScreen(
                     nodes = nodes,
                     gatewayModelIds = gatewayModelIds,
+                    cloudProviderSettings = cloudProviderSettings,
+                    onCloudEnabledChange = onCloudEnabledChange,
                     preferredBackend = preferredMnnBackend,
                     localEngineStatus = mnnLocalEngine,
                     onBackendChange = onPreferredMnnBackendChange,

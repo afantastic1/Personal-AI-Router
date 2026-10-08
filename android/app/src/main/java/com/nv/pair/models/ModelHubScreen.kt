@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,6 +41,7 @@ import com.nv.pair.data.PairNode
 import com.nv.pair.mnn.MnnBackend
 import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.runtime.MnnLocalEngineStatus
+import com.nv.pair.rpc.CloudProviderSettings
 
 @Composable
 fun ModelHubScreen(
@@ -48,6 +50,8 @@ fun ModelHubScreen(
     preferredBackend: MnnBackend,
     localEngineStatus: MnnLocalEngineStatus,
     onBackendChange: (MnnBackend) -> Unit,
+    cloudProviderSettings: CloudProviderSettings?,
+    onCloudEnabledChange: (Boolean) -> Unit,
 ) {
     val modelHubViewModel: ModelHubViewModel = viewModel()
     val hubState by modelHubViewModel.state.collectAsStateWithLifecycle()
@@ -231,6 +235,45 @@ fun ModelHubScreen(
                         Text("${item.modelId} · ${item.engine} · ${item.nodeId}${if (item.loaded) " · loaded" else ""}")
                     }
                 }
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Cloud resources", style = MaterialTheme.typography.titleLarge)
+                val cloudModels = gatewayModelIds.orEmpty().filter { it.startsWith("cloud/") }
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Enable Cloud on this device")
+                        Text(
+                            "This controls only this device's Gateway. It does not authorize other paired nodes.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Switch(
+                        checked = cloudProviderSettings?.cloudEnabled == true,
+                        enabled = cloudProviderSettings != null,
+                        onCheckedChange = onCloudEnabledChange,
+                    )
+                }
+                Text(
+                    "Configured budget: $${cloudProviderSettings?.monthlyBudgetUsd ?: 0.0} monthly; " +
+                        "$${cloudProviderSettings?.perRequestMaxEstimatedCostUsd ?: 0.0} per request.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (cloudModels.isEmpty()) {
+                    Text(
+                        "No Cloud models are configured on this device. Provider setup and credentials are managed on the host that owns them.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    cloudModels.forEach { Text(it) }
+                }
+                Text(
+                    "Cloud access is currently available only on the host configured with the Provider key.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
 

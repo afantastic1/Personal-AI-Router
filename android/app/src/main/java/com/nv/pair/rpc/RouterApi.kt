@@ -25,6 +25,50 @@ class RouterApi(private val session: BrokerSession) {
         val generation = repository.workloadGeneration()
         repository.setWorkloadsIfUnchanged(generation, parseWorkloads(session.request("workloads:get-initial")))
     }
+
+    fun cloudProviderSettings(): CloudProviderSettings = parseCloudProviderSettings(
+        session.request("cloudproviders:get"),
+    )
+
+    fun setCloudEnabled(settings: CloudProviderSettings, enabled: Boolean) {
+        val params = settings.toJson(enabled)
+        val result = session.request("cloudproviders:save", params)
+        if (!result.optBoolean("saved")) throw IOException("broker did not save cloud settings")
+    }
+}
+
+data class CloudProviderSettings(
+    val config: JSONObject,
+    val policy: String,
+    val allowPaidFallback: Boolean,
+    val monthlyBudgetUsd: Double,
+    val perRequestMaxEstimatedCostUsd: Double,
+    val cloudEnabled: Boolean,
+) {
+    fun toJson(enabled: Boolean): JSONObject = JSONObject()
+        .put("schema_version", 1)
+        .put("config", config)
+        .put("cloudEnabled", enabled)
+        .put("policy", policy)
+        .put("allowPaidFallback", allowPaidFallback)
+        .put("monthlyBudgetUSD", monthlyBudgetUsd)
+        .put("perRequestMaxEstimatedCostUSD", perRequestMaxEstimatedCostUsd)
+}
+fun parseCloudProviderSettings(value: JSONObject): CloudProviderSettings {
+    val config = value.optJSONObject("config") ?: throw IOException("cloud settings have no config")
+    if (value.optInt("schema_version") != 1) throw IOException("unsupported cloud settings version")
+    val policy = value.optString("policy")
+    if (policy !in setOf("local_only", "cloud_only", "prefer_local", "prefer_cloud")) {
+        throw IOException("cloud settings have an invalid policy")
+    }
+    return CloudProviderSettings(
+        config = config,
+        policy = policy,
+        allowPaidFallback = value.optBoolean("allowPaidFallback"),
+        monthlyBudgetUsd = value.optDouble("monthlyBudgetUSD"),
+        perRequestMaxEstimatedCostUsd = value.optDouble("perRequestMaxEstimatedCostUSD"),
+        cloudEnabled = value.optBoolean("cloudEnabled"),
+    )
 }
 
 fun parseProxyStatus(engine: String, value: JSONObject): EngineProxyStatus {
