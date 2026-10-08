@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,9 @@ func TestCloudProvidersSettingsRoundTripStoresOnlyPublicConfiguration(t *testing
 		Config:        json.RawMessage(`{"schema_version":1,"providers":[{"id":"p","auth_ref":"user-vault:p"}]}`),
 		CloudEnabled:  true, Policy: "cloud_only", MonthlyBudgetUSD: 10,
 		PerRequestMaxEstimatedCostUSD: 1,
+		AuthorizedNodes: []cloudNodeAuthorization{{
+			NodeUUID: "10000000-0000-0000-0000-000000000001", CertFingerprint: "sha256:" + strings.Repeat("a", 64),
+		}},
 	}
 	if err := saveCloudProvidersSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
@@ -26,7 +30,8 @@ func TestCloudProvidersSettingsRoundTripStoresOnlyPublicConfiguration(t *testing
 	if err != nil {
 		t.Fatalf("load settings: %v", err)
 	}
-	if got.CloudEnabled != settings.CloudEnabled || got.Policy != settings.Policy || string(got.Config) != string(settings.Config) {
+	if got.CloudEnabled != settings.CloudEnabled || got.Policy != settings.Policy || string(got.Config) != string(settings.Config) ||
+		!reflect.DeepEqual(got.AuthorizedNodes, settings.AuthorizedNodes) {
 		t.Fatalf("round trip=%+v, want %+v", got, settings)
 	}
 	path := filepath.Join(os.Getenv("LOCALAPPDATA"), "Nvidia Corporation", "Personal AI Router", cloudProvidersStoreName)

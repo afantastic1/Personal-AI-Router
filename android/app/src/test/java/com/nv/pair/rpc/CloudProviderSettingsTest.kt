@@ -16,11 +16,11 @@ class CloudProviderSettingsTest {
     fun togglePreservesProviderConfigAndBudgetSettings() {
         val settings = parseCloudProviderSettings(
             JSONObject(
-                """{"schema_version":1,"config":{"schema_version":1,"providers":[{"id":"work"}]},"cloudEnabled":false,"policy":"prefer_local","allowPaidFallback":true,"monthlyBudgetUSD":25,"perRequestMaxEstimatedCostUSD":0.5}""",
+                """{"schema_version":1,"config":{"schema_version":1,"providers":[{"id":"work"}]},"cloudEnabled":false,"policy":"prefer_local","allowPaidFallback":true,"monthlyBudgetUSD":25,"perRequestMaxEstimatedCostUSD":0.5,"authorizedNodes":[{"nodeUuid":"10000000-0000-0000-0000-000000000001","certFingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}""",
             ),
         )
 
-        val saved = settings.toJson(enabled = true)
+        val saved = settings.toJson(enabled = true, routingPolicy = settings.policy)
 
         assertTrue(saved.optBoolean("cloudEnabled"))
         assertEquals(settings.config.toString(), saved.getJSONObject("config").toString())
@@ -28,6 +28,10 @@ class CloudProviderSettingsTest {
         assertTrue(saved.optBoolean("allowPaidFallback"))
         assertEquals(25.0, saved.optDouble("monthlyBudgetUSD"), 0.0)
         assertEquals(0.5, saved.optDouble("perRequestMaxEstimatedCostUSD"), 0.0)
+        assertEquals(
+            "10000000-0000-0000-0000-000000000001",
+            saved.getJSONArray("authorizedNodes").getJSONObject(0).getString("nodeUuid"),
+        )
         assertFalse(saved.has("credential"))
     }
 

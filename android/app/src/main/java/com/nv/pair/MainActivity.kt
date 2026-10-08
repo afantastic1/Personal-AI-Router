@@ -84,13 +84,15 @@ class MainActivity : ComponentActivity() {
                 val proxies by runtimeController.proxies.collectAsState()
                 val workloads by runtimeController.workloads.collectAsState()
                 val cloudProviderSettings by runtimeController.cloudProviderSettings.collectAsState()
-                var gatewayModelIds by remember { mutableStateOf<List<String>?>(null) }
+                var gatewayModels by remember { mutableStateOf<List<com.nv.pair.models.GatewayModel>?>(null) }
                 LaunchedEffect(state.phase) {
-                    gatewayModelIds = null
+                    gatewayModels = null
                     if (state.phase == RuntimePhase.RUNNING) {
                         while (true) {
-                            gatewayModelIds = runCatching {
-                                withContext(Dispatchers.IO) { GatewayModelRepository().modelIds() }
+                            gatewayModels = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    GatewayModelRepository(accessToken = com.nv.pair.runtime.GatewayTokenStore(applicationContext).getOrCreate()).models()
+                                }
                             }.getOrNull()
                             delay(GATEWAY_MODEL_REFRESH_MILLIS)
                         }
@@ -111,7 +113,8 @@ class MainActivity : ComponentActivity() {
                     workloads = workloads,
                     cloudProviderSettings = cloudProviderSettings,
                     onCloudEnabledChange = runtimeController::setCloudEnabled,
-                    gatewayModelIds = gatewayModelIds,
+                    onCloudPolicyChange = runtimeController::setCloudPolicy,
+                    gatewayModels = gatewayModels,
                     preferredMnnBackend = displayedMnnBackend,
                     mnnLocalEngine = mnnLocalEngine,
                     onPreferredMnnBackendChange = { backend ->
@@ -151,7 +154,8 @@ private fun PairHomeScreen(
     workloads: List<PairWorkload>,
     cloudProviderSettings: com.nv.pair.rpc.CloudProviderSettings?,
     onCloudEnabledChange: (Boolean) -> Unit,
-    gatewayModelIds: List<String>?,
+    onCloudPolicyChange: (String) -> Unit,
+    gatewayModels: List<com.nv.pair.models.GatewayModel>?,
     preferredMnnBackend: MnnBackend,
     mnnLocalEngine: MnnLocalEngineStatus,
     onPreferredMnnBackendChange: (MnnBackend) -> Unit,
@@ -226,7 +230,7 @@ private fun PairHomeScreen(
             Text("Local router", style = MaterialTheme.typography.titleLarge)
             proxies.forEach { ProxyStatusCard(it) }
             MnnLocalEngineCard(mnnLocalEngine)
-            LocalApiCard(running = running, modelIds = gatewayModelIds)
+            LocalApiCard(running = running, modelIds = gatewayModels?.map(com.nv.pair.models.GatewayModel::id))
             Text("Recent workloads", style = MaterialTheme.typography.titleLarge)
             if (workloads.isEmpty()) {
                 Text("No requests have been routed yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -269,9 +273,10 @@ private fun PairHomeScreen(
             } else {
                 ModelHubScreen(
                     nodes = nodes,
-                    gatewayModelIds = gatewayModelIds,
+                    gatewayModels = gatewayModels,
                     cloudProviderSettings = cloudProviderSettings,
                     onCloudEnabledChange = onCloudEnabledChange,
+                    onCloudPolicyChange = onCloudPolicyChange,
                     preferredBackend = preferredMnnBackend,
                     localEngineStatus = mnnLocalEngine,
                     onBackendChange = onPreferredMnnBackendChange,
@@ -285,17 +290,18 @@ private fun PairHomeScreen(
 private fun LocalApiCard(running: Boolean, modelIds: List<String>?) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val url = "http://127.0.0.1:14326/v1"
+    val token = remember(context) { com.nv.pair.runtime.GatewayTokenStore(context).getOrCreate() }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Local API", style = MaterialTheme.typography.titleMedium)
             Text("Status: ${if (running) "Running" else "Stopped"}")
             Text("URL: $url", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("Key: pair-local", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Key: stored securely on this device", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Models: ${modelIds?.size?.toString() ?: "Unavailable"}", color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedButton(onClick = {
                 val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
                     ?: return@OutlinedButton
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PAIR Local API", "$url\npair-local"))
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PAIR Local API", "$url\n$token"))
             }) {
                 Text("Copy URL and key")
             }
@@ -335,6 +341,7 @@ private fun WorkloadCard(workload: PairWorkload) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(workload.model.ifBlank { "Inference request" }, style = MaterialTheme.typography.titleMedium)
+            workload.requesterId?.let { Text("Caller node $it", style = MaterialTheme.typography.bodySmall) }
             val source = if (workload.kind == "cloud") "Cloud ${workload.providerId.orEmpty()}" else workload.engine
             Text("$source · ${workload.state}")
             if (workload.scheduledOn.isNotBlank()) {

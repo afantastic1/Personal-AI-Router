@@ -48,6 +48,14 @@ class PairRuntimeController(context: Context) {
         )
     }
 
+    fun setCloudPolicy(policy: String) {
+        applicationContext.startService(
+            Intent(applicationContext, PairRuntimeService::class.java)
+                .setAction(PairRuntimeService.ACTION_CLOUD_POLICY_CHANGED)
+                .putExtra(PairRuntimeService.EXTRA_CLOUD_POLICY, policy),
+        )
+    }
+
     suspend fun setPreferredMnnBackend(backend: MnnBackend) {
         mnnSettings.setPreferredBackend(backend)
         if (PairRuntimeService.runtimeState.value.desiredRunning) {

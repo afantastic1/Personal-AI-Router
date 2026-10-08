@@ -29,4 +29,5 @@ data class PairWorkload(
     val inputTokens: Long? = null,
     val outputTokens: Long? = null,
     val costEstimate: Double? = null,
+    val requesterId: String? = null,
 )

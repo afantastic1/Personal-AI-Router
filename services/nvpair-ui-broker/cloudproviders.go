@@ -21,21 +21,27 @@ import (
 
 const cloudProvidersStoreName = "cloud-providers.json"
 
+type cloudNodeAuthorization struct {
+	NodeUUID        string `json:"nodeUuid"`
+	CertFingerprint string `json:"certFingerprint"`
+}
+
 type cloudProvidersSettings struct {
-	SchemaVersion                 int             `json:"schema_version"`
-	Config                        json.RawMessage `json:"config"`
-	CloudEnabled                  bool            `json:"cloudEnabled"`
-	Policy                        string          `json:"policy"`
-	AllowPaidFallback             bool            `json:"allowPaidFallback"`
-	MonthlyBudgetUSD              float64         `json:"monthlyBudgetUSD"`
-	PerRequestMaxEstimatedCostUSD float64         `json:"perRequestMaxEstimatedCostUSD"`
+	SchemaVersion                 int                      `json:"schema_version"`
+	Config                        json.RawMessage          `json:"config"`
+	CloudEnabled                  bool                     `json:"cloudEnabled"`
+	Policy                        string                   `json:"policy"`
+	AllowPaidFallback             bool                     `json:"allowPaidFallback"`
+	MonthlyBudgetUSD              float64                  `json:"monthlyBudgetUSD"`
+	PerRequestMaxEstimatedCostUSD float64                  `json:"perRequestMaxEstimatedCostUSD"`
+	AuthorizedNodes               []cloudNodeAuthorization `json:"authorizedNodes"`
 }
 
 var cloudProvidersStoreMu sync.Mutex
 
 func defaultCloudProvidersSettings() cloudProvidersSettings {
 	return cloudProvidersSettings{
-		SchemaVersion: 1, Config: json.RawMessage(`{"schema_version":1,"providers":[]}`),
+		SchemaVersion: 1, Config: json.RawMessage(`{"schema_version":1,"providers":[]}`), AuthorizedNodes: []cloudNodeAuthorization{},
 		Policy: "local_only",
 	}
 }
@@ -55,6 +61,9 @@ func loadCloudProvidersSettings() (cloudProvidersSettings, error) {
 	settings, err := parseCloudProvidersSettings(data)
 	if err != nil || settings.SchemaVersion != 1 || len(settings.Config) == 0 {
 		return cloudProvidersSettings{}, fmt.Errorf("cloud provider settings are invalid")
+	}
+	if settings.AuthorizedNodes == nil {
+		settings.AuthorizedNodes = []cloudNodeAuthorization{}
 	}
 	return settings, nil
 }
@@ -275,5 +284,6 @@ func gatewaySettingsRPCParams(settings cloudProvidersSettings) map[string]any {
 		"policy": settings.Policy, "allowPaidFallback": settings.AllowPaidFallback,
 		"monthlyBudgetUSD":              settings.MonthlyBudgetUSD,
 		"perRequestMaxEstimatedCostUSD": settings.PerRequestMaxEstimatedCostUSD,
+		"authorizedNodes":               settings.AuthorizedNodes,
 	}
 }

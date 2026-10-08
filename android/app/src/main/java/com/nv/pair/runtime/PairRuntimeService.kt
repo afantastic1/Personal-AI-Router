@@ -108,6 +108,7 @@ class PairRuntimeService : Service() {
             }
             ACTION_DELETE_MODEL -> serviceScope.launch { deleteInstalledModel(intent) }
             ACTION_CLOUD_ENABLED_CHANGED -> serviceScope.launch { updateCloudEnabled(intent.getBooleanExtra(EXTRA_CLOUD_ENABLED, false)) }
+            ACTION_CLOUD_POLICY_CHANGED -> serviceScope.launch { updateCloudPolicy(intent.getStringExtra(EXTRA_CLOUD_POLICY).orEmpty()) }
             ACTION_CLUSTER_CREATE, ACTION_CLUSTER_INVITE, ACTION_CLUSTER_RESPOND,
             ACTION_CLUSTER_CANCEL, ACTION_CLUSTER_LEAVE, ACTION_CLUSTER_REMOVE ->
                 serviceScope.launch { performClusterAction(intent.action.orEmpty(), intent) }
@@ -175,7 +176,9 @@ class PairRuntimeService : Service() {
                     onLog = { line -> android.util.Log.i(TAG, line) },
                     onCrash = { code -> crash.complete(code) },
                     onWaitingReady = { setPhaseIf(STARTING, WAITING_READY) },
-                    additionalEnvironment = mdnsEnvironment(),
+                    additionalEnvironment = mdnsEnvironment() + mapOf(
+                        "PAIR_GATEWAY_CLIENT_TOKEN" to GatewayTokenStore(applicationContext).getOrCreate(),
+                    ),
                     proxyEngines = BrokerSession.proxyEnginesForLocalMnn(mnnAvailable),
                     onNotification = { notification ->
                         if (notification.method.startsWith("cluster:invite-")) {
@@ -505,11 +508,25 @@ class PairRuntimeService : Service() {
             withContext(Dispatchers.IO) {
                 val api = RouterApi(session)
                 val current = api.cloudProviderSettings()
-                api.setCloudEnabled(current, enabled)
+                api.updateCloudSettings(current, enabled, current.policy)
                 api.cloudProviderSettings()
             }
         }.onSuccess { _cloudProviderSettings.value = it }
             .onFailure { android.util.Log.w(TAG, "cloud setting update failed") }
+    }
+
+    private suspend fun updateCloudPolicy(policy: String) {
+        if (policy !in setOf("local_only", "cloud_only", "prefer_local", "prefer_cloud")) return
+        val session = activeSession.get() ?: return
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val api = RouterApi(session)
+                val current = api.cloudProviderSettings()
+                api.updateCloudSettings(current, current.cloudEnabled, policy)
+                api.cloudProviderSettings()
+            }
+        }.onSuccess { _cloudProviderSettings.value = it }
+            .onFailure { android.util.Log.w(TAG, "cloud routing policy update failed") }
     }
 
     private fun performClusterAction(action: String, intent: Intent) {
@@ -720,6 +737,8 @@ class PairRuntimeService : Service() {
         const val ACTION_DELETE_MODEL = "com.nv.pair.action.DELETE_MODEL"
         const val ACTION_CLOUD_ENABLED_CHANGED = "com.nv.pair.action.CLOUD_ENABLED_CHANGED"
         const val EXTRA_CLOUD_ENABLED = "com.nv.pair.extra.CLOUD_ENABLED"
+        const val ACTION_CLOUD_POLICY_CHANGED = "com.nv.pair.action.CLOUD_POLICY_CHANGED"
+        const val EXTRA_CLOUD_POLICY = "com.nv.pair.extra.CLOUD_POLICY"
         const val ACTION_CLUSTER_CREATE = "com.nv.pair.action.CLUSTER_CREATE"
         const val ACTION_CLUSTER_INVITE = "com.nv.pair.action.CLUSTER_INVITE"
         const val ACTION_CLUSTER_RESPOND = "com.nv.pair.action.CLUSTER_RESPOND"

@@ -62,6 +62,8 @@ export interface ClusterNode {
     port: number
     clusterId: string
     state: MembershipState
+    /** SHA-256 fingerprint of the current pinned certificate; changes on re-pair. */
+    certFingerprint?: string
     /** Epoch ms when membership was confirmed; null while pending. */
     joinedAt: number | null
     /** Epoch ms of last successful contact; null if never. */

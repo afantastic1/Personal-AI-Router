@@ -17,11 +17,8 @@ import (
 const engineIdentityProbeHeader = "X-NVPAIR-Engine-Identity-Probe"
 
 // localBackend is the explicit loopback engine the cluster mTLS ingress
-// forwards to. It is supplied by the broker over node/set-local-backend and is
-// deliberately NOT sourced from the discovery overlay: a request that arrived
-// over the LAN mTLS ingress can only ever be dumped on this node's own local
-// engine, never re-routed to a peer, so the ingress path is strictly terminal
-// and cannot recurse or amplify.
+// forwards to for engine-compatible requests. It is supplied by the broker
+// over node/set-local-backend and is deliberately NOT sourced from discovery.
 type localBackend struct {
 	Engine  string `json:"engine"`
 	Host    string `json:"host"`
@@ -94,13 +91,11 @@ func (f *facade) handlePlain(w http.ResponseWriter, r *http.Request) {
 	f.handleHTTP(w, r)
 }
 
-// handleClusterIngress is the LAN mTLS personality: it authenticates the caller
-// against this node's cluster pins and, once the peer is a trusted cluster
-// member, forwards the request straight to the local loopback engine — exactly
-// like the local plaintext path, with no route filtering. The mTLS pin is the
-// sole authorization boundary (a trusted peer is treated like a local client),
-// so the two personalities stay behaviorally identical toward the engine. It
-// never calls resolveCandidates, so a peer request cannot be re-routed onward.
+// handleClusterIngress authenticates the caller against this node's live cluster
+// pins. Engine-compatible requests reach only the local loopback engine. The
+// separate PAIR Cloud terminal paths expose public model summaries and accept
+// explicit Cloud models only after matching both the caller UUID and its exact
+// currently pinned certificate fingerprint against the paid-use allowlist.
 func (f *facade) handleClusterIngress(w http.ResponseWriter, r *http.Request) {
 	// Re-derive membership and pins per request so a cluster left, or a peer
 	// paired or removed, after startup is reflected immediately without a proxy
@@ -111,6 +106,19 @@ func (f *facade) handleClusterIngress(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeIngressError(w, http.StatusForbidden, "cluster-auth",
 			"client certificate is not a pinned member of this node's cluster")
+		return
+	}
+	if r.URL.Path == "/v1/pair/cloud/models" && r.Method == http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(f.host.gatewayDispatcher.peerCloudModelDirectory())
+		return
+	}
+	if r.URL.Path == "/v1/pair/cloud/chat/completions" && r.Method == http.MethodPost {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			writeIngressError(w, http.StatusForbidden, "cluster-auth", "client certificate is required")
+			return
+		}
+		f.host.gatewayDispatcher.serveAuthorizedCloudPeer(w, r, peer, r.TLS.PeerCertificates[0].Raw)
 		return
 	}
 	target, ok := f.localBackendTarget()

@@ -125,14 +125,23 @@ the local budget ledger. Until a model price table is configured, the ceiling
 is charged conservatively because provider usage alone does not establish a
 cost; unknown cost is never recorded as zero.
 
+Cross-node execution uses a terminal mTLS protocol. The host advertises only
+public Cloud model IDs and capabilities; it never sends Provider URLs, auth
+references, or keys to a caller. A paired caller must also be explicitly
+authorized by UUID and its exact pinned certificate fingerprint. The caller
+sends an explicit `cloud/...` model to the execution host; `auto` and local
+models are not accepted on that path. The host owns the Provider call, budget
+ledger, and workload, and records the caller UUID as `requesterId`. Pin removal
+or re-pairing invalidates the grant, and transport failures do not trigger a
+paid-request retry.
+
 Cloud workload notifications use `kind: "cloud"`, `providerId`, and
 `publicModelId`, and omit `engine` and `scheduledOn`. Aggregate token usage may
 be included when returned by the provider. Prompt and response content,
 credential references, and keys are never workload fields.
 
-Cross-node cloud execution is out of scope for the first Gateway integration.
-It requires a separate terminal-executor authorization protocol; paired-node
-trust does not transfer provider credentials or paid-use permission.
+Cluster membership alone never transfers paid-use permission. Only the
+separate certificate-bound grant enables terminal Cloud execution.
 
 ## Error mapping
 

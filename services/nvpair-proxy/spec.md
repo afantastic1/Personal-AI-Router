@@ -125,6 +125,16 @@ only in process memory and are pruned when a provider is removed. The explicit
 without sending chat content or starting inference. The provider key is never
 returned in RPC responses, model listings, logs, or Workload events.
 
+Paired nodes use terminal `GET /v1/pair/cloud/models` and
+`POST /v1/pair/cloud/chat/completions` endpoints over the existing mTLS ingress.
+The public directory contains only enabled model IDs and capabilities. A chat
+request must name a configured `cloud/...` model and pass the separate allowlist
+bound to both caller UUID and the exact pinned certificate fingerprint; local
+models and automatic aliases are rejected. The execution host performs budget
+reservation and Provider I/O, and records the mTLS caller UUID as workload
+`requesterId`. The caller key and Provider URL never cross the link. Requests
+have no retry path, and pin removal or re-pairing invalidates the saved grant.
+
 Eligibility intersects model-name capability heuristics with known engine
 protocol support before scoring. MNN supports chat and streaming; it cannot
 satisfy tools, vision, or embeddings requirements even when its model ID

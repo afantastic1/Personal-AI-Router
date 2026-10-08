@@ -18,13 +18,16 @@ type gatewayCloudWorkload struct {
 	terminalMu sync.Once
 }
 
-func newGatewayCloudWorkload(proxy *Proxy, route gatewayRoute) *gatewayCloudWorkload {
+func newGatewayCloudWorkload(proxy *Proxy, route gatewayRoute, callerNode string) *gatewayCloudWorkload {
 	now := time.Now().UnixMilli()
 	workload := Workload{
 		ID:    "cloud-" + fmt.Sprint(proxy.cloudRequestID.Add(1)),
 		Model: route.requestModel, Kind: "cloud", ProviderID: route.provider.ID,
 		PublicModelID: route.cloudTarget.PublicID, RunID: proxy.runID,
 		State: "queued", CreatedAt: now,
+	}
+	if callerNode != "" {
+		workload.RequesterID = &callerNode
 	}
 	lifecycle := &gatewayCloudWorkload{proxy: proxy, workload: workload, sequence: 1}
 	lifecycle.emit(workloadSubmittedMethod)

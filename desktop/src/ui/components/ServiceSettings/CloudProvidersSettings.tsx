@@ -15,6 +15,7 @@ import {
     type DropdownEntry
 } from '@nvidia/foundations-react-core'
 import type { CloudProviderConfig, CloudProvidersSettings } from '@/shared/types/cloud-providers'
+import type { ClusterNode } from '@/shared/types/cluster'
 import getErrorString from '@/shared/utils/get-error-string'
 import { InlineErrorBanner } from '@/ui/components/InlineErrorBanner'
 
@@ -25,7 +26,8 @@ const EMPTY_SETTINGS: CloudProvidersSettings = {
     policy: 'local_only',
     allowPaidFallback: false,
     monthlyBudgetUSD: 0,
-    perRequestMaxEstimatedCostUSD: 0
+    perRequestMaxEstimatedCostUSD: 0,
+    authorizedNodes: []
 }
 
 const POLICY_LABELS: Record<CloudProvidersSettings['policy'], string> = {
@@ -56,6 +58,8 @@ export default function CloudProvidersSettingsCard() {
     const [testing, setTesting] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [status, setStatus] = useState<string | null>(null)
+    const [members, setMembers] = useState<ClusterNode[]>([])
+    const [selfNodeUuid, setSelfNodeUuid] = useState<string | null>(null)
 
     const applySettings = useCallback(
         (next: CloudProvidersSettings, preferredProviderId?: string) => {
@@ -102,7 +106,26 @@ export default function CloudProvidersSettingsCard() {
     useEffect(() => {
         void reload()
         if (!window.pairApi) return
-        return window.pairApi.cloudProviders.onSettingsChanged(applySettings)
+        let mounted = true
+        const reloadMembers = async () => {
+            try {
+                const snapshot = await window.pairApi.cluster.getInitial()
+                if (mounted) {
+                    setMembers(snapshot.members)
+                    setSelfNodeUuid(snapshot.identity.nodeUuid)
+                }
+            } catch (loadError) {
+                if (mounted) setError(getErrorString(loadError))
+            }
+        }
+        void reloadMembers()
+        const unsubscribeSettings = window.pairApi.cloudProviders.onSettingsChanged(applySettings)
+        const unsubscribeMembers = window.pairApi.nodes.onMembersChanged(nodes => setMembers(nodes))
+        return () => {
+            mounted = false
+            unsubscribeSettings()
+            unsubscribeMembers()
+        }
     }, [applySettings, reload])
 
     const policyItems: DropdownEntry[] = useMemo(
@@ -305,6 +328,50 @@ export default function CloudProvidersSettingsCard() {
         }
     }, [applySettings, editingProviderRefId, settings])
 
+    const setNodeAuthorization = useCallback(
+        async (node: ClusterNode, authorized: boolean) => {
+            if (!window.pairApi) return
+            if (authorized && !node.certFingerprint) return
+            if (
+                authorized &&
+                !window.confirm(
+                    `Allow ${node.name} to use this host's configured paid Cloud providers?`
+                )
+            )
+                return
+            setBusy(true)
+            setError(null)
+            const authorizedNodes = settings.authorizedNodes.filter(
+                entry => entry.nodeUuid !== node.nodeUuid
+            )
+            if (authorized && node.certFingerprint) {
+                authorizedNodes.push({
+                    nodeUuid: node.nodeUuid,
+                    certFingerprint: node.certFingerprint
+                })
+            }
+            const next = { ...settings, authorizedNodes }
+            try {
+                await window.pairApi.cloudProviders.saveSettings(next)
+                applySettings(next)
+                setStatus(
+                    authorized
+                        ? `${node.name} can use paid Cloud providers.`
+                        : `${node.name}'s Cloud access was revoked.`
+                )
+            } catch (saveError) {
+                setError(getErrorString(saveError))
+            } finally {
+                setBusy(false)
+            }
+        },
+        [applySettings, settings]
+    )
+
+    const pairedMembers = members.filter(
+        member => member.state === 'member' && member.nodeUuid !== selfNodeUuid
+    )
+
     return (
         <Card density="compact" className="settings-card pair-paper p-4">
             <Stack gap="4">
@@ -332,6 +399,37 @@ export default function CloudProvidersSettingsCard() {
                         aria-label="Enable cloud routing"
                     />
                 </Flex>
+
+                <Stack gap="2">
+                    <Text kind="body/semibold/sm">Paired node Cloud access</Text>
+                    <Text kind="body/regular/sm" className="text-subtle-color">
+                        Pairing does not grant access to this host&apos;s paid Cloud account.
+                        Authorize each node separately.
+                    </Text>
+                    {pairedMembers.map(member => (
+                        <Flex key={member.nodeUuid} align="center" justify="between" gap="3">
+                            <Text kind="body/regular/sm">{member.name}</Text>
+                            <Switch
+                                size="small"
+                                checked={settings.authorizedNodes.some(
+                                    entry =>
+                                        entry.nodeUuid === member.nodeUuid &&
+                                        entry.certFingerprint === member.certFingerprint
+                                )}
+                                disabled={busy || !member.certFingerprint}
+                                onCheckedChange={authorized =>
+                                    void setNodeAuthorization(member, authorized)
+                                }
+                                aria-label={`Allow ${member.name} to use paid Cloud providers`}
+                            />
+                        </Flex>
+                    ))}
+                    {pairedMembers.length === 0 && (
+                        <Text kind="body/regular/sm" className="text-subtle-color">
+                            No paired nodes are available.
+                        </Text>
+                    )}
+                </Stack>
 
                 <Flex align="center" justify="between" gap="4" wrap="wrap">
                     <Text kind="body/regular/sm">Provider enabled</Text>

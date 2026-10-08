@@ -63,6 +63,10 @@ function WorkloadItemCard({ workload }: { workload: Workload }) {
         if (!workload.originatedFrom) return ''
         return state.nodes.get(workload.originatedFrom)?.name ?? ''
     })
+    const requesterNodeText = useNodesStore(state => {
+        if (!workload.requesterId) return ''
+        return state.nodes.get(workload.requesterId)?.name ?? workload.requesterId
+    })
     const barColor = useMemo(() => getWorkloadColorBar(workload.state), [workload.state])
 
     const subtext = useMemo(() => {
@@ -171,6 +175,16 @@ function WorkloadItemCard({ workload }: { workload: Workload }) {
                             </Flex>
                         )}
                     </Stack>
+                )}
+                {workload.kind === 'cloud' && requesterNodeText && (
+                    <Flex align="center" wrap="wrap" gap="1" className="mt-1">
+                        <Text kind="body/regular/sm" className="text-subtle-color">
+                            Caller node
+                        </Text>
+                        <Text kind="body/regular/sm" className="text-subtle-color">
+                            {requesterNodeText}
+                        </Text>
+                    </Flex>
                 )}
                 <Flex align="center" gap="2">
                     {subtext}

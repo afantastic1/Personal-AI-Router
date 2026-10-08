@@ -42,7 +42,7 @@ class RouterJsonTest {
     @Test
     fun parsesCloudWorkloadWithoutAnEngine() {
         val notification = parseWorkloadUpsert(
-            """{"workloadInfo":{"id":"cloud-1","model":"auto","kind":"cloud","providerId":"deepseek","publicModelId":"cloud/deepseek/chat","runId":"r-1","state":"completed","originatedFrom":"PC","createdAt":12,"startedAt":13,"completedAt":14,"error":null,"requesterId":null,"usage":{"inputTokens":10,"outputTokens":4}}}""",
+            """{"workloadInfo":{"id":"cloud-1","model":"auto","kind":"cloud","providerId":"deepseek","publicModelId":"cloud/deepseek/chat","runId":"r-1","state":"completed","originatedFrom":"PC","createdAt":12,"startedAt":13,"completedAt":14,"error":null,"requesterId":"10000000-0000-0000-0000-000000000001","usage":{"inputTokens":10,"outputTokens":4}}}""",
         )
 
         assertEquals("cloud", notification.kind)
@@ -50,6 +50,7 @@ class RouterJsonTest {
         assertEquals("deepseek", notification.providerId)
         assertEquals(10L, notification.inputTokens)
         assertEquals(4L, notification.outputTokens)
+        assertEquals("10000000-0000-0000-0000-000000000001", notification.requesterId)
     }
 
     @Test

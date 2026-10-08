@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest'
-import { parseCloudProvidersSettings } from '@/electron/service-bridge/cloud-providers'
+import {
+    cloudProvidersSettingsParams,
+    parseCloudProvidersSettings
+} from '@/electron/service-bridge/cloud-providers'
 
 describe('cloud provider settings bridge', () => {
     it('parses public settings without carrying extra credential fields', () => {
@@ -32,7 +35,8 @@ describe('cloud provider settings bridge', () => {
             policy: 'cloud_only',
             allowPaidFallback: false,
             monthlyBudgetUSD: 25,
-            perRequestMaxEstimatedCostUSD: 2
+            perRequestMaxEstimatedCostUSD: 2,
+            authorizedNodes: []
         })
 
         expect(settings.config.providers[0].auth_ref).toBe('user-vault:provider-a')
@@ -48,8 +52,31 @@ describe('cloud provider settings bridge', () => {
                 policy: 'automatic-paid-fallback',
                 allowPaidFallback: false,
                 monthlyBudgetUSD: 0,
-                perRequestMaxEstimatedCostUSD: 0
+                perRequestMaxEstimatedCostUSD: 0,
+                authorizedNodes: []
             })
         ).toThrow('invalid response')
+    })
+
+    it('preserves explicit paired-node cloud authorizations through the broker payload', () => {
+        const settings = parseCloudProvidersSettings({
+            schema_version: 1,
+            config: { schema_version: 1, providers: [] },
+            cloudEnabled: true,
+            policy: 'prefer_cloud',
+            allowPaidFallback: false,
+            monthlyBudgetUSD: 10,
+            perRequestMaxEstimatedCostUSD: 1,
+            authorizedNodes: [
+                {
+                    nodeUuid: '10000000-0000-0000-0000-000000000001',
+                    certFingerprint: `sha256:${'a'.repeat(64)}`
+                }
+            ]
+        })
+
+        expect(cloudProvidersSettingsParams(settings).authorizedNodes).toEqual(
+            settings.authorizedNodes
+        )
     })
 })

@@ -15,6 +15,9 @@ func TestGatewayConfigureAppliesValidatedSettingsAndRegistry(t *testing.T) {
 		Config: json.RawMessage(validCloudConfig), CloudEnabled: true,
 		Policy: gatewayPolicyCloudOnly, MonthlyBudgetUSD: 20,
 		PerRequestMaxEstimatedCostUSD: 2,
+		AuthorizedNodes: []gatewayCloudNodeAuthorization{{
+			NodeUUID: "10000000-0000-0000-0000-000000000001", CertFingerprint: cloudCertificateFingerprint([]byte("peer-cert")),
+		}},
 	}
 	if err := dispatcher.configure(params); err != nil {
 		t.Fatalf("configure: %v", err)
@@ -25,6 +28,45 @@ func TestGatewayConfigureAppliesValidatedSettingsAndRegistry(t *testing.T) {
 	settings := dispatcher.settings.Load()
 	if settings.policy != gatewayPolicyCloudOnly || !settings.cloudEnabled || settings.monthlyBudgetUSD != 20 {
 		t.Fatalf("settings=%+v", settings)
+	}
+	if !isAuthorizedCloudNode(settings, "10000000-0000-0000-0000-000000000001", []byte("peer-cert")) {
+		t.Fatal("configured paired node was not authorized")
+	}
+}
+
+func TestPeerCloudModelDirectoryExposesNoProviderEndpointOrCredentialReference(t *testing.T) {
+	dispatcher := newGatewayDispatcher(NewProxy(NewCodec(rwNop{})))
+	if err := dispatcher.registry.ReplaceJSON([]byte(validCloudConfig), cloudConfigOptions{}); err != nil {
+		t.Fatalf("configure registry: %v", err)
+	}
+	dispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	encoded, err := json.Marshal(dispatcher.peerCloudModelDirectory())
+	if err != nil {
+		t.Fatalf("marshal public directory: %v", err)
+	}
+	value := string(encoded)
+	for _, secret := range []string{"api.deepseek.com", "user-vault:", "auth_ref", "base_url"} {
+		if strings.Contains(value, secret) {
+			t.Errorf("public Cloud directory contains private field %q: %s", secret, value)
+		}
+	}
+	if !strings.Contains(value, "cloud/deepseek/deepseek-chat") {
+		t.Fatalf("public model ID missing from directory: %s", value)
+	}
+}
+
+func TestGatewayConfigureRejectsMalformedAuthorizedCloudNode(t *testing.T) {
+	dispatcher := newGatewayDispatcher(NewProxy(NewCodec(rwNop{})))
+	err := dispatcher.configure(gatewayConfigureParams{
+		Config: json.RawMessage(validCloudConfig), AuthorizedNodes: []gatewayCloudNodeAuthorization{{
+			NodeUUID: "not-a-node-uuid", CertFingerprint: cloudCertificateFingerprint([]byte("peer-cert")),
+		}},
+	})
+	if err == nil {
+		t.Fatal("configure accepted malformed authorized node identity")
+	}
+	if len(dispatcher.settings.Load().authorizedCloudNodes) != 0 {
+		t.Fatal("invalid authorization replaced live settings")
 	}
 }
 

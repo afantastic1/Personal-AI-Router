@@ -96,6 +96,15 @@ atomically replaces the non-secret registry and routing/budget settings;
 returned by these methods. The broker restores saved non-secret settings and
 process-scoped credentials when it restarts this worker.
 
+Paired-node Cloud execution uses a separate terminal mTLS protocol. The host
+exposes `GET /v1/pair/cloud/models` with public model IDs and capability names
+only, and `POST /v1/pair/cloud/chat/completions` for one explicitly named
+`cloud/<provider>/<model>`. The POST requires a live cluster pin and a paid-use
+grant matching both the caller UUID and exact pinned certificate fingerprint.
+It cannot route local models or `auto`, and it never receives a Provider key
+from the caller. The host owns the budget reservation, Provider call, workload,
+and `requesterId` attribution. Requests are not retried.
+
 ### Flags
 
 Only process-scoped settings are flags. Anything per-engine is a `facade/enable`
@@ -165,11 +174,14 @@ actionable warning while the primary listener stays available.
 **Cluster ingress.** The listener carries two personalities, demultiplexed by
 each connection's first byte. Plaintext HTTP is accepted only from loopback; a
 LAN caller is refused. When `--cluster-dir` shows this node is a cluster member,
-the same listener also terminates cluster mTLS: a peer whose client certificate
-matches one of this node's pins is forwarded straight to the local engine
-reported by `node/set-local-backend`, and is never re-routed onward to another
-node. Membership and pins are re-derived per request, so joining or leaving a
-cluster needs no restart.
+the same listener also terminates cluster mTLS. Engine-compatible requests from
+a pinned peer are forwarded to the local engine reported by
+`node/set-local-backend`, and are never re-routed onward. The two
+`/v1/pair/cloud/*` paths are terminal exceptions: model discovery returns only
+public model IDs/capabilities, while inference requires a separate paid-use
+grant bound to the caller UUID and exact pinned certificate fingerprint.
+Membership and pins are re-derived per request, so removal and re-pairing
+immediately invalidate an old grant without a proxy restart.
 
 **Persisted port.** A port chosen at runtime via `set-port` is saved to the
 per-user data dir (`%LocalAppData%\Nvidia Corporation\Personal AI Router` on

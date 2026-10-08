@@ -422,6 +422,152 @@ func TestGatewayRoutesAuthorizedCloudModelAndMapsPublicModelID(t *testing.T) {
 	}
 }
 
+func TestGatewaySupportsTwoTurnAgentToolCall(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := upstreamHits.Add(1)
+		var payload map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode Agent request: %v", err)
+		}
+		var model string
+		if err := json.Unmarshal(payload["model"], &model); err != nil || model != "deepseek-chat" {
+			t.Errorf("upstream model=%q err=%v", model, err)
+		}
+		var messages []map[string]json.RawMessage
+		if err := json.Unmarshal(payload["messages"], &messages); err != nil {
+			t.Errorf("decode Agent messages: %v", err)
+		}
+		if call == 1 {
+			if len(payload["tools"]) == 0 || len(payload["tool_choice"]) == 0 {
+				t.Errorf("first Agent turn lost tools/tool_choice: %s", payload)
+			}
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-tools","model":"deepseek-chat","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Seattle\"}"}}],"content":null},"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		if len(messages) != 3 || len(messages[2]["tool_call_id"]) == 0 {
+			t.Errorf("second Agent turn lost tool reply: messages=%s", payload["messages"])
+		}
+		if len(payload["response_format"]) == 0 {
+			t.Errorf("second Agent turn lost structured output request")
+		}
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-final","model":"deepseek-chat","choices":[{"message":{"role":"assistant","content":"Clear in Seattle."},"finish_reason":"stop"}]}`)
+	}))
+	defer server.Close()
+
+	proxy := NewProxy(NewCodec(rwNop{}))
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load Provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+		cloudEnabled: true, policy: gatewayPolicyCloudOnly,
+		monthlyBudgetUSD: 5, perRequestMaxEstimatedCostUSD: 1,
+	})
+	budget, err := newCloudBudgetLedger(filepath.Join(t.TempDir(), "budget.json"))
+	if err != nil {
+		t.Fatalf("create Cloud budget ledger: %v", err)
+	}
+	proxy.gatewayDispatcher.budget = budget
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+
+	first := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[{"role":"user","content":"What is the weather in Seattle?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"tool_choice":"auto"}`,
+	))
+	first.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
+	firstResponse := httptest.NewRecorder()
+	proxy.serveGateway(firstResponse, first)
+	if firstResponse.Code != http.StatusOK || !strings.Contains(firstResponse.Body.String(), `"tool_calls"`) {
+		t.Fatalf("first Agent turn status=%d body=%s", firstResponse.Code, firstResponse.Body.String())
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[{"role":"user","content":"What is the weather in Seattle?"},{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Seattle\"}"}}]},{"role":"tool","tool_call_id":"call_weather","content":"Sunny, 18 C"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"tool_choice":"auto","response_format":{"type":"json_object"}}`,
+	))
+	second.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
+	secondResponse := httptest.NewRecorder()
+	proxy.serveGateway(secondResponse, second)
+	if secondResponse.Code != http.StatusOK || !strings.Contains(secondResponse.Body.String(), "Clear in Seattle") {
+		t.Fatalf("second Agent turn status=%d body=%s", secondResponse.Code, secondResponse.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("upstream Agent turn count=%d, want 2", got)
+	}
+}
+
+func TestPairedCloudIngressRejectsUnauthorizedCallerBeforeUpstream(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHits.Add(1)
+	}))
+	defer server.Close()
+	proxy := NewProxy(NewCodec(rwNop{}))
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+		cloudEnabled: true, policy: gatewayPolicyCloudOnly,
+		monthlyBudgetUSD: 5, perRequestMaxEstimatedCostUSD: 1,
+	})
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	request := httptest.NewRequest(http.MethodPost, "https://host/v1/pair/cloud/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.gatewayDispatcher.serveAuthorizedCloudPeer(response, request, "10000000-0000-0000-0000-000000000001", []byte("caller-cert"))
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "cloud_not_allowed") {
+		t.Fatalf("unauthorized paired Cloud response=%d %s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("unauthorized paired caller reached provider %d times", got)
+	}
+}
+
+func TestPairedCloudIngressUsesHostCredentialAndBudget(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer provider-test-key" {
+			t.Errorf("provider authorization=%q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","model":"deepseek-chat","choices":[]}`)
+	}))
+	defer server.Close()
+	proxy := NewProxy(NewCodec(rwNop{}))
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+		cloudEnabled: true, policy: gatewayPolicyCloudOnly,
+		monthlyBudgetUSD: 5, perRequestMaxEstimatedCostUSD: 1,
+		authorizedCloudNodes: map[string]string{"10000000-0000-0000-0000-000000000001": cloudCertificateFingerprint([]byte("caller-cert"))},
+	})
+	budget, err := newCloudBudgetLedger(filepath.Join(t.TempDir(), "budget.json"))
+	if err != nil {
+		t.Fatalf("create Cloud budget ledger: %v", err)
+	}
+	proxy.gatewayDispatcher.budget = budget
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	request := httptest.NewRequest(http.MethodPost, "https://host/v1/pair/cloud/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	response := httptest.NewRecorder()
+	proxy.gatewayDispatcher.serveAuthorizedCloudPeer(response, request, "10000000-0000-0000-0000-000000000001", []byte("caller-cert"))
+	if response.Code != http.StatusOK {
+		t.Fatalf("authorized paired Cloud response=%d %s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("authorized paired caller reached provider %d times, want one", got)
+	}
+}
+
 func TestGatewayCloudRoutingIsDisabledByDefault(t *testing.T) {
 	var upstreamHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -273,6 +274,58 @@ func TestCloudClientBoundsConcurrentStreamsAndReleasesSlots(t *testing.T) {
 	}
 	if got := hits.Load(); got != 2 {
 		t.Fatalf("upstream hits=%d after slot release, want 2", got)
+	}
+}
+
+func TestCloudClientBoundsTenAndThirtyConcurrentAgents(t *testing.T) {
+	for _, count := range []int{10, 30} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			var active atomic.Int32
+			var maximum atomic.Int32
+			var hits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				current := active.Add(1)
+				for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
+				}
+				time.Sleep(5 * time.Millisecond)
+				active.Add(-1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[]}`)
+			}))
+			defer server.Close()
+			provider := cloudProviderRuntime{ID: "p", Protocol: "openai_chat_completions", BaseURL: server.URL, Enabled: true}
+			client := newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true, maxConcurrent: 8})
+			var workers sync.WaitGroup
+			errors := make(chan error, count)
+			for index := 0; index < count; index++ {
+				workers.Add(1)
+				go func(index int) {
+					defer workers.Done()
+					target := cloudModelTarget{PublicID: "cloud/p/model", ProviderID: "p", UpstreamID: "upstream", Enabled: true}
+					body := []byte(`{"model":"cloud/p/model","messages":[{"role":"user","content":"agent ` + strconv.Itoa(index) + `"}]}`)
+					response, err := client.DoChat(context.Background(), provider, target, target.PublicID, "secret", body)
+					if err == nil {
+						_, err = io.Copy(io.Discard, response.Body)
+						_ = response.Body.Close()
+					}
+					errors <- err
+				}(index)
+			}
+			workers.Wait()
+			close(errors)
+			for err := range errors {
+				if err != nil {
+					t.Fatalf("Agent request failed: %v", err)
+				}
+			}
+			if got := hits.Load(); got != int32(count) {
+				t.Fatalf("upstream request count=%d, want %d", got, count)
+			}
+			if got := maximum.Load(); got > 8 {
+				t.Fatalf("maximum concurrent upstream requests=%d, want <= 8", got)
+			}
+		})
 	}
 }
 

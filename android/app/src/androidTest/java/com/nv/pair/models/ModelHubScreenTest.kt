@@ -35,12 +35,18 @@ class ModelHubScreenTest {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                 ModelHubScreen(
                     nodes = emptyList(),
-                    gatewayModelIds = listOf("qwen3-1.7b", "auto", "auto-balanced", "auto-new-policy"),
+                    gatewayModels = listOf(
+                        GatewayModel("qwen3-1.7b", GatewayModelKind.LOCAL),
+                        GatewayModel("auto", GatewayModelKind.AUTOMATIC),
+                        GatewayModel("auto-balanced", GatewayModelKind.AUTOMATIC),
+                        GatewayModel("auto-new-policy", GatewayModelKind.AUTOMATIC),
+                    ),
                     preferredBackend = MnnBackend.CPU,
                     localEngineStatus = MnnLocalEngineStatus(available = false),
                     onBackendChange = {},
                     cloudProviderSettings = null,
                     onCloudEnabledChange = {},
+                    onCloudPolicyChange = {},
                 )
             }
         }
@@ -56,12 +62,16 @@ class ModelHubScreenTest {
         composeRule.setContent {
             ModelHubScreen(
                 nodes = emptyList(),
-                gatewayModelIds = listOf("auto", "auto-balanced"),
+                gatewayModels = listOf(
+                    GatewayModel("auto", GatewayModelKind.AUTOMATIC),
+                    GatewayModel("auto-balanced", GatewayModelKind.AUTOMATIC),
+                ),
                 preferredBackend = MnnBackend.CPU,
                 localEngineStatus = MnnLocalEngineStatus(available = true),
                 onBackendChange = { selectedBackend = it },
                 cloudProviderSettings = null,
                 onCloudEnabledChange = {},
+                onCloudPolicyChange = {},
             )
         }
 
@@ -75,7 +85,7 @@ class ModelHubScreenTest {
         composeRule.setContent {
             ModelHubScreen(
                 nodes = emptyList(),
-                gatewayModelIds = null,
+                gatewayModels = null,
                 preferredBackend = MnnBackend.OPENCL,
                 localEngineStatus = MnnLocalEngineStatus(
                     available = true,
@@ -85,6 +95,7 @@ class ModelHubScreenTest {
                 onBackendChange = {},
                 cloudProviderSettings = null,
                 onCloudEnabledChange = {},
+                onCloudPolicyChange = {},
             )
         }
 
@@ -98,19 +109,20 @@ class ModelHubScreenTest {
         composeRule.setContent {
             ModelHubScreen(
                 nodes = emptyList(),
-                gatewayModelIds = listOf("cloud/work/chat"),
+                gatewayModels = listOf(GatewayModel("cloud/work/chat", GatewayModelKind.CLOUD)),
                 preferredBackend = MnnBackend.CPU,
                 localEngineStatus = MnnLocalEngineStatus(available = false),
                 onBackendChange = {},
                 cloudProviderSettings = null,
                 onCloudEnabledChange = {},
+                onCloudPolicyChange = {},
             )
         }
 
         composeRule.onNodeWithText("Cloud resources").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("cloud/work/chat").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText(
-            "Cloud access is currently available only on the host configured with the Provider key.",
+            "Requests run on the host that holds the Provider key. This device never receives that key; the host must authorize this paired node.",
         ).performScrollTo().assertIsDisplayed()
     }
 }

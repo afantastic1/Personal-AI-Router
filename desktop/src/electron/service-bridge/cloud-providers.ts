@@ -85,10 +85,12 @@ export function parseCloudProvidersSettings(value: JsonValue | undefined): Cloud
     const config = objectValue(settings?.config)
     const providersValue = config?.providers
     const policy = stringValue(settings?.policy)
+    const authorizedNodesValue = settings?.authorizedNodes
     if (
         settings?.schema_version !== 1 ||
         config?.schema_version !== 1 ||
         !Array.isArray(providersValue) ||
+        (authorizedNodesValue !== undefined && !Array.isArray(authorizedNodesValue)) ||
         !isGatewayPolicy(policy)
     ) {
         throw new Error('Cloud provider settings returned an invalid response')
@@ -99,6 +101,18 @@ export function parseCloudProvidersSettings(value: JsonValue | undefined): Cloud
         if (!provider) throw new Error('Cloud provider settings returned an invalid response')
         providers.push(provider)
     }
+    const authorizedNodes: CloudProvidersSettings['authorizedNodes'] = []
+    if (Array.isArray(authorizedNodesValue)) {
+        for (const value of authorizedNodesValue) {
+            const authorization = objectValue(value)
+            const nodeUuid = stringValue(authorization?.nodeUuid)
+            const certFingerprint = stringValue(authorization?.certFingerprint)
+            if (!nodeUuid || !/^sha256:[0-9a-f]{64}$/i.test(certFingerprint)) {
+                throw new Error('Cloud provider settings returned an invalid response')
+            }
+            authorizedNodes.push({ nodeUuid, certFingerprint })
+        }
+    }
     return {
         schema_version: 1,
         config: { schema_version: 1, providers },
@@ -106,7 +120,8 @@ export function parseCloudProvidersSettings(value: JsonValue | undefined): Cloud
         policy,
         allowPaidFallback: booleanValue(settings.allowPaidFallback),
         monthlyBudgetUSD: numberValue(settings.monthlyBudgetUSD),
-        perRequestMaxEstimatedCostUSD: numberValue(settings.perRequestMaxEstimatedCostUSD)
+        perRequestMaxEstimatedCostUSD: numberValue(settings.perRequestMaxEstimatedCostUSD),
+        authorizedNodes
     }
 }
 
@@ -134,6 +149,10 @@ export function cloudProvidersSettingsParams(settings: CloudProvidersSettings): 
         policy: settings.policy,
         allowPaidFallback: settings.allowPaidFallback,
         monthlyBudgetUSD: settings.monthlyBudgetUSD,
-        perRequestMaxEstimatedCostUSD: settings.perRequestMaxEstimatedCostUSD
+        perRequestMaxEstimatedCostUSD: settings.perRequestMaxEstimatedCostUSD,
+        authorizedNodes: settings.authorizedNodes.map(({ nodeUuid, certFingerprint }) => ({
+            nodeUuid,
+            certFingerprint
+        }))
     }
 }

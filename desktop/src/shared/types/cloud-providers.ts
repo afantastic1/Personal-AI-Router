@@ -16,6 +16,11 @@ export interface CloudProviderConfig {
     models: CloudModelConfig[]
 }
 
+export interface CloudNodeAuthorization {
+    nodeUuid: string
+    certFingerprint: string
+}
+
 export interface CloudProvidersSettings {
     schema_version: 1
     config: { schema_version: 1; providers: CloudProviderConfig[] }
@@ -24,4 +29,5 @@ export interface CloudProvidersSettings {
     allowPaidFallback: boolean
     monthlyBudgetUSD: number
     perRequestMaxEstimatedCostUSD: number
+    authorizedNodes: CloudNodeAuthorization[]
 }

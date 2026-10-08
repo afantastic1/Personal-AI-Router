@@ -15,15 +15,20 @@ import org.junit.Test
 
 class GatewayModelRepositoryTest {
     @Test
-    fun modelIdsAndAutomaticAliasesComeFromGatewayModelList() {
-        val response = """{"object":"list","data":[{"id":"qwen3-1.7b"},{"id":"auto"},{"id":"auto-balanced"}]}"""
+    fun modelListDistinguishesLocalCloudAndAutomaticEntries() {
+        val response = """{"object":"list","data":[{"id":"qwen3-1.7b"},{"id":"cloud/work/chat","owned_by":"pair-remote-cloud"},{"id":"auto"},{"id":"auto-balanced"}]}"""
         val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
         val requestTarget = AtomicReference<String?>()
+        val authorization = AtomicReference<String?>()
         val worker = Thread {
             server.accept().use { socket ->
                 val reader = socket.getInputStream().bufferedReader(StandardCharsets.US_ASCII)
                 requestTarget.set(reader.readLine()?.split(' ')?.getOrNull(1))
-                while (reader.readLine()?.isNotEmpty() == true) Unit
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isEmpty()) break
+                    if (line.startsWith("Authorization:", ignoreCase = true)) authorization.set(line.substringAfter(':').trim())
+                }
                 val body = response.toByteArray(StandardCharsets.UTF_8)
                 val header = "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
                 socket.getOutputStream().apply {
@@ -35,10 +40,22 @@ class GatewayModelRepositoryTest {
         }.apply { start() }
 
         try {
-            val modelIds = GatewayModelRepository(URL("http://127.0.0.1:${server.localPort}/v1/models")).modelIds()
+            val models = GatewayModelRepository(
+                URL("http://127.0.0.1:${server.localPort}/v1/models"),
+                "android-gateway-token-12345678901234567890",
+            ).models()
 
             assertEquals("/v1/models", requestTarget.get())
-            assertEquals(listOf("qwen3-1.7b", "auto", "auto-balanced"), modelIds)
+            assertEquals("Bearer android-gateway-token-12345678901234567890", authorization.get())
+            assertEquals(
+                listOf(
+                    GatewayModel("qwen3-1.7b", GatewayModelKind.LOCAL),
+                    GatewayModel("cloud/work/chat", GatewayModelKind.REMOTE_CLOUD),
+                    GatewayModel("auto", GatewayModelKind.AUTOMATIC),
+                    GatewayModel("auto-balanced", GatewayModelKind.AUTOMATIC),
+                ),
+                models,
+            )
         } finally {
             server.close()
             worker.join(2_000)

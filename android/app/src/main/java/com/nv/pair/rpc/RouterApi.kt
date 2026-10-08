@@ -30,8 +30,8 @@ class RouterApi(private val session: BrokerSession) {
         session.request("cloudproviders:get"),
     )
 
-    fun setCloudEnabled(settings: CloudProviderSettings, enabled: Boolean) {
-        val params = settings.toJson(enabled)
+    fun updateCloudSettings(settings: CloudProviderSettings, enabled: Boolean, policy: String) {
+        val params = settings.toJson(enabled, policy)
         val result = session.request("cloudproviders:save", params)
         if (!result.optBoolean("saved")) throw IOException("broker did not save cloud settings")
     }
@@ -44,16 +44,26 @@ data class CloudProviderSettings(
     val monthlyBudgetUsd: Double,
     val perRequestMaxEstimatedCostUsd: Double,
     val cloudEnabled: Boolean,
+    val authorizedNodes: List<CloudNodeAuthorization>,
 ) {
-    fun toJson(enabled: Boolean): JSONObject = JSONObject()
+    fun toJson(enabled: Boolean, routingPolicy: String): JSONObject = JSONObject()
         .put("schema_version", 1)
         .put("config", config)
         .put("cloudEnabled", enabled)
-        .put("policy", policy)
+        .put("policy", routingPolicy)
         .put("allowPaidFallback", allowPaidFallback)
         .put("monthlyBudgetUSD", monthlyBudgetUsd)
         .put("perRequestMaxEstimatedCostUSD", perRequestMaxEstimatedCostUsd)
+        .put("authorizedNodes", JSONArray().apply {
+            authorizedNodes.forEach { authorization ->
+                put(JSONObject()
+                    .put("nodeUuid", authorization.nodeUuid)
+                    .put("certFingerprint", authorization.certFingerprint))
+            }
+        })
 }
+
+data class CloudNodeAuthorization(val nodeUuid: String, val certFingerprint: String)
 fun parseCloudProviderSettings(value: JSONObject): CloudProviderSettings {
     val config = value.optJSONObject("config") ?: throw IOException("cloud settings have no config")
     if (value.optInt("schema_version") != 1) throw IOException("unsupported cloud settings version")
@@ -68,6 +78,18 @@ fun parseCloudProviderSettings(value: JSONObject): CloudProviderSettings {
         monthlyBudgetUsd = value.optDouble("monthlyBudgetUSD"),
         perRequestMaxEstimatedCostUsd = value.optDouble("perRequestMaxEstimatedCostUSD"),
         cloudEnabled = value.optBoolean("cloudEnabled"),
+        authorizedNodes = value.optJSONArray("authorizedNodes")?.let { array ->
+            List(array.length()) { index ->
+                val authorization = array.optJSONObject(index)
+                    ?: throw IOException("cloud settings contain an invalid node authorization")
+                val nodeUuid = authorization.optString("nodeUuid")
+                val certFingerprint = authorization.optString("certFingerprint")
+                if (nodeUuid.isBlank() || certFingerprint.isBlank()) {
+                    throw IOException("cloud settings contain an invalid node authorization")
+                }
+                CloudNodeAuthorization(nodeUuid, certFingerprint)
+            }
+        }.orEmpty(),
     )
 }
 
@@ -129,6 +151,7 @@ private fun JSONObject.toPairWorkload(): PairWorkload = PairWorkload(
     inputTokens = valueOptJSONObject("usage")?.optLong("inputTokens"),
     outputTokens = valueOptJSONObject("usage")?.optLong("outputTokens"),
     costEstimate = if (isNull("costEstimate")) null else optDouble("costEstimate"),
+    requesterId = if (isNull("requesterId")) null else optString("requesterId"),
 )
 
 private fun JSONObject.valueOptJSONObject(key: String): JSONObject? =

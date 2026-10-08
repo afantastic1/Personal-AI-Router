@@ -51,16 +51,17 @@ const reasonIncorrectPIN = "incorrect-pin"
 // ClusterNode is a cluster member or pending invitee (§6). The logical id is the
 // membership key for display; nodeUuid is the cryptographic principal.
 type ClusterNode struct {
-	ID             string          `json:"id"`
-	NodeUUID       string          `json:"nodeUuid"`
-	Name           string          `json:"name"`
-	IPAddress      string          `json:"ipAddress"`
-	Port           int             `json:"port"`
-	ClusterID      string          `json:"clusterId"`
-	AdmissionEpoch uint64          `json:"admissionEpoch,omitempty"`
-	State          MembershipState `json:"state"`
-	JoinedAt       *int64          `json:"joinedAt"`
-	LastSeen       *int64          `json:"lastSeen"`
+	ID              string          `json:"id"`
+	NodeUUID        string          `json:"nodeUuid"`
+	Name            string          `json:"name"`
+	IPAddress       string          `json:"ipAddress"`
+	Port            int             `json:"port"`
+	ClusterID       string          `json:"clusterId"`
+	AdmissionEpoch  uint64          `json:"admissionEpoch,omitempty"`
+	CertFingerprint string          `json:"certFingerprint,omitempty"`
+	State           MembershipState `json:"state"`
+	JoinedAt        *int64          `json:"joinedAt"`
+	LastSeen        *int64          `json:"lastSeen"`
 }
 
 // Invite is the Broker-facing view of a pairing session (§6). Certificates are
@@ -283,7 +284,13 @@ func (m *Manager) snapshotNodes() []ClusterNode {
 	defer m.memMu.Unlock()
 	out := make([]ClusterNode, 0, len(m.members))
 	for _, n := range m.members {
-		out = append(out, *cloneClusterNode(n))
+		member := *cloneClusterNode(n)
+		if member.NodeUUID == m.identity.NodeUUID {
+			member.CertFingerprint = m.identity.CertFingerprint
+		} else if pin, ok := m.trust.Get(member.NodeUUID); ok {
+			member.CertFingerprint = pin.CertFingerprint
+		}
+		out = append(out, member)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out

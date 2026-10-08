@@ -110,6 +110,7 @@ export function emptyInvite(): Invite {
 
 function parseClusterNode(value: JsonValue | undefined): ClusterNode {
     const obj = objectValue(value)
+    const certFingerprint = stringValue(obj?.certFingerprint)
     return {
         id: stringValue(obj?.id),
         nodeUuid: stringValue(obj?.nodeUuid),
@@ -118,6 +119,7 @@ function parseClusterNode(value: JsonValue | undefined): ClusterNode {
         port: numberValue(obj?.port),
         clusterId: stringValue(obj?.clusterId),
         state: membershipState(obj?.state),
+        ...(certFingerprint ? { certFingerprint } : {}),
         joinedAt: nullableNumber(obj?.joinedAt),
         lastSeen: nullableNumber(obj?.lastSeen)
     }

@@ -32,7 +32,7 @@ func TestGatewayCloudWorkloadEmitsOneTerminalWithoutEngineAttribution(t *testing
 		requestModel: "auto", provider: cloudProviderRuntime{ID: "deepseek"},
 		cloudTarget: cloudModelTarget{PublicID: "cloud/deepseek/chat"},
 	}
-	workload := newGatewayCloudWorkload(proxy, route)
+	workload := newGatewayCloudWorkload(proxy, route, "")
 	workload.started()
 	usage := &CloudUsage{InputTokens: 11, OutputTokens: 4}
 	workload.complete(usage, nil)
@@ -66,5 +66,18 @@ func TestGatewayCloudWorkloadEmitsOneTerminalWithoutEngineAttribution(t *testing
 	want := []string{workloadSubmittedMethod, workloadStartedMethod, workloadCompletedMethod}
 	if !reflect.DeepEqual(methods, want) {
 		t.Fatalf("lifecycle methods = %v, want %v", methods, want)
+	}
+}
+
+func TestPairedCloudWorkloadRecordsCallerNode(t *testing.T) {
+	transport := &workloadRecordingTransport{}
+	proxy := NewProxy(NewCodec(transport))
+	route := gatewayRoute{
+		requestModel: "cloud/deepseek/chat", provider: cloudProviderRuntime{ID: "deepseek"},
+		cloudTarget: cloudModelTarget{PublicID: "cloud/deepseek/chat"},
+	}
+	workload := newGatewayCloudWorkload(proxy, route, "10000000-0000-0000-0000-000000000001")
+	if workload.workload.RequesterID == nil || *workload.workload.RequesterID != "10000000-0000-0000-0000-000000000001" {
+		t.Fatalf("Cloud workload requester=%v", workload.workload.RequesterID)
 	}
 }

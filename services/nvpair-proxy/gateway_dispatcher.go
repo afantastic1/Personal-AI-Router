@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"nvpair-shared/appdir"
 	"nvpair-shared/modelselection"
@@ -36,6 +38,7 @@ type gatewayRoutingSettings struct {
 	allowPaidFallback             bool
 	monthlyBudgetUSD              float64
 	perRequestMaxEstimatedCostUSD float64
+	authorizedCloudNodes          map[string]string
 }
 
 type gatewayRequestTraits struct {
@@ -51,12 +54,15 @@ type gatewayDispatchError struct {
 }
 
 type gatewayRoute struct {
-	facade        *facade
-	cloudTarget   cloudModelTarget
-	provider      cloudProviderRuntime
-	requestModel  string
-	upstreamModel string
-	traits        gatewayRequestTraits
+	facade         *facade
+	cloudTarget    cloudModelTarget
+	provider       cloudProviderRuntime
+	requestModel   string
+	upstreamModel  string
+	traits         gatewayRequestTraits
+	remoteNode     *Node
+	remoteFacade   *facade
+	remotePeerUUID string
 }
 
 type gatewayDispatcher struct {
@@ -72,6 +78,9 @@ type gatewayDispatcher struct {
 	credentialMu        sync.RWMutex
 	resolveCredential   func(string) (string, error)
 	providerCredentials map[string]string
+	remoteCloudMu       sync.Mutex
+	remoteCloudExpires  time.Time
+	remoteCloudCache    []remoteCloudModel
 }
 
 func newGatewayDispatcher(proxy *Proxy) *gatewayDispatcher {
@@ -126,6 +135,11 @@ func (d *gatewayDispatcher) modelDirectory() []gatewayModel {
 			ids[model.PublicID] = gatewayModel{ID: model.PublicID, Object: "model", OwnedBy: "pair"}
 		}
 	}
+	if settings.cloudEnabled {
+		for _, model := range d.proxy.remoteCloudModels() {
+			ids[model.ID] = gatewayModel{ID: model.ID, Object: "model", OwnedBy: "pair-remote-cloud"}
+		}
+	}
 	for _, alias := range autoAliases {
 		ids[alias] = gatewayModel{ID: alias, Object: "model", OwnedBy: "pair"}
 	}
@@ -158,7 +172,112 @@ func (d *gatewayDispatcher) dispatch(w http.ResponseWriter, r *http.Request, bod
 		route.facade.handleHTTP(w, r)
 		return
 	}
+	if route.remoteNode != nil {
+		d.dispatchRemoteCloud(w, r, body, route)
+		return
+	}
 	d.dispatchCloud(w, r, body, route)
+}
+
+func isAuthorizedCloudNode(settings *gatewayRoutingSettings, peerUUID string, certDER []byte) bool {
+	if peerUUID == "" || len(certDER) == 0 {
+		return false
+	}
+	fingerprint, ok := settings.authorizedCloudNodes[strings.ToLower(peerUUID)]
+	return ok && fingerprint == cloudCertificateFingerprint(certDER)
+}
+
+func (d *gatewayDispatcher) peerCloudModelDirectory() any {
+	settings := d.settings.Load()
+	models := make([]map[string]any, 0)
+	if settings.cloudEnabled {
+		for _, model := range d.registry.Snapshot().Models() {
+			capabilities := make([]string, 0, len(model.Capabilities))
+			for capability, enabled := range model.Capabilities {
+				if enabled {
+					capabilities = append(capabilities, capability)
+				}
+			}
+			sort.Strings(capabilities)
+			models = append(models, map[string]any{"id": model.PublicID, "capabilities": capabilities})
+		}
+	}
+	return map[string]any{"enabled": settings.cloudEnabled, "models": models}
+}
+
+func (d *gatewayDispatcher) serveAuthorizedCloudPeer(w http.ResponseWriter, r *http.Request, peerUUID string, certDER []byte) {
+	settings := d.settings.Load()
+	if !settings.cloudEnabled || !isAuthorizedCloudNode(settings, peerUUID, certDER) {
+		writeGatewayError(w, http.StatusForbidden, "this paired node is not authorized to use cloud providers", "cloud_not_allowed")
+		return
+	}
+	body, model, bodyErr := bufferBodyAndModel(w, r)
+	if bodyErr != nil {
+		writeRequestBodyError(w, bodyErr)
+		return
+	}
+	if !strings.HasPrefix(model, "cloud/") {
+		writeGatewayError(w, http.StatusForbidden, "terminal cloud requests require an explicit cloud model", "cloud_not_allowed")
+		return
+	}
+	requestContext, cancel := context.WithCancel(r.Context())
+	if d.proxy.mesh != nil {
+		done := make(chan struct{})
+		go d.monitorAuthorizedCloudPeer(requestContext, cancel, done, r, peerUUID, certDER, model)
+		defer close(done)
+	}
+	defer cancel()
+	r = r.WithContext(requestContext)
+	if requestContext.Err() != nil {
+		writeGatewayError(w, http.StatusForbidden, "paired Cloud authorization was revoked", "cloud_not_allowed")
+		return
+	}
+	traits, err := parseGatewayRequestTraits(body)
+	if err != nil {
+		writeGatewayError(w, http.StatusBadRequest, "request body must be a valid chat completion object", "invalid_request_error")
+		return
+	}
+	traits.model = model
+	route, dispatchErr := d.resolveCloud(d.registry.Snapshot(), model, model, traits, settings)
+	if dispatchErr != nil {
+		writeGatewayError(w, dispatchErr.status, dispatchErr.message, dispatchErr.kind)
+		return
+	}
+	d.dispatchCloudForCaller(w, r, body, route, peerUUID)
+}
+
+func (d *gatewayDispatcher) monitorAuthorizedCloudPeer(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	done <-chan struct{},
+	request *http.Request,
+	peerUUID string,
+	certDER []byte,
+	model string,
+) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			if d.proxy.mesh == nil {
+				cancel()
+				return
+			}
+			d.proxy.mesh.Refresh()
+			settings := d.settings.Load()
+			_, stillPinned := d.proxy.mesh.VerifyClientPin(request)
+			_, modelStillEnabled := d.registry.Snapshot().Resolve(model)
+			if !stillPinned || !settings.cloudEnabled || !isAuthorizedCloudNode(settings, peerUUID, certDER) || !modelStillEnabled {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 func (d *gatewayDispatcher) requiresCloudAuthorization(model string) bool {
@@ -329,6 +448,15 @@ func (d *gatewayDispatcher) resolveCloud(
 	}
 	target, ok := snapshot.Resolve(publicID)
 	if !ok {
+		if remote, available := d.proxy.remoteCloudTarget(publicID); available {
+			if missing := missingGatewayCapabilities(remote.Capabilities, traits.capabilities); len(missing) > 0 {
+				return gatewayRoute{}, unsupportedGatewayCapabilities(missing)
+			}
+			return gatewayRoute{
+				requestModel: requestModel, traits: traits,
+				remoteNode: &remote.Node, remoteFacade: remote.Facade, remotePeerUUID: remote.Node.ClusterUUID,
+			}, nil
+		}
 		return gatewayRoute{}, &gatewayDispatchError{status: http.StatusNotFound, message: "model is unavailable", kind: "model_not_found"}
 	}
 	if missing := missingGatewayCapabilities(target.Capabilities, traits.capabilities); len(missing) > 0 {
@@ -411,6 +539,10 @@ func parseLocalPublicModelID(publicID string) (string, string, bool) {
 }
 
 func (d *gatewayDispatcher) dispatchCloud(w http.ResponseWriter, r *http.Request, body []byte, route gatewayRoute) {
+	d.dispatchCloudForCaller(w, r, body, route, "")
+}
+
+func (d *gatewayDispatcher) dispatchCloudForCaller(w http.ResponseWriter, r *http.Request, body []byte, route gatewayRoute, callerNode string) {
 	d.credentialMu.RLock()
 	resolver := d.resolveCredential
 	d.credentialMu.RUnlock()
@@ -444,7 +576,7 @@ func (d *gatewayDispatcher) dispatchCloud(w http.ResponseWriter, r *http.Request
 		}
 		return
 	}
-	workload := newGatewayCloudWorkload(d.proxy, route)
+	workload := newGatewayCloudWorkload(d.proxy, route, callerNode)
 	response, err := d.client.DoChat(r.Context(), route.provider, route.cloudTarget, route.requestModel, credential, body)
 	if err != nil {
 		settleCloudBudget(reservation, route)

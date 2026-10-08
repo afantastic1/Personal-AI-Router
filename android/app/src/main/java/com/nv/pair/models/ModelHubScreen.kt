@@ -46,12 +46,13 @@ import com.nv.pair.rpc.CloudProviderSettings
 @Composable
 fun ModelHubScreen(
     nodes: List<PairNode>,
-    gatewayModelIds: List<String>?,
+    gatewayModels: List<GatewayModel>?,
     preferredBackend: MnnBackend,
     localEngineStatus: MnnLocalEngineStatus,
     onBackendChange: (MnnBackend) -> Unit,
     cloudProviderSettings: CloudProviderSettings?,
     onCloudEnabledChange: (Boolean) -> Unit,
+    onCloudPolicyChange: (String) -> Unit,
 ) {
     val modelHubViewModel: ModelHubViewModel = viewModel()
     val hubState by modelHubViewModel.state.collectAsStateWithLifecycle()
@@ -241,7 +242,9 @@ fun ModelHubScreen(
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Cloud resources", style = MaterialTheme.typography.titleLarge)
-                val cloudModels = gatewayModelIds.orEmpty().filter { it.startsWith("cloud/") }
+                val cloudModels = gatewayModels.orEmpty()
+                    .filter { it.kind == GatewayModelKind.CLOUD || it.kind == GatewayModelKind.REMOTE_CLOUD }
+                    .map(GatewayModel::id)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("Enable Cloud on this device")
@@ -257,11 +260,35 @@ fun ModelHubScreen(
                         onCheckedChange = onCloudEnabledChange,
                     )
                 }
+                val hasRemoteCloudModels = gatewayModels.orEmpty().any { it.kind == GatewayModelKind.REMOTE_CLOUD }
                 Text(
-                    "Configured budget: $${cloudProviderSettings?.monthlyBudgetUsd ?: 0.0} monthly; " +
-                        "$${cloudProviderSettings?.perRequestMaxEstimatedCostUsd ?: 0.0} per request.",
+                    if (hasRemoteCloudModels) {
+                        "The execution host applies its configured monthly and per-request budget limits."
+                    } else {
+                        "Configured budget: $${cloudProviderSettings?.monthlyBudgetUsd ?: 0.0} monthly; " +
+                            "$${cloudProviderSettings?.perRequestMaxEstimatedCostUsd ?: 0.0} per request."
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Text("Routing policy", style = MaterialTheme.typography.titleMedium)
+                Column(Modifier.selectableGroup()) {
+                    listOf("local_only", "cloud_only", "prefer_local", "prefer_cloud").forEach { policy ->
+                        Row(
+                            Modifier.fillMaxWidth().selectable(
+                                selected = cloudProviderSettings?.policy == policy,
+                                onClick = { onCloudPolicyChange(policy) },
+                                role = Role.RadioButton,
+                            ),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = cloudProviderSettings?.policy == policy,
+                                onClick = null,
+                            )
+                            Text(policy.replace('_', ' '))
+                        }
+                    }
+                }
                 if (cloudModels.isEmpty()) {
                     Text(
                         "No Cloud models are configured on this device. Provider setup and credentials are managed on the host that owns them.",
@@ -271,7 +298,7 @@ fun ModelHubScreen(
                     cloudModels.forEach { Text(it) }
                 }
                 Text(
-                    "Cloud access is currently available only on the host configured with the Provider key.",
+                    "Requests run on the host that holds the Provider key. This device never receives that key; the host must authorize this paired node.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -280,8 +307,10 @@ fun ModelHubScreen(
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Automatic model policies", style = MaterialTheme.typography.titleLarge)
-                val aliases = gatewayModelIds?.filter { it == "auto" || it.startsWith("auto-") }.orEmpty()
-                if (gatewayModelIds == null) {
+                val aliases = gatewayModels.orEmpty()
+                    .filter { it.kind == GatewayModelKind.AUTOMATIC }
+                    .map(GatewayModel::id)
+                if (gatewayModels == null) {
                     Text("Automatic model aliases are unavailable while the gateway model list cannot be read.")
                 } else if (aliases.isEmpty()) {
                     Text("The gateway is not advertising automatic model aliases.")
