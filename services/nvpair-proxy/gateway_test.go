@@ -686,6 +686,38 @@ func TestGatewayRejectsCloudRequestWithoutClientToken(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsWrongClientTokenBeforeUpstream(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	proxy := NewProxy(nil)
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{cloudEnabled: true, policy: gatewayPolicyCloudOnly})
+	proxy.gatewayDispatcher.setCredentialResolver(func(string) (string, error) { return "provider-test-key", nil })
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+		`{"model":"cloud/deepseek/deepseek-chat","messages":[]}`,
+	))
+	request.Header.Set("Authorization", "Bearer wrong-client-token-12345678901234567890")
+	response := httptest.NewRecorder()
+	proxy.serveGateway(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong-token cloud response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("wrong-token cloud request reached upstream %d times", got)
+	}
+}
+
 func TestGatewayRejectsCloudRequestWithoutBudgetBeforeUpstream(t *testing.T) {
 	var upstreamHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
