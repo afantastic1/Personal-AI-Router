@@ -179,8 +179,8 @@ class MnnHttpServerTest {
                 "/v1/chat/completions",
                 """{"model":"qwen3-0.6b","messages":[{"role":"user","content":"x"}],"tools":[]}""",
             )
-            assertTrue(unsupported.startsWith("HTTP/1.1 400"))
-            assertTrue(unsupported.contains("\"code\":\"unsupported_parameter\""))
+            assertTrue("unsupported tools response: $unsupported", unsupported.startsWith("HTTP/1.1 400"))
+            assertTrue("unsupported tools response: $unsupported", unsupported.contains("\"code\":\"unsupported_parameter\""))
         } finally {
             server.close()
         }
@@ -358,8 +358,8 @@ class MnnHttpServerTest {
             assertTrue(service.firstToken.await(2, TimeUnit.SECONDS))
 
             val second = http(server.localPort, "POST", "/v1/chat/completions", chatBody(stream = false))
-            assertTrue(second.startsWith("HTTP/1.1 409"))
-            assertTrue(second.contains("\"code\":\"engine_busy\""))
+            assertTrue("second generation response: $second", second.startsWith("HTTP/1.1 409"))
+            assertTrue("second generation response: $second", second.contains("\"code\":\"engine_busy\""))
 
             firstClient.close()
             service.releaseGeneration.countDown()

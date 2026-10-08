@@ -497,6 +497,72 @@ func TestGatewaySupportsTwoTurnAgentToolCall(t *testing.T) {
 	}
 }
 
+func TestGatewayPaidCloudFallbackRequiresOptInAndBudget(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-fallback","model":"deepseek-chat","choices":[]}`)
+	}))
+	defer server.Close()
+	proxy := NewProxy(NewCodec(rwNop{}))
+	config := strings.Replace(validCloudConfig, "https://api.deepseek.com", server.URL, 1)
+	if err := proxy.gatewayDispatcher.registry.ReplaceJSON([]byte(config), cloudConfigOptions{allowLoopbackURL: true}); err != nil {
+		t.Fatalf("load Provider config: %v", err)
+	}
+	proxy.gatewayDispatcher.client = newCloudHTTPClient(cloudHTTPOptions{allowLoopback: true})
+	proxy.gatewayDispatcher.setClientToken("local-client-token-12345678901234567890")
+	proxy.gatewayDispatcher.resolveCredential = func(string) (string, error) { return "provider-test-key", nil }
+	budget, err := newCloudBudgetLedger(filepath.Join(t.TempDir(), "budget.json"))
+	if err != nil {
+		t.Fatalf("create Cloud budget ledger: %v", err)
+	}
+	proxy.gatewayDispatcher.budget = budget
+	proxy.gatewayDispatcher.settings.Store(&gatewayRoutingSettings{
+		cloudEnabled: true, policy: gatewayPolicyPreferLocal,
+		monthlyBudgetUSD: 2, perRequestMaxEstimatedCostUSD: 0.5,
+	})
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:14326/v1/chat/completions", strings.NewReader(
+			`{"model":"auto","messages":[{"role":"user","content":"hello"}]}`,
+		))
+		req.Header.Set("Authorization", "Bearer local-client-token-12345678901234567890")
+		response := httptest.NewRecorder()
+		proxy.serveGateway(response, req)
+		return response
+	}
+
+	withoutOptIn := request()
+	if withoutOptIn.Code != http.StatusNotFound {
+		t.Fatalf("prefer-local without paid fallback response=%d %s, want local unavailable", withoutOptIn.Code, withoutOptIn.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("paid fallback without opt-in reached Provider %d times", got)
+	}
+
+	settings := *proxy.gatewayDispatcher.settings.Load()
+	settings.allowPaidFallback = true
+	proxy.gatewayDispatcher.settings.Store(&settings)
+	withOptIn := request()
+	if withOptIn.Code != http.StatusOK {
+		t.Fatalf("budgeted paid fallback response=%d %s", withOptIn.Code, withOptIn.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("budgeted paid fallback Provider requests=%d, want 1", got)
+	}
+
+	settings.monthlyBudgetUSD = 0.25
+	settings.perRequestMaxEstimatedCostUSD = 0.25
+	proxy.gatewayDispatcher.settings.Store(&settings)
+	exhausted := request()
+	if exhausted.Code != http.StatusTooManyRequests || !strings.Contains(exhausted.Body.String(), "quota_exceeded") {
+		t.Fatalf("exhausted paid fallback response=%d %s", exhausted.Code, exhausted.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("over-budget fallback reached Provider %d times, want one total call", got)
+	}
+}
+
 func TestPairedCloudIngressRejectsUnauthorizedCallerBeforeUpstream(t *testing.T) {
 	var upstreamHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

@@ -249,15 +249,15 @@ class MnnHttpServer(
     private fun logRequestRejection(failure: OpenAiRequestException) {
         val field = failure.fieldPath?.let { " field=$it" }.orEmpty()
         val kind = failure.fieldKind?.let { " kind=$it" }.orEmpty()
-        Log.w(LOG_TAG, "Rejected OpenAI request code=${failure.code}$field$kind")
+        runCatching { Log.w(LOG_TAG, "Rejected OpenAI request code=${failure.code}$field$kind") }
     }
 
     private fun logInferenceFailure(code: MnnErrorCode) {
-        Log.w(LOG_TAG, "MNN inference failed code=${code.name}")
+        runCatching { Log.w(LOG_TAG, "MNN inference failed code=${code.name}") }
     }
 
     private fun logInternalFailure(failure: Exception) {
-        Log.e(LOG_TAG, "MNN HTTP request failed type=${failure.javaClass.simpleName}")
+        runCatching { Log.e(LOG_TAG, "MNN HTTP request failed type=${failure.javaClass.simpleName}") }
     }
 
     private fun closeClient(socket: Socket) {
