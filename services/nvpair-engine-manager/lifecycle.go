@@ -341,6 +341,12 @@ func (e *Executor) bringUpCommand(ctx context.Context, st *engineState, engine s
 			started = true
 		}
 		if err := run(ctx, argv); err != nil {
+			// A command can launch its daemon and then still be in flight when
+			// shutdown cancels the command context. Treat cancellation as a
+			// possibly-started runtime and run the official stop command.
+			if ctx.Err() != nil {
+				started = true
+			}
 			werr := fmt.Errorf("start command failed: %w", err)
 			e.reportStartFailedUnlessShuttingDown(ctx, engine, werr)
 			return cleanup(werr)

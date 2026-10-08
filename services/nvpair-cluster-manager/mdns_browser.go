@@ -18,6 +18,7 @@ package main
 import (
 	"sync"
 
+	"nvpair-shared/clustertrust"
 	"nvpair-shared/discovery"
 	"nvpair-shared/netpick"
 	"nvpair-shared/noderec"
@@ -59,12 +60,34 @@ func (b *Browser) setRelay(nodes []noderec.DirectoryNode) {
 			ID:        n.Name,
 			Addresses: hosts,
 			Port:      svc.Port,
-			TXT:       append([]string{"uuid=" + n.HostUUID}, n.AddressTXT()...),
+			TXT:       append(append([]string{"uuid=" + n.HostUUID}, clusterUUIDTXT(n.ClusterUUID)...), n.AddressTXT()...),
 		}
 	}
 	b.mu.Lock()
 	b.relay = m
 	b.mu.Unlock()
+}
+
+func clusterUUIDTXT(clusterUUID string) []string {
+	if clusterUUID == "" {
+		return nil
+	}
+	return []string{"cluster-uuid=" + clusterUUID}
+}
+
+// LookupIdentity resolves a discovered node by its stable UUID or display id.
+func (b *Browser) LookupIdentity(idOrUUID string) (nodeUUID, clusterUUID string, ok bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if node, found := b.relay[idOrUUID]; found {
+		return idOrUUID, clustertrust.ClusterUUIDFromTXT(node.TXT), true
+	}
+	for uuid, node := range b.relay {
+		if node.ID == idOrUUID {
+			return uuid, clustertrust.ClusterUUIDFromTXT(node.TXT), true
+		}
+	}
+	return "", "", false
 }
 
 // Resolve returns a node's addresses in the order it ranked them, plus its

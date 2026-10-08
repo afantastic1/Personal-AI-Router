@@ -51,6 +51,7 @@ class M65AndroidToPcRoutingInstrumentedTest {
         val pcAddress = requireNotNull(arguments.getString(ARG_PC_ADDRESS))
         val modelId = requireNotNull(arguments.getString(ARG_MODEL_ID))
         val engine = arguments.getString(ARG_ENGINE) ?: DEFAULT_ENGINE
+        require(engine == SUPPORTED_ENGINE) { "M65 currently supports '$SUPPORTED_ENGINE'; received '$engine'." }
         val controller = PairRuntimeController(context)
         val pairingFile = File(context.cacheDir, PAIRING_FILE_NAME)
 
@@ -304,6 +305,7 @@ class M65AndroidToPcRoutingInstrumentedTest {
         const val ARG_MODEL_ID = "pairModelId"
         const val ARG_ENGINE = "pairEngine"
         const val DEFAULT_ENGINE = "lmstudio"
+        const val SUPPORTED_ENGINE = "lmstudio"
         const val PAIRING_FILE_NAME = "m65-pairing.json"
         const val CLUSTER_NAME = "PAIR M6.5 Android to PC acceptance"
         const val ENGINE_BACKEND_PORT = 1235

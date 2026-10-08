@@ -27,11 +27,14 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.nv.pair.data.ClusterState
 import com.nv.pair.data.PairNode
+import com.nv.pair.data.PeerRelationshipStatus
+import com.nv.pair.data.buildPeerViews
 
 @Composable
 internal fun ClusterManagement(
     cluster: ClusterState,
     discoveredNodes: List<PairNode>,
+    relationshipStateLoaded: Boolean,
     enabled: Boolean,
     onCreate: (String) -> Unit,
     onInvite: (String) -> Unit,
@@ -43,6 +46,7 @@ internal fun ClusterManagement(
     var clusterName by remember { mutableStateOf("") }
     var pinByInvite by remember { mutableStateOf("") }
     val identity = cluster.identity
+    val peerViews = buildPeerViews(discoveredNodes, cluster, relationshipStateLoaded)
     Text("Your node", style = MaterialTheme.typography.titleLarge)
     if (identity == null) {
         Text("Start PAIR to load this device’s cluster identity.", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -69,16 +73,18 @@ internal fun ClusterManagement(
     if (cluster.busy) CircularProgressIndicator()
     cluster.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 
-    Text("Members", style = MaterialTheme.typography.titleLarge)
-    if (cluster.members.none { it.state == "member" }) {
-        Text("No other members yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Text("Paired devices", style = MaterialTheme.typography.titleLarge)
+    val pairedPeers = peerViews.filter { it.status == PeerRelationshipStatus.PAIRED_ONLINE || it.status == PeerRelationshipStatus.PAIRED_OFFLINE }
+    if (pairedPeers.isEmpty()) {
+        Text("No paired devices.", color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    cluster.members.filter { it.state == "member" && it.nodeUuid != identity?.nodeUuid }.forEach { member ->
+    pairedPeers.forEach { peer ->
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(member.name.ifBlank { member.id }, style = MaterialTheme.typography.titleMedium)
-                Text(member.ipAddress, style = MaterialTheme.typography.bodySmall)
-                Button(onClick = { onRemove(member.nodeUuid.ifBlank { member.id }) }, enabled = enabled) {
+                Text(peer.displayName, style = MaterialTheme.typography.titleMedium)
+                Text(if (peer.status == PeerRelationshipStatus.PAIRED_ONLINE) "Paired · Online" else "Paired · Offline")
+                peer.address?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                Button(onClick = { onRemove(peer.nodeUuid ?: peer.nodeId) }, enabled = enabled) {
                     Text("Remove member")
                 }
             }
@@ -129,11 +135,35 @@ internal fun ClusterManagement(
 
     if (enabled) {
         Text("Nearby nodes", style = MaterialTheme.typography.titleLarge)
-        val eligible = discoveredNodes.filterNot(PairNode::trusted)
-        if (eligible.isEmpty()) Text("No unpaired nodes found yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        eligible.forEach { node ->
-            Button(onClick = { onInvite(node.id) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Invite ${node.name}")
+        val nearbyPeers = peerViews.filterNot {
+            it.status == PeerRelationshipStatus.PAIRED_ONLINE || it.status == PeerRelationshipStatus.PAIRED_OFFLINE
+        }
+        val actionableNearbyPeers = nearbyPeers.filterNot {
+            it.status == PeerRelationshipStatus.INVITE_OUTBOUND || it.status == PeerRelationshipStatus.INVITE_INBOUND
+        }
+        if (!relationshipStateLoaded) {
+            Text("Checking pairing status…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else if (actionableNearbyPeers.isEmpty()) {
+            Text("No nearby unpaired nodes found.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        actionableNearbyPeers.forEach { peer ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(peer.displayName, style = MaterialTheme.typography.titleMedium)
+                    when (peer.status) {
+                        PeerRelationshipStatus.DISCOVERED_UNPAIRED -> Button(
+                            onClick = { onInvite(peer.nodeId) },
+                            enabled = enabled && peer.canInvite,
+                        ) { Text("Pair") }
+                        PeerRelationshipStatus.INVITE_OUTBOUND -> Text("Pairing in progress · PIN shown above")
+                        PeerRelationshipStatus.INVITE_INBOUND -> Text("Pairing request · enter its PIN above")
+                        PeerRelationshipStatus.IN_OTHER_CLUSTER -> Text("Already in another cluster · leave or migrate explicitly")
+                        PeerRelationshipStatus.INCONSISTENT -> Text(peer.reason ?: "Pairing needs repair")
+                        PeerRelationshipStatus.UNKNOWN_IDENTITY -> Text("Identity is not available yet")
+                        PeerRelationshipStatus.PAIRED_ONLINE,
+                        PeerRelationshipStatus.PAIRED_OFFLINE -> Unit
+                    }
+                }
             }
         }
     }

@@ -13,14 +13,26 @@ class ModelCatalogRepository(
     private val entries = linkedMapOf<String, ModelDescriptor>()
 
     fun search(query: String, source: ModelSourceKind): List<ModelDescriptor> {
+        return searchPage(query, source, page = 1).descriptors
+    }
+
+    fun searchPage(
+        query: String,
+        source: ModelSourceKind,
+        page: Int,
+        pageSize: Int = ModelSourceAdapter.DEFAULT_SEARCH_LIMIT,
+    ): ModelSearchPage {
         val adapter = adapters.firstOrNull { it.kind == source }
             ?: throw IllegalArgumentException("No adapter is configured for this model source.")
-        val results = adapter.search(query)
+        val result = adapter.searchPage(query, page, pageSize)
         synchronized(this) {
-            results.forEach { entries[it.logicalId] = it }
+            result.descriptors.forEach { entries[it.logicalId] = it }
         }
-        return results
+        return result
     }
+
+    fun adapterFor(source: ModelSourceKind): ModelSourceAdapter = adapters.firstOrNull { it.kind == source }
+        ?: throw IllegalArgumentException("No adapter is configured for this model source.")
 
     @Synchronized
     fun entries(): List<ModelDescriptor> = entries.values.toList()

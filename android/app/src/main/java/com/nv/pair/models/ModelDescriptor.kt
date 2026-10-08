@@ -13,7 +13,8 @@ enum class ModelCompatibility { COMPATIBLE, UNKNOWN, INCOMPATIBLE }
 
 enum class ModelInstallability {
     VERIFIED_INSTALLABLE,
-    MISSING_VERIFICATION_METADATA,
+    LOCAL_DIGEST_ONLY,
+    UNPINNED_SOURCE_REVISION,
     UNSUPPORTED_FORMAT,
     INCOMPLETE_ARTIFACT_SET,
 }
@@ -43,22 +44,27 @@ data class ModelDescriptor(
     val estimatedMemoryBytes: Long?,
     val compatibility: ModelCompatibility,
     val files: List<ModelFile> = emptyList(),
+    val requiredArtifactPaths: List<String> = emptyList(),
+    val description: String = "",
+    val tags: List<String> = emptyList(),
 )
 
 fun ModelDescriptor.installability(): ModelInstallability {
     if (format != ModelFormat.MNN) return ModelInstallability.UNSUPPORTED_FORMAT
+    if (!IMMUTABLE_REVISION.matches(source.revision)) return ModelInstallability.UNPINNED_SOURCE_REVISION
 
     val filesByPath = files.associateBy(ModelFile::path)
-    val requiredPaths = listOf("config.json", "llm.mnn", "llm.mnn.weight", "tokenizer.txt")
+    if (requiredArtifactPaths.isEmpty()) return ModelInstallability.INCOMPLETE_ARTIFACT_SET
+    val requiredPaths = listOf("config.json") + requiredArtifactPaths
     if (requiredPaths.any { filesByPath[it] == null }) {
         return ModelInstallability.INCOMPLETE_ARTIFACT_SET
     }
-    if (requiredPaths.any { path -> filesByPath[path]?.sha256?.let(::isTrustedSha256) != true }) {
-        return ModelInstallability.MISSING_VERIFICATION_METADATA
-    }
-    return ModelInstallability.VERIFIED_INSTALLABLE
+    return if (requiredPaths.all { path -> filesByPath[path]?.sha256?.let(::isTrustedSha256) == true }) {
+        ModelInstallability.VERIFIED_INSTALLABLE
+    } else ModelInstallability.LOCAL_DIGEST_ONLY
 }
 
 internal fun isTrustedSha256(value: String): Boolean = value.matches(TRUSTED_SHA256_PATTERN)
 
 private val TRUSTED_SHA256_PATTERN = Regex("(?i)[0-9a-f]{64}")
+private val IMMUTABLE_REVISION = Regex("(?i)(?:[0-9a-f]{40}|[0-9a-f]{64})")

@@ -98,6 +98,16 @@ The instrumented tests cover CPU load, generation and streaming, cancellation, m
 
 The final planned device gate additionally uses the pinned Qwen3-1.7B MNN fixture. See `../docs/superpowers/plans/2026-10-05-pair-android-mnn-runtime.md` for its pinned snapshot and remaining acceptance requirements.
 
+## Two-device pairing persistence acceptance
+
+Connect and authorize one clean ARM64 Android test device. The acceptance runner starts an isolated PC broker, waits for Android to create a pairing invitation, accepts it on the PC, then verifies that the paired PC remains trusted after Android Stop/Start. Run it from `android`:
+
+```powershell
+.\scripts\run-pairing-persistence-acceptance.ps1 -PcAddress 192.168.1.20
+```
+
+Pass `-Serial <adb-serial>` when multiple Android devices are attached. The test requires an unpaired Android installation and ports 14321/14324 free on the PC. The runner removes only its unique temporary PC broker directory and log files. A successful script run is required to report this real-device acceptance as PASS; compilation alone does not count.
+
 ## Cluster shutdown
 
-Using the runtime's explicit **Stop** action sends `cluster:leave` before the local Broker closes, so reachable peers remove this node from their cluster roster and it can be paired again later. Internal Broker restarts preserve membership. A force-stop, crash, or network loss can prevent the departure message from being delivered; an unreachable peer may then need an explicit leave/removal before pairing again.
+Using the runtime's explicit **Stop** action closes the local Broker without leaving its cluster. The node identity, cluster membership, and trust state persist, so starting PAIR again does not require pairing again. Use the explicit **Leave cluster** action to withdraw membership; this operation remains distinct from stopping the runtime.

@@ -34,12 +34,12 @@ $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) "pair-m10-gradle-$runI
 $brokerProcess = $null
 $gradleProcess = $null
 $rpcId = 0
-$brokerReadTask = $null
+$script:brokerReadTask = $null
 
 if ($ModelId -notmatch '^[A-Za-z0-9._-]+$') { throw 'ModelId must be a single safe model-directory name.' }
 if (-not (Test-Path -LiteralPath $adb -PathType Leaf)) { throw "adb was not found at $adb." }
 if (-not (Test-Path -LiteralPath $brokerPath -PathType Leaf)) { throw "PC broker binary was not found at $brokerPath." }
-foreach ($requiredFile in @('config.json', 'llm.mnn', 'llm.mnn.weight')) {
+foreach ($requiredFile in @('config.json', 'llm_config.json', 'llm.mnn', 'llm.mnn.weight')) {
     if (-not (Test-Path -LiteralPath (Join-Path $fixture $requiredFile) -PathType Leaf)) {
         throw "Required MNN fixture file is missing: $requiredFile"
     }
@@ -81,7 +81,10 @@ function Invoke-BrokerRpc([string] $Method, [hashtable] $Params) {
     $script:rpcId++
     $requestId = $script:rpcId
     $request = @{ jsonrpc = '2.0'; id = $requestId; method = $Method; params = $Params } | ConvertTo-Json -Compress
-    $script:brokerProcess.StandardInput.WriteLine($request)
+    $requestBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($request + "`n")
+    $inputStream = $script:brokerProcess.StandardInput.BaseStream
+    $inputStream.Write($requestBytes, 0, $requestBytes.Length)
+    $inputStream.Flush()
     $deadline = [DateTime]::UtcNow.AddSeconds(35)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($null -eq $script:brokerReadTask) {
@@ -98,6 +101,19 @@ function Invoke-BrokerRpc([string] $Method, [hashtable] $Params) {
         }
     }
     throw "PC broker RPC '$Method' timed out."
+}
+
+function Wait-ForBrokerReady {
+    $deadline = [DateTime]::UtcNow.AddSeconds(35)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not $script:brokerReadTask.Wait(50)) { continue }
+        $line = $script:brokerReadTask.Result
+        if ($null -eq $line) { throw 'PC broker closed its JSON-RPC output before readiness.' }
+        $script:brokerReadTask = $script:brokerProcess.StandardOutput.ReadLineAsync()
+        try { $message = $line | ConvertFrom-Json } catch { continue }
+        if ($message.method -eq 'app:ready') { return }
+    }
+    throw 'PC broker did not report app:ready before the startup deadline.'
 }
 
 function Invoke-Adb([string[]] $Arguments, [string] $FailureMessage) {
@@ -260,8 +276,11 @@ try {
     $brokerProcess = [System.Diagnostics.Process]::new()
     $brokerProcess.StartInfo = $brokerInfo
     if (-not $brokerProcess.Start()) { throw 'Unable to start the isolated PC broker.' }
-    $brokerReadTask = $brokerProcess.StandardOutput.ReadLineAsync()
+    $script:brokerReadTask = $brokerProcess.StandardOutput.ReadLineAsync()
     Write-Host 'Waiting for isolated PC broker RPC.'
+    Wait-ForBrokerReady
+    # Prime the redirected writer so its UTF-8 preamble cannot prefix a JSON-RPC request.
+    $brokerProcess.StandardInput.WriteLine('')
     $null = Invoke-BrokerRpc 'ping' @{}
     Write-Host 'PC broker RPC is ready.'
 
@@ -284,8 +303,18 @@ try {
         '-PpairM10Acceptance=true',
         "-PpairM10PcAddress=$PcAddress"
     )
-    $gradleProcess = Start-Process -FilePath (Join-Path $androidRoot 'gradlew.bat') `
-        -ArgumentList $gradleArgs -WorkingDirectory $androidRoot -WindowStyle Hidden `
+    $javaCommand = Get-Command java.exe -CommandType Application -ErrorAction Stop
+    $wrapperJar = Join-Path $androidRoot 'gradle/wrapper/gradle-wrapper.jar'
+    $javaArgs = @(
+        '"-Xmx64m"',
+        '"-Xms64m"',
+        '"-Dorg.gradle.appname=gradlew"',
+        '-classpath',
+        ('"' + $wrapperJar + '"'),
+        'org.gradle.wrapper.GradleWrapperMain'
+    ) + $gradleArgs
+    $gradleProcess = Start-Process -FilePath $javaCommand.Source `
+        -ArgumentList ($javaArgs -join ' ') -WorkingDirectory $androidRoot -WindowStyle Hidden `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 
     $pairingAccepted = $false

@@ -8,6 +8,7 @@ package com.nv.pair.runtime
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
+import com.nv.pair.models.ModelHubInstaller
 import com.nv.pair.data.PairNode
 import com.nv.pair.data.ClusterState
 import com.nv.pair.data.EngineProxyStatus
@@ -16,6 +17,15 @@ import com.nv.pair.mnn.MnnBackend
 import com.nv.pair.mnn.MnnSettingsRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import java.io.File
+import java.io.IOException
+import java.util.UUID
 
 class PairRuntimeController(context: Context) {
     private val applicationContext = context.applicationContext
@@ -37,6 +47,33 @@ class PairRuntimeController(context: Context) {
                     .setAction(PairRuntimeService.ACTION_MNN_BACKEND_CHANGED)
                     .putExtra(PairRuntimeService.EXTRA_MNN_BACKEND, backend.preferenceValue),
             )
+        }
+    }
+
+    suspend fun deleteInstalledModel(modelId: String) {
+        when (state.value.phase) {
+            RuntimePhase.STOPPED -> withContext(Dispatchers.IO) {
+                ModelHubInstaller(File(applicationContext.filesDir, "mnn/models")).deleteInstalledModel(modelId)
+            }
+            RuntimePhase.RUNNING -> {
+                val requestId = UUID.randomUUID().toString()
+                val result = coroutineScope {
+                    val response = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                        withTimeout(MODEL_DELETE_TIMEOUT_MILLIS) {
+                            PairRuntimeService.modelDeletionResults.first { it.requestId == requestId }
+                        }
+                    }
+                    applicationContext.startService(
+                        Intent(applicationContext, PairRuntimeService::class.java)
+                            .setAction(PairRuntimeService.ACTION_DELETE_MODEL)
+                            .putExtra(PairRuntimeService.EXTRA_MODEL_DELETE_REQUEST_ID, requestId)
+                            .putExtra(PairRuntimeService.EXTRA_MODEL_DELETE_ID, modelId),
+                    )
+                    response.await()
+                }
+                result.failureMessage?.let { throw IOException(it) }
+            }
+            else -> throw IOException("Wait for PAIR to finish changing runtime state before deleting a model.")
         }
     }
 
@@ -76,4 +113,8 @@ class PairRuntimeController(context: Context) {
 
     private fun clusterIntent(action: String) =
         Intent(applicationContext, PairRuntimeService::class.java).setAction(action)
+
+    private companion object {
+        const val MODEL_DELETE_TIMEOUT_MILLIS = 35_000L
+    }
 }

@@ -66,8 +66,8 @@ class MainActivity : ComponentActivity() {
 
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (granted && startAfterNotificationPermission) runtimeController.start()
+    ) {
+        if (startAfterNotificationPermission) runtimeController.start()
         startAfterNotificationPermission = false
     }
 
@@ -252,6 +252,7 @@ private fun PairHomeScreen(
                 ClusterManagement(
                     cluster = cluster,
                     discoveredNodes = nodes,
+                    relationshipStateLoaded = running,
                     enabled = running && !cluster.busy,
                     onCreate = onCreateCluster,
                     onInvite = onInvite,

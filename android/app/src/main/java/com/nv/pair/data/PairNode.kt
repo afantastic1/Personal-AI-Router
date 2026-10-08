@@ -14,6 +14,7 @@ data class PairNode(
     val port: Int = 0,
     val trusted: Boolean = false,
     val clustered: Boolean = false,
+    val clusterId: String = "",
     val models: List<String> = emptyList(),
     val modelsByEngine: Map<String, List<String>> = emptyMap(),
     val loadedByEngine: Map<String, List<String>> = emptyMap(),

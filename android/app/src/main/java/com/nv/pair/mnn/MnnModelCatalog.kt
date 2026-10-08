@@ -15,6 +15,7 @@ class MnnModelCatalog(
         .orEmpty()
         .asSequence()
         .filter(File::isDirectory)
+        .filterNot { it.name.startsWith('.') }
         .mapNotNull { directory ->
             when (val model = modelManager.resolve(directory, directory.name, directory.name)) {
                 is MnnResult.Success -> model.value

@@ -20,6 +20,8 @@ import com.nv.pair.MainActivity
 import com.nv.pair.data.PairRepository
 import com.nv.pair.data.ClusterRepository
 import com.nv.pair.data.ClusterInvite
+import com.nv.pair.data.InviteDecision
+import com.nv.pair.data.checkInviteDecision
 import com.nv.pair.data.RouterRepository
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.UiPreferencesRepository
@@ -27,6 +29,7 @@ import com.nv.pair.mnn.MnnRuntimeContainer
 import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.mnn.MnnSettingsRepository
 import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.models.ModelHubInstaller
 import com.nv.pair.network.MulticastLockManager
 import com.nv.pair.network.AndroidNetworkContext
 import com.nv.pair.rpc.BrokerSession
@@ -38,7 +41,6 @@ import com.nv.pair.rpc.RouterApi
 import com.nv.pair.rpc.parseWorkloadRemoval
 import com.nv.pair.rpc.parseWorkloadUpsert
 import com.nv.pair.rpc.parseClusterMembersChanged
-import com.nv.pair.rpc.parseClusterMembers
 import com.nv.pair.runtime.RuntimePhase.CRASHED
 import com.nv.pair.runtime.RuntimePhase.RESTART_BACKOFF
 import com.nv.pair.runtime.RuntimePhase.RUNNING
@@ -49,6 +51,7 @@ import com.nv.pair.runtime.RuntimePhase.STOPPING
 import com.nv.pair.runtime.RuntimePhase.WAITING_READY
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CompletableDeferred
@@ -64,6 +67,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -72,6 +76,8 @@ import kotlinx.coroutines.flow.asStateFlow
 class PairRuntimeService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commandMutex = Mutex()
+    private val modelLifecycleMutex = Mutex()
+    private val pendingInviteTargets = ConcurrentHashMap.newKeySet<String>()
     private lateinit var preferences: UiPreferencesRepository
     private lateinit var mnnSettings: MnnSettingsRepository
     private lateinit var multicastLock: MulticastLockManager
@@ -100,6 +106,7 @@ class PairRuntimeService : Service() {
             ACTION_MNN_BACKEND_CHANGED -> serviceScope.launch {
                 applyPreferredMnnBackend(MnnBackend.fromPreferenceValue(intent.getStringExtra(EXTRA_MNN_BACKEND)))
             }
+            ACTION_DELETE_MODEL -> serviceScope.launch { deleteInstalledModel(intent) }
             ACTION_CLUSTER_CREATE, ACTION_CLUSTER_INVITE, ACTION_CLUSTER_RESPOND,
             ACTION_CLUSTER_CANCEL, ACTION_CLUSTER_LEAVE, ACTION_CLUSTER_REMOVE ->
                 serviceScope.launch { performClusterAction(intent.action.orEmpty(), intent) }
@@ -188,6 +195,14 @@ class PairRuntimeService : Service() {
                                 if (invite.state == "canceled" || invite.state == "expired" ||
                                     invite.state == "declined" || invite.state == "failed" || invite.state == "paired") {
                                     clusterRepository.applyInvite(invite.copy(pin = null))
+                                    val session = activeSession.get()
+                                    if (session != null) serviceScope.launch {
+                                        runCatching {
+                                            withContext(Dispatchers.IO) { ClusterApi(session).refresh(clusterRepository) }
+                                        }.onFailure {
+                                            android.util.Log.w(TAG, "cluster snapshot refresh failed after invite update")
+                                        }
+                                    }
                                 } else {
                                     clusterRepository.applyInvite(invite)
                                 }
@@ -340,15 +355,6 @@ class PairRuntimeService : Service() {
         setDesiredRunning(false)
         if (runtimeState.value.phase != STOPPED) setPhase(STOPPING)
         val session = activeSession.get()
-        if (session != null) {
-            val leaveFailed = withContext(Dispatchers.IO) {
-                runCatching { ClusterApi(session).leave() }.isFailure
-            }
-            if (leaveFailed) {
-                clusterRepository.setError("Could not notify cluster peers before PAIR stopped.")
-                android.util.Log.w(TAG, "cluster leave failed during runtime shutdown")
-            }
-        }
         closeMnnRuntime()
         if (session != null) withContext(Dispatchers.IO) { session.close() }
         runtimeJob?.cancelAndJoin()
@@ -364,10 +370,12 @@ class PairRuntimeService : Service() {
     }
 
     private suspend fun closeMnnRuntime() {
-        val container = mnnRuntimeContainer
-        mnnRuntimeContainer = null
-        if (container != null) {
-            withContext(NonCancellable + Dispatchers.IO) { container.close() }
+        modelLifecycleMutex.withLock {
+            val container = mnnRuntimeContainer
+            mnnRuntimeContainer = null
+            if (container != null) {
+                withContext(NonCancellable + Dispatchers.IO) { container.close() }
+            }
         }
     }
 
@@ -400,9 +408,13 @@ class PairRuntimeService : Service() {
     private suspend fun monitorProxyStatus(session: BrokerSession) {
         while (currentCoroutineContext().isActive && activeSession.get() === session && runtimeState.value.phase == RUNNING) {
             for (engine in RouterRepository.ROUTER_ENGINES) {
-                val status = runCatching {
+                val status = try {
                     withContext(Dispatchers.IO) { RouterApi(session).proxyStatus(engine) }
-                }.getOrNull() ?: EngineProxyStatus(engine, false, 0)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    EngineProxyStatus(engine, false, 0)
+                }
                 routerRepository.setProxyStatus(status)
             }
             mnnRuntimeContainer?.let { container ->
@@ -437,8 +449,19 @@ class PairRuntimeService : Service() {
                         ACTION_CLUSTER_INVITE -> {
                             val node = pairRepository.nodes.value.firstOrNull { it.id == text }
                                 ?: throw IllegalArgumentException("Discovered node is no longer available.")
-                            val invite = api.invite(node.ipAddress, CLUSTER_MANAGER_PORT, node.id)
-                            clusterRepository.applyInvite(invite)
+                            val decision = checkInviteDecision(node, clusterRepository.state.value)
+                            if (decision is InviteDecision.NotAllowed) {
+                                throw IllegalStateException(decision.reason)
+                            }
+                            if (!pendingInviteTargets.add(node.hostUuid)) {
+                                throw IllegalStateException("Pairing is already in progress for this device.")
+                            }
+                            val invite = try {
+                                api.invite(node.ipAddress, CLUSTER_MANAGER_PORT, node.hostUuid)
+                                    .also(clusterRepository::applyInvite)
+                            } finally {
+                                pendingInviteTargets.remove(node.hostUuid)
+                            }
                             if (invite.state == "pending") inviteToWatch = invite.inviteId
                         }
                         ACTION_CLUSTER_RESPOND -> {
@@ -454,10 +477,13 @@ class PairRuntimeService : Service() {
                         ACTION_CLUSTER_LEAVE -> api.leave()
                         ACTION_CLUSTER_REMOVE -> api.remove(text)
                     }
-                    if (action == ACTION_CLUSTER_LEAVE || action == ACTION_CLUSTER_REMOVE) {
-                        clusterRepository.applyMembersChanged(parseClusterMembers(session.request("nodes:get-initial")))
+                    if (action == ACTION_CLUSTER_RESPOND || action == ACTION_CLUSTER_CANCEL ||
+                        action == ACTION_CLUSTER_LEAVE || action == ACTION_CLUSTER_REMOVE) {
+                        api.refresh(clusterRepository)
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (failure: Exception) {
                 clusterRepository.setError(failure.message ?: "Cluster operation failed.")
             } finally {
@@ -467,10 +493,11 @@ class PairRuntimeService : Service() {
                 serviceScope.launch {
                     while (isActive && runtimeState.value.phase == RUNNING) {
                         delay(2_000)
-                        val statusResult = runCatching {
+                        val updated = try {
                             withContext(Dispatchers.IO) { api.inviteStatus(inviteId) }
-                        }
-                        if (statusResult.isFailure) {
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
                             clusterRepository.applyInvite(ClusterInvite(
                                 inviteId = inviteId,
                                 fromNodeId = "",
@@ -478,13 +505,45 @@ class PairRuntimeService : Service() {
                             ))
                             break
                         }
-                        val updated = statusResult.getOrThrow()
                         clusterRepository.applyInvite(updated.copy(pin = if (updated.state == "pending") updated.pin else null))
                         if (updated.state != "pending") break
                     }
                 }
             }
         }
+    }
+
+    private suspend fun deleteInstalledModel(intent: Intent) {
+        val requestId = intent.getStringExtra(EXTRA_MODEL_DELETE_REQUEST_ID).orEmpty()
+        val modelId = intent.getStringExtra(EXTRA_MODEL_DELETE_ID).orEmpty()
+        val result = try {
+            require(requestId.isNotBlank()) { "Model deletion request ID is missing." }
+            require(runtimeState.value.phase == RUNNING) { "PAIR runtime changed state; retry model deletion." }
+            val container = mnnRuntimeContainer
+            modelLifecycleMutex.withLock {
+                require(runtimeState.value.phase == RUNNING && mnnRuntimeContainer === container) {
+                    "PAIR runtime changed state; retry model deletion."
+                }
+                val deletion = withContext(Dispatchers.IO) {
+                    val deleteFiles = {
+                        ModelHubInstaller(File(filesDir, MNN_MODELS_DIRECTORY)).deleteInstalledModel(modelId)
+                    }
+                    container?.deleteModel(modelId, deleteFiles) ?: run {
+                        deleteFiles()
+                        com.nv.pair.mnn.MnnResult.success(Unit)
+                    }
+                }
+                when (deletion) {
+                    is com.nv.pair.mnn.MnnResult.Success -> ModelDeletionResult(requestId, modelId, null)
+                    is com.nv.pair.mnn.MnnResult.Failure -> ModelDeletionResult(requestId, modelId, deletion.error.message)
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            ModelDeletionResult(requestId, modelId, failure.message ?: "Model deletion failed.")
+        }
+        modelDeletionResults.emit(result)
     }
 
     private fun setPhaseIf(expected: RuntimePhase, next: RuntimePhase) {
@@ -577,6 +636,7 @@ class PairRuntimeService : Service() {
         const val ACTION_START = "com.nv.pair.action.START_RUNTIME"
         const val ACTION_STOP = "com.nv.pair.action.STOP_RUNTIME"
         const val ACTION_MNN_BACKEND_CHANGED = "com.nv.pair.action.MNN_BACKEND_CHANGED"
+        const val ACTION_DELETE_MODEL = "com.nv.pair.action.DELETE_MODEL"
         const val ACTION_CLUSTER_CREATE = "com.nv.pair.action.CLUSTER_CREATE"
         const val ACTION_CLUSTER_INVITE = "com.nv.pair.action.CLUSTER_INVITE"
         const val ACTION_CLUSTER_RESPOND = "com.nv.pair.action.CLUSTER_RESPOND"
@@ -587,6 +647,8 @@ class PairRuntimeService : Service() {
         const val EXTRA_SECONDARY = "com.nv.pair.extra.SECONDARY"
         const val EXTRA_ACCEPT = "com.nv.pair.extra.ACCEPT"
         const val EXTRA_MNN_BACKEND = "com.nv.pair.extra.MNN_BACKEND"
+        const val EXTRA_MODEL_DELETE_REQUEST_ID = "com.nv.pair.extra.MODEL_DELETE_REQUEST_ID"
+        const val EXTRA_MODEL_DELETE_ID = "com.nv.pair.extra.MODEL_DELETE_ID"
 
         private const val TAG = "PAIR-Runtime"
         private const val CHANNEL_ID = "pair-runtime"
@@ -609,5 +671,8 @@ class PairRuntimeService : Service() {
         val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = _mnnLocalEngine.asStateFlow()
         private val _preferredMnnBackend = MutableStateFlow(MnnBackend.CPU)
         val workloads = routerRepository.workloads
+        val modelDeletionResults = MutableSharedFlow<ModelDeletionResult>(extraBufferCapacity = 8)
     }
 }
+
+data class ModelDeletionResult(val requestId: String, val modelId: String, val failureMessage: String?)

@@ -70,6 +70,7 @@ private fun JSONArray.toPairNodes(): List<PairNode> = List(length()) { index ->
         port = node.optInt("port"),
         trusted = node.optBoolean("trusted"),
         clustered = node.optBoolean("clustered"),
+        clusterId = node.optString("clusterUuid"),
         models = node.optJSONArray("models").toStringList(),
         modelsByEngine = node.optJSONObject("modelsByEngine").toStringListMap(),
         loadedByEngine = node.optJSONObject("loadedByEngine").toStringListMap(),

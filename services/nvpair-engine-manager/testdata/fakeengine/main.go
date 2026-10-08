@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // Command fake-engine is a tiny, pure-Go stand-in for a real inference
@@ -113,6 +114,13 @@ func main() {
 				_ = os.WriteFile(os.Args[2], []byte("ok"), 0o644)
 			}
 			return
+		case "touchwait": // signal a detached daemon then wait for context cancellation
+			if len(os.Args) > 2 {
+				_ = os.WriteFile(os.Args[2], []byte("ok"), 0o644)
+			}
+			for {
+				time.Sleep(time.Hour)
+			}
 		case "echo": // print args to stdout so a cmd-action can capture output
 			fmt.Println(strings.Join(os.Args[2:], " "))
 			return

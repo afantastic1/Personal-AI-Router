@@ -1,0 +1,20 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# M12.5 Known Limitations
+
+- Model Hub state and IO orchestration live in an `AndroidViewModel`, surviving Activity recreation. Downloads show byte progress and expose cancellation. Interrupted installs retain a private staging directory with an atomic task manifest, verified completed-file receipts, and resumable `.part` files; a retry with the same pinned source can continue. A different source identity or revision is rejected while that task exists. A staging directory with only an incomplete initial task-manifest temporary file can be safely rebuilt; if artifacts exist without task metadata, the installer fails closed. Failed installs can leave this staging directory behind and currently require a retry of the same model or manual app-data cleanup.
+- Model deletion is coordinated with the Service-owned MNN runtime while PAIR is running: active generation is rejected, a matching loaded model is unloaded and checked before deletion. Process death during the request returns no UI acknowledgement; retry after runtime state is restored.
+- Provider HTTP status failures, connection failures, malformed JSON and unresolved revisions now carry typed provider, operation, category, retryability, status and request ID when available. URL-connection cancellation remains timeout/interruption based, and live provider errors have not been smoke-tested against public services.
+- Model Hub now wires previous/next page controls to both provider page APIs, guards stale page responses with request generations, and exposes typed provider failure state with retry for retryable catalog failures. The Hugging Face HTTP client is synchronous; cancellation depends on thread interruption and its bounded connect/read timeouts.
+- Models without trusted provider SHA-256 metadata can be installed only from a pinned immutable revision after an explicit confirmation. The installer records a local digest and labels the manifest `UNVERIFIED_SOURCE_DIGEST`; that digest protects the installed copy from later unnoticed changes but does not verify it against the provider.
+- ModelScope inspection validates the selected branch/tag through revision metadata, then resolves it to a 40-hex object ID using Git smart-HTTP refs. The live public API smoke and on-device Android Model Hub inspection/download/install passed for `MNN/Qwen3-0.6B-MNN`; Hugging Face inspection requires and pins the returned immutable `sha`.
+- A complete MNN artifact set does not guarantee compatibility with the pinned MNN 3.6.1 runtime. M10 used the official Qwen3 0.6B package; a newer Qwen3.5 package was rejected during diagnosis. Model Hub reports package completeness and provenance, not runtime compatibility for every model revision.
+- Durable resume is tested by interrupting a local HTTP download and constructing a new installer instance. Android OS process-kill recovery, app-data restore, and device storage pressure have not been exercised on hardware.
+- The downloader implements bounded retries for 408/429/5xx and Retry-After, explicit interrupt cancellation, and 416 handling. A source whose checksum is absent can only be installed after explicit opt-in; its local digest is recorded but does not prove publisher authenticity.
+- M65 is LM Studio-only and requires its managed engine port 1235. Physical acceptance passed with LM Studio's local Qwen 3 0.6B model.
+- M10 PC-to-Android acceptance passed on a Galaxy Tab SM-T733 / Android 14 using `taobao-mnn/Qwen3-0.6B-MNN` pinned to `34dfccda1187ded6e07ea06426da576b0b793c6b`. Two-device pairing persistence, Stop/Start, notification permission denial, live Model Hub inspection/download/install, and runtime inference through the Model Hub installed copy also passed on the same device. Android OS process-kill recovery has not been exercised.
+- Cross-cluster and simultaneous-invite conflicts are covered by service-level tests, not the device scenario.
+- Native shutdown controls must not free a session still owned by a blocked native call.

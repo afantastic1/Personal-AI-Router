@@ -121,7 +121,7 @@ func TestStopAllStopsDetachedCommandDaemonBeforeReadiness(t *testing.T) {
 	platform.Runtime.Mode = "command"
 	platform.Runtime.Bin = ""
 	platform.Runtime.Port = port
-	platform.Runtime.Start = [][]string{{fakeEngineBin, "touch", startMarker}}
+	platform.Runtime.Start = [][]string{{fakeEngineBin, "touchwait", startMarker}}
 	platform.Runtime.Stop = &StopSpec{Cmd: []string{fakeEngineBin, "touch", stopMarker}, GraceS: 1}
 	platform.Runtime.Ready = &Probe{
 		HTTP:     "http://127.0.0.1:{port}/",

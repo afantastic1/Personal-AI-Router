@@ -32,6 +32,7 @@ class MnnModelManagerTest {
         modelDirectory.resolve("config.json").writeText(
             "{\"llm_model\":\"llm.mnn\",\"llm_weight\":\"llm.mnn.weight\",\"tokenizer_file\":\"tokenizer.txt\"}"
         )
+        modelDirectory.resolve("llm_config.json").writeText("{}")
         modelDirectory.resolve("llm.mnn").writeText("synthetic model file")
         modelDirectory.resolve("llm.mnn.weight").writeText("synthetic model weights")
         modelDirectory.resolve("tokenizer.txt").writeText("synthetic tokenizer")
@@ -55,6 +56,7 @@ class MnnModelManagerTest {
         modelDirectory.resolve("config.json").writeText(
             "{\"llm_model\":\"llm.mnn\",\"llm_weight\":\"llm.mnn.weight\",\"tokenizer_file\":\"tokenizer.txt\"}"
         )
+        modelDirectory.resolve("llm_config.json").writeText("{}")
         modelDirectory.resolve("llm.mnn").writeText("synthetic model file")
         modelDirectory.resolve("tokenizer.txt").writeText("synthetic tokenizer")
 
@@ -76,6 +78,7 @@ class MnnModelManagerTest {
         modelDirectory.resolve("config.json").writeText(
             "{\"llm_model\":\"llm.mnn\",\"llm_weight\":\"llm.mnn.weight\",\"tokenizer_file\":\"tokenizer.txt\"}"
         )
+        modelDirectory.resolve("llm_config.json").writeText("{}")
         modelDirectory.resolve("llm.mnn").writeText("synthetic model file")
         modelDirectory.resolve("llm.mnn.weight").writeText("synthetic model weights")
 
@@ -88,6 +91,28 @@ class MnnModelManagerTest {
         }
         assertEquals(MnnErrorCode.MODEL_CONFIG_INVALID, error.code)
         assertTrue(error.message.contains("tokenizer.txt"))
+        modelDirectory.deleteRecursively()
+    }
+
+    @Test
+    fun rejectsModelWhenLlmConfigFileIsMissing() {
+        val modelDirectory = Files.createTempDirectory("pair-mnn-model").toFile()
+        modelDirectory.resolve("config.json").writeText(
+            "{\"llm_model\":\"llm.mnn\",\"llm_weight\":\"llm.mnn.weight\",\"tokenizer_file\":\"tokenizer.txt\"}"
+        )
+        modelDirectory.resolve("llm.mnn").writeText("synthetic model file")
+        modelDirectory.resolve("llm.mnn.weight").writeText("synthetic model weights")
+        modelDirectory.resolve("tokenizer.txt").writeText("synthetic tokenizer")
+
+        val result = MnnModelManager().resolve(modelDirectory, "qwen-test")
+
+        assertTrue(result is MnnResult.Failure)
+        val error = when (result) {
+            is MnnResult.Failure -> result.error
+            is MnnResult.Success -> error("Expected incomplete model to fail")
+        }
+        assertEquals(MnnErrorCode.MODEL_CONFIG_INVALID, error.code)
+        assertTrue(error.message.contains("llm_config.json"))
         modelDirectory.deleteRecursively()
     }
 }

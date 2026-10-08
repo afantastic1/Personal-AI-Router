@@ -12,10 +12,52 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MnnInferenceServiceTest {
+    @Test
+    fun deletingLoadedModelUnloadsBeforeRemovingItsFiles() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        val modelDirectory = createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime()
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime))
+        try {
+            assertTrue(service.ensureLoaded("qwen3-0.6b", MnnBackend.CPU) is MnnResult.Success)
+
+            val result = service.deleteModel("qwen3-0.6b") { modelDirectory.deleteRecursively() }
+
+            assertTrue(result is MnnResult.Success)
+            assertEquals(null, service.status().modelId)
+            assertFalse(modelDirectory.exists())
+        } finally {
+            service.close()
+        }
+    }
+
+    @Test
+    fun deletingDuringGenerationLeavesModelFilesUntouched() {
+        val root = Files.createTempDirectory("pair-mnn-service").toFile()
+        val modelDirectory = createModel(root, "qwen3-0.6b")
+        val runtime = FakeRuntime(blockGeneration = true)
+        val service = LocalMnnInferenceService(MnnModelCatalog(root), MnnEngineHost(runtime))
+        val generation = Thread { service.generate(29, request()) { } }
+        generation.start()
+        try {
+            assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
+
+            val result = service.deleteModel("qwen3-0.6b") { modelDirectory.deleteRecursively() }
+
+            assertEquals(MnnErrorCode.ENGINE_BUSY, failureCode(result))
+            assertTrue(modelDirectory.isDirectory)
+        } finally {
+            service.cancel(29)
+            generation.join(2_000)
+            service.close()
+        }
+    }
+
     @Test
     fun defaultBackendIsCpu() {
         val root = Files.createTempDirectory("pair-mnn-service").toFile()
@@ -193,13 +235,15 @@ class MnnInferenceServiceTest {
         }
     }
 
-    private fun createModel(root: File, modelId: String) {
+    private fun createModel(root: File, modelId: String): File {
         val directory = root.resolve(modelId)
         directory.mkdirs()
         directory.resolve("config.json").writeText("""{"llm_model":"llm.mnn"}""")
+        directory.resolve("llm_config.json").writeText("{}")
         directory.resolve("llm.mnn").writeText("model")
         directory.resolve("llm.mnn.weight").writeText("weights")
         directory.resolve("tokenizer.txt").writeText("tokenizer")
+        return directory
     }
 
     private fun request(modelId: String = "qwen3-0.6b") =

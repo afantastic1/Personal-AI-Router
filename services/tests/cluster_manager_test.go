@@ -194,6 +194,22 @@ func TestClusterManagerPairing(t *testing.T) {
 	if len(inv.Pin) != 6 {
 		t.Fatalf("expected a six-digit PIN, got %q", inv.Pin)
 	}
+	duplicate := a.callExpectError("cluster:invite-node", map[string]any{
+		"address": "127.0.0.1", "port": 14822, "nodeId": "node-b",
+	})
+	if duplicate.Error == nil || duplicate.Error.Code != -32004 {
+		t.Fatalf("duplicate invite error = %#v, want precondition error", duplicate.Error)
+	}
+	var duplicateData struct {
+		Reason   string `json:"reason"`
+		InviteID string `json:"inviteId"`
+	}
+	if err := json.Unmarshal(duplicate.Error.Data, &duplicateData); err != nil {
+		t.Fatalf("decode duplicate invite error data: %v", err)
+	}
+	if duplicateData.Reason != "invite-in-progress" || duplicateData.InviteID != inv.InviteID {
+		t.Fatalf("duplicate invite data = %+v, want existing invite %q", duplicateData, inv.InviteID)
+	}
 
 	// B is prompted.
 	rcv := b.waitNotify("cluster:invite-received")
@@ -232,6 +248,22 @@ func TestClusterManagerPairing(t *testing.T) {
 	}
 	if got := memberCount(t, b); got != 2 {
 		t.Fatalf("node B members = %d, want 2", got)
+	}
+	duplicateMember := a.callExpectError("cluster:invite-node", map[string]any{
+		"address": "127.0.0.1", "port": 14822, "nodeId": bInfo.NodeUUID,
+	})
+	if duplicateMember.Error == nil || duplicateMember.Error.Code != -32004 {
+		t.Fatalf("already-member invite error = %#v, want precondition error", duplicateMember.Error)
+	}
+	var memberErrorData struct {
+		Reason   string `json:"reason"`
+		NodeUUID string `json:"nodeUuid"`
+	}
+	if err := json.Unmarshal(duplicateMember.Error.Data, &memberErrorData); err != nil {
+		t.Fatalf("decode already-member error data: %v", err)
+	}
+	if memberErrorData.Reason != "already-member" || memberErrorData.NodeUUID != bInfo.NodeUUID {
+		t.Fatalf("already-member error data = %+v, want node UUID %q", memberErrorData, bInfo.NodeUUID)
 	}
 
 	// A removes B.
@@ -308,11 +340,20 @@ func TestInviteAutoFoundsClusterWhenUnclustered(t *testing.T) {
 	}
 
 	// Idempotency: a second invite reuses the existing cluster, never re-founds.
-	inv2 := decodeResult[inviteResult](t, a.call("cluster:invite-node", map[string]any{
+	second := a.callExpectError("cluster:invite-node", map[string]any{
 		"address": "127.0.0.1", "port": 14832, "nodeId": "node-b",
-	}))
-	if inv2.State != "pending" || len(inv2.Pin) != 6 {
-		t.Fatalf("second invite-node = %+v, want pending + six-digit pin", inv2)
+	})
+	if second.Error == nil || second.Error.Code != -32004 {
+		t.Fatalf("duplicate invite error = %+v, want precondition error", second.Error)
+	}
+	var errorData struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(second.Error.Data, &errorData); err != nil {
+		t.Fatalf("decode duplicate invite error data: %v", err)
+	}
+	if errorData.Reason != "invite-in-progress" {
+		t.Fatalf("duplicate invite reason = %q, want invite-in-progress", errorData.Reason)
 	}
 	aFinal := decodeResult[cmNodeID](t, a.call("cluster:get-node-id", nil))
 	if aFinal.ClusterID != id.ClusterID {
@@ -320,11 +361,9 @@ func TestInviteAutoFoundsClusterWhenUnclustered(t *testing.T) {
 	}
 }
 
-// TestRepeatedInviteSameSenderSupersedesPrior verifies that re-inviting the same
-// standalone node leaves exactly the newest pairing session usable. This keeps
-// PIN-only clients from seeing multiple indistinguishable inbound invites from
-// one sender while preserving the separate-sender race covered below.
-func TestRepeatedInviteSameSenderSupersedesPrior(t *testing.T) {
+// TestRepeatedInviteSameSenderIsRejectedWhilePending verifies that a duplicate
+// request does not replace the active PIN session or create another inbound invite.
+func TestRepeatedInviteSameSenderIsRejectedWhilePending(t *testing.T) {
 	a := startCM(t, t.TempDir(), 14911)
 	defer a.stop()
 	b := startCM(t, t.TempDir(), 14912)
@@ -349,44 +388,29 @@ func TestRepeatedInviteSameSenderSupersedesPrior(t *testing.T) {
 	}
 	b.waitNotify("cluster:invite-received")
 
-	second := invite()
-	if second.State != "pending" || len(second.Pin) != 6 || second.InviteID == first.InviteID {
-		t.Fatalf("second invite = %+v, want a new pending invite + six-digit PIN", second)
-	}
-
-	canceledMsg := b.waitNotify("cluster:invite-canceled")
-	var canceled inviteResult
-	if err := json.Unmarshal(canceledMsg.Params, &canceled); err != nil {
-		t.Fatalf("decode cluster:invite-canceled: %v", err)
-	}
-	if canceled.InviteID != first.InviteID || canceled.State != "canceled" {
-		t.Fatalf("canceled invite = %+v, want first invite %s canceled", canceled, first.InviteID)
-	}
-	receivedMsg := b.waitNotify("cluster:invite-received")
-	var received inviteResult
-	if err := json.Unmarshal(receivedMsg.Params, &received); err != nil {
-		t.Fatalf("decode second cluster:invite-received: %v", err)
-	}
-	if received.InviteID != second.InviteID {
-		t.Fatalf("received inviteId = %q, want newest %q", received.InviteID, second.InviteID)
-	}
-
-	waitInviteState(t, a, first.InviteID, "declined")
-	waitInviteState(t, b, first.InviteID, "canceled")
-	stale := b.callExpectError("cluster:respond-to-invite", map[string]any{
-		"inviteId": first.InviteID, "accept": true, "pin": first.Pin,
+	duplicate := a.callExpectError("cluster:invite-node", map[string]any{
+		"address": "127.0.0.1", "port": 14912, "nodeId": "node-b",
 	})
-	if stale.Error == nil {
-		t.Fatal("accepting superseded invite succeeded, want invalid-state error")
+	if duplicate.Error == nil || duplicate.Error.Code != -32004 {
+		t.Fatalf("duplicate invite error = %+v, want precondition error", duplicate.Error)
+	}
+	var errorData struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(duplicate.Error.Data, &errorData); err != nil {
+		t.Fatalf("decode duplicate invite error data: %v", err)
+	}
+	if errorData.Reason != "invite-in-progress" {
+		t.Fatalf("duplicate invite reason = %q, want invite-in-progress", errorData.Reason)
 	}
 
 	paired := decodeResult[inviteResult](t, b.call("cluster:respond-to-invite", map[string]any{
-		"inviteId": second.InviteID, "accept": true, "pin": second.Pin,
+		"inviteId": first.InviteID, "accept": true, "pin": first.Pin,
 	}))
 	if paired.State != "paired" {
-		t.Fatalf("accept newest invite state = %q, want paired", paired.State)
+		t.Fatalf("accept original invite state = %q, want paired", paired.State)
 	}
-	waitInviteState(t, a, second.InviteID, "paired")
+	waitInviteState(t, a, first.InviteID, "paired")
 }
 
 // cmNodeID is the subset of cluster:get-node-id we assert on.

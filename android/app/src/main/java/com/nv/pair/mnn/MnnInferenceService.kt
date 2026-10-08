@@ -88,6 +88,27 @@ class LocalMnnInferenceService(
         host.unloadModel()
     }
 
+    fun deleteModel(modelId: String, deleteFiles: () -> Unit): MnnResult<Unit> = operationLock.withLock {
+        if (activeRequestId.get() != null) {
+            return MnnResult.failure(MnnErrorCode.ENGINE_BUSY, "An MNN generation is active; the model was not deleted.")
+        }
+        if (host.getLoadedModel()?.model?.modelId == modelId) {
+            when (val unloaded = host.unloadModel()) {
+                is MnnResult.Failure -> return unloaded
+                is MnnResult.Success -> Unit
+            }
+            if (host.getLoadedModel()?.model?.modelId == modelId || host.getStatus().state != MnnEngineState.UNLOADED) {
+                return MnnResult.failure(MnnErrorCode.INVALID_STATE, "The active MNN model could not be confirmed unloaded.")
+            }
+        }
+        try {
+            deleteFiles()
+            MnnResult.success(Unit)
+        } catch (failure: Exception) {
+            MnnResult.failure(MnnErrorCode.INTERNAL_ERROR, failure.message ?: "The installed model could not be deleted.")
+        }
+    }
+
     override fun close() {
         activeRequestId.get()?.let(::cancel)
         host.close()

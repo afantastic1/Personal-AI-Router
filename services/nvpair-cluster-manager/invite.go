@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"eapnoob"
@@ -102,6 +103,14 @@ func (m *Manager) handleInviteNode(msg *Message) {
 			map[string]string{"field": "address"})
 		return
 	}
+	targetUUID := ""
+	targetClusterID := ""
+	if p.NodeID != nil && m.browser != nil {
+		targetUUID, targetClusterID, _ = m.browser.LookupIdentity(*p.NodeID)
+	}
+	if targetUUID == "" && p.NodeID != nil && isNodeUUID(*p.NodeID) {
+		targetUUID = *p.NodeID
+	}
 	// Probe before taking inviteMu. That mutex also serializes cancellation,
 	// decline, expiry and pairing commit, and a handful of connect timeouts to
 	// unreachable NICs must not hold any of them up.
@@ -111,6 +120,12 @@ func (m *Manager) handleInviteNode(msg *Message) {
 	// cleanup. The pending record is installed before network I/O so a decline or
 	// expiry on a sibling cannot observe "no pending invites" in this window.
 	m.inviteMu.Lock()
+	if reason, data := m.inviteTargetRejection(targetUUID, targetClusterID, p.NodeID); reason != "" {
+		m.inviteMu.Unlock()
+		data["reason"] = reason
+		m.codec.RespondErrorData(msg.ID, codePrecondition, inviteTargetErrorMessage(reason), data)
+		return
+	}
 
 	// Auto-found a cluster of one when this node isn't clustered yet, so a caller
 	// can invite straight away with no separate cluster:create step.
@@ -221,6 +236,86 @@ func (m *Manager) handleInviteNode(msg *Message) {
 		return
 	}
 	m.codec.Respond(msg.ID, map[string]any{"inviteId": inviteID, "state": inviteStatePending, "pin": pin})
+}
+
+func isNodeUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, char := range value {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			if char != '-' {
+				return false
+			}
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdefABCDEF", char) {
+			return false
+		}
+	}
+	return true
+}
+
+// inviteTargetRejection checks durable membership and active invitations while
+// inviteMu is held. rosterMu makes the membership and local cluster identity a
+// single snapshot with respect to pairing, leave, and removal commits.
+func (m *Manager) inviteTargetRejection(targetUUID, targetClusterID string, requestedID *string) (string, map[string]string) {
+	if targetUUID != "" && targetUUID == m.identity.NodeUUID {
+		return "self-invite", map[string]string{"nodeUuid": targetUUID}
+	}
+	m.rosterMu.Lock()
+	clusterID, _ := m.clusterIdentity()
+	if targetUUID == "" && requestedID != nil {
+		if member, ok := m.memberByNodeID(*requestedID); ok {
+			targetUUID = member.NodeUUID
+			if targetClusterID == "" {
+				targetClusterID = member.ClusterID
+			}
+		}
+	}
+	if targetClusterID != "" && targetClusterID != clusterID {
+		m.rosterMu.Unlock()
+		return "different-cluster", map[string]string{"nodeUuid": targetUUID}
+	}
+	if targetUUID != "" {
+		member, isMember := m.memberByNodeID(targetUUID)
+		pin, isPinned := m.trust.Get(targetUUID)
+		m.rosterMu.Unlock()
+		if isMember && isPinned && member.ClusterID == clusterID && pin.ClusterID == clusterID {
+			return "already-member", map[string]string{"nodeUuid": targetUUID}
+		}
+		if isMember || isPinned {
+			return "membership-inconsistent", map[string]string{"nodeUuid": targetUUID}
+		}
+	} else {
+		m.rosterMu.Unlock()
+	}
+
+	if requestedID != nil {
+		m.memMu.Lock()
+		defer m.memMu.Unlock()
+		for _, invite := range m.invites {
+			if invite.State == inviteStatePending && invite.ToNodeID != nil && *invite.ToNodeID == *requestedID {
+				return "invite-in-progress", map[string]string{"inviteId": invite.InviteID}
+			}
+		}
+	}
+	return "", nil
+}
+
+func inviteTargetErrorMessage(reason string) string {
+	switch reason {
+	case "already-member":
+		return "node is already a member of this cluster"
+	case "invite-in-progress":
+		return "pairing already in progress"
+	case "different-cluster":
+		return "node is already in another cluster"
+	case "self-invite":
+		return "cannot invite this node to itself"
+	default:
+		return "cluster membership is inconsistent; refresh and repair before inviting"
+	}
 }
 
 func (m *Manager) publishInitialInvite(inv *Invite, clusterID string) (uint64, bool) {

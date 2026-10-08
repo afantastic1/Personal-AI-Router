@@ -105,7 +105,7 @@ class M10PcToAndroidMnnInstrumentedTest {
     private suspend fun awaitStagedModel(modelId: String) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val modelDirectory = File(context.filesDir, "mnn/models/$modelId")
-        val requiredFiles = listOf("config.json", "llm.mnn", "llm.mnn.weight")
+        val requiredFiles = listOf("config.json", "llm_config.json", "llm.mnn", "llm.mnn.weight")
         withTimeout(MODEL_STAGE_TIMEOUT_MILLIS) {
             while (!modelDirectory.isDirectory || requiredFiles.any { name ->
                     !File(modelDirectory, name).isFile || File(modelDirectory, name).length() == 0L

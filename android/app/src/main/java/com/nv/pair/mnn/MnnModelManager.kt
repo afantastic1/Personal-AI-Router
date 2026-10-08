@@ -51,6 +51,7 @@ class MnnModelManager {
                 )
             }
             val artifacts = listOf(
+                ConfigArtifact("llm_config", "llm_config.json", "LLM config"),
                 ConfigArtifact("llm_model", "llm.mnn", "model graph"),
                 ConfigArtifact("llm_weight", "llm.mnn.weight", "model weights"),
                 ConfigArtifact("tokenizer_file", "tokenizer.txt", "tokenizer"),

@@ -16,6 +16,10 @@ import org.json.JSONObject
 
 class ClusterApi(private val session: BrokerSession) {
     fun initialize(repository: ClusterRepository) {
+        refresh(repository)
+    }
+
+    fun refresh(repository: ClusterRepository) {
         val nodeIdentity = parseClusterIdentity(session.request("cluster:get-node-id"))
         val friendlyName = session.request("settings/get-cluster-friendly-name").optString("value")
         val identity = nodeIdentity.copy(clusterFriendlyName = friendlyName)

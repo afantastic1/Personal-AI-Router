@@ -5,6 +5,7 @@
 
 #include "NativeMnn.h"
 
+#include <android/log.h>
 #include <MNN/Interpreter.hpp>
 #include <llm/llm.hpp>
 
@@ -235,17 +236,6 @@ bool CanInitializeOpenClRuntime() {
 }
 #endif
 
-jint LoadErrorCode(MNN::Transformer::Llm* llm, bool loaded) {
-    if (llm == nullptr) {
-        return kLoadFailed;
-    }
-    if (!loaded) {
-        MNN::Transformer::Llm::destroy(llm);
-        return kLoadFailed;
-    }
-    return kSuccess;
-}
-
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
@@ -309,8 +299,13 @@ Java_com_nv_pair_mnn_NativeMnn_nativeLoadModel(JNIEnv* env, jobject, jlong handl
         }
         const char* backendName = backend == 0 ? "cpu" : "opencl";
         const std::string runtimeConfig = std::string("{\"backend_type\":\"") + backendName + "\"}";
-        if (!candidate->set_config(runtimeConfig) || !candidate->load()) {
-            return LoadErrorCode(candidate.get(), false);
+        if (!candidate->set_config(runtimeConfig)) {
+            __android_log_print(ANDROID_LOG_ERROR, "PAIR-MNN", "MNN rejected runtime backend configuration.");
+            return kLoadFailed;
+        }
+        if (!candidate->load()) {
+            __android_log_print(ANDROID_LOG_ERROR, "PAIR-MNN", "MNN model loading failed.");
+            return kLoadFailed;
         }
         session->llm = candidate.release();
         session->backend = backend;

@@ -95,6 +95,26 @@ class JsonRpcClientTest {
     }
 
     @Test
+    fun preservesStructuredRpcErrorData() {
+        val harness = FakeBrokerHarness()
+        harness.client.start()
+        val request = CompletableFuture.supplyAsync { runCatching { harness.client.request("invite") } }
+        val frame = harness.readRequest()
+        harness.respondError(
+            frame,
+            -32004,
+            "pairing already in progress",
+            JSONObject().put("reason", "invite-in-progress").put("inviteId", "invite-1"),
+        )
+
+        val failure = request.get(2, TimeUnit.SECONDS).exceptionOrNull()
+        if (failure !is RpcException) throw AssertionError("failure was not a JSON-RPC error", failure)
+        assertEquals("invite-in-progress", failure.data?.getString("reason"))
+        assertEquals("invite-1", failure.data?.getString("inviteId"))
+        harness.close()
+    }
+
+    @Test
     fun malformedFrameFailsPendingRequests() {
         val harness = FakeBrokerHarness()
         harness.client.start()
@@ -141,12 +161,14 @@ class JsonRpcClientTest {
             emit(JSONObject().put("jsonrpc", "2.0").put("id", request.getLong("id")).put("result", result))
         }
 
-        fun respondError(request: JSONObject, code: Int, message: String) {
+        fun respondError(request: JSONObject, code: Int, message: String, data: JSONObject? = null) {
+            val error = JSONObject().put("code", code).put("message", message)
+            data?.let { error.put("data", it) }
             emit(
                 JSONObject()
                     .put("jsonrpc", "2.0")
                     .put("id", request.getLong("id"))
-                    .put("error", JSONObject().put("code", code).put("message", message))
+                    .put("error", error)
             )
         }
 

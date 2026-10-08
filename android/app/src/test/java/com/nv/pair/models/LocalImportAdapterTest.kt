@@ -21,6 +21,7 @@ class LocalImportAdapterTest {
                 "qwen3-0.6b",
                 listOf(
                     LocalModelFile("config.json") { bytes("""{"llm_model":"llm.mnn","llm_weight":"llm.mnn.weight","tokenizer_file":"tokenizer.txt"}""") },
+                    LocalModelFile("llm_config.json") { bytes("{}") },
                     LocalModelFile("llm.mnn") { bytes("graph") },
                     LocalModelFile("llm.mnn.weight") { bytes("weights") },
                     LocalModelFile("tokenizer.txt") { bytes("tokens") },

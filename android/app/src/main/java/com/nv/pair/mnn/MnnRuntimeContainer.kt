@@ -35,6 +35,9 @@ class MnnRuntimeContainer(
 
     fun setPreferredBackend(backend: MnnBackend) = inference.setPreferredBackend(backend)
 
+    fun deleteModel(modelId: String, deleteFiles: () -> Unit): MnnResult<Unit> =
+        inference.deleteModel(modelId, deleteFiles)
+
     fun start() {
         check(!closed.get()) { "MNN runtime container is closed." }
         httpServer.start()

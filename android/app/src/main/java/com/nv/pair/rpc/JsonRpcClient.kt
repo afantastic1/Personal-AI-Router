@@ -23,7 +23,11 @@ import org.json.JSONObject
 
 data class RpcNotification(val method: String, val paramsJson: String?)
 
-class RpcException(val code: Int, message: String) : IOException("JSON-RPC $code: $message")
+class RpcException(
+    val code: Int,
+    message: String,
+    val data: JSONObject? = null,
+) : IOException("JSON-RPC $code: $message")
 
 class JsonRpcClient(
     input: InputStream,
@@ -136,7 +140,11 @@ class JsonRpcClient(
         if (frame.has("error")) {
             val error = frame.optJSONObject("error") ?: throw IOException("JSON-RPC error is malformed")
             response.completeExceptionally(
-                RpcException(error.optInt("code"), error.optString("message", "unspecified error"))
+                RpcException(
+                    error.optInt("code"),
+                    error.optString("message", "unspecified error"),
+                    error.optJSONObject("data"),
+                )
             )
             return
         }

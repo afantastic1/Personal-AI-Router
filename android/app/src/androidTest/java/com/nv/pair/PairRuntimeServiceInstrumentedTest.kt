@@ -184,7 +184,7 @@ class PairRuntimeServiceInstrumentedTest {
     }
 
     @Test
-    fun stoppingRuntimeLeavesClusterBeforeBrokerCloses() = runBlocking {
+    fun stoppingRuntimePreservesClusterMembership() = runBlocking {
         val controller = PairRuntimeController(InstrumentationRegistry.getInstrumentation().targetContext)
         try {
             controller.start()
@@ -198,10 +198,108 @@ class PairRuntimeServiceInstrumentedTest {
             withTimeout(30_000) {
                 controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
             }
-            val unclustered = withTimeout(5_000) { controller.cluster.first { !it.isClustered } }
-            assertTrue(unclustered.members.isEmpty())
+            val membershipAfterStop = withTimeout(5_000) {
+                controller.cluster.first { it.isClustered }
+            }
+            assertEquals(clustered.identity?.clusterId, membershipAfterStop.identity?.clusterId)
+            assertEquals(clustered.members, membershipAfterStop.members)
+
+            controller.start()
+            withTimeout(30_000) { controller.state.first { it.phase == RuntimePhase.RUNNING } }
+            val membershipAfterRestart = withTimeout(15_000) {
+                controller.cluster.first { it.isClustered }
+            }
+            assertEquals(clustered.identity?.clusterId, membershipAfterRestart.identity?.clusterId)
+            assertEquals(clustered.members, membershipAfterRestart.members)
         } finally {
+            if (controller.cluster.value.isClustered) {
+                if (controller.state.value.phase != RuntimePhase.RUNNING) {
+                    controller.start()
+                    withTimeout(30_000) {
+                        controller.state.first { it.phase == RuntimePhase.RUNNING }
+                    }
+                }
+                controller.leaveCluster()
+                withTimeout(15_000) { controller.cluster.first { !it.isClustered } }
+            }
             controller.stop()
+        }
+    }
+
+    @Test
+    fun pairedPeerMembershipSurvivesStopAndStart() = runBlocking<Unit> {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val pcAddress = InstrumentationRegistry.getArguments().getString("pairHostIp")
+        assumeTrue("Pair persistence acceptance requires the isolated PC broker runner", !pcAddress.isNullOrBlank())
+        val targetPcAddress = requireNotNull(pcAddress)
+        val pairingFile = File(context.cacheDir, "pairing-persistence.json")
+        val controller = PairRuntimeController(context)
+        assertFalse("Pair persistence acceptance requires a clean Android node", controller.cluster.value.isClustered)
+
+        try {
+            controller.start()
+            withTimeout(30_000) { controller.state.first { it.phase == RuntimePhase.RUNNING } }
+            val pc = withTimeout(45_000) {
+                controller.nodes.first { nodes -> nodes.any { it.isTargetPc(targetPcAddress) } }
+                    .first { it.isTargetPc(targetPcAddress) }
+            }
+            controller.createCluster("PAIR pairing persistence acceptance")
+            val initialCluster = withTimeout(30_000) { controller.cluster.first { it.isClustered } }
+            val clusterId = requireNotNull(initialCluster.identity?.clusterId)
+            controller.invite(pc.id)
+            val invite = withTimeout(30_000) {
+                controller.cluster.first { state ->
+                    state.invites.any { it.state == "pending" && !it.pin.isNullOrBlank() }
+                }.invites.first { it.state == "pending" && !it.pin.isNullOrBlank() }
+            }
+            pairingFile.writeText(JSONObject().put("inviteId", invite.inviteId).put("pin", invite.pin).toString())
+
+            withTimeout(45_000) {
+                controller.cluster.first { state ->
+                    state.members.any { it.nodeUuid == pc.hostUuid || it.id == pc.id }
+                }
+            }
+            withTimeout(45_000) {
+                controller.nodes.first { nodes -> nodes.any { it.hostUuid == pc.hostUuid && it.trusted } }
+            }
+            pairingFile.delete()
+
+            controller.stop()
+            withTimeout(30_000) {
+                controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
+            }
+            val stoppedMembership = withTimeout(10_000) {
+                controller.cluster.first { it.identity?.clusterId == clusterId }
+            }
+            assertTrue(stoppedMembership.members.any { it.nodeUuid == pc.hostUuid || it.id == pc.id })
+
+            controller.start()
+            withTimeout(30_000) { controller.state.first { it.phase == RuntimePhase.RUNNING } }
+            val restartedMembership = withTimeout(30_000) {
+                controller.cluster.first { state ->
+                    state.identity?.clusterId == clusterId &&
+                        state.members.any { it.nodeUuid == pc.hostUuid || it.id == pc.id }
+                }
+            }
+            assertTrue(restartedMembership.isClustered)
+            withTimeout(45_000) {
+                controller.nodes.first { nodes -> nodes.any { it.hostUuid == pc.hostUuid && it.trusted } }
+            }
+        } finally {
+            pairingFile.delete()
+            if (controller.cluster.value.isClustered) {
+                if (controller.state.value.phase != RuntimePhase.RUNNING) {
+                    controller.start()
+                    withTimeout(30_000) { controller.state.first { it.phase == RuntimePhase.RUNNING } }
+                }
+                controller.leaveCluster()
+                withTimeout(30_000) { controller.cluster.first { !it.isClustered } }
+            }
+            controller.stop()
+            withTimeout(30_000) {
+                controller.state.first { it.phase == RuntimePhase.STOPPED && !it.desiredRunning }
+            }
         }
     }
 

@@ -30,15 +30,31 @@ android {
         testInstrumentationRunnerArguments["pairModelId"] =
             project.findProperty("pairMnnDeviceModelId")?.toString().orEmpty()
         val modelSwitchFixture = project.findProperty("pairMnnModelSwitchDeviceDir")?.toString().orEmpty()
-        val excludedInstrumentedTests = mutableListOf(
-            "com.nv.pair.M65AndroidToPcRoutingInstrumentedTest",
-        )
         val m10Acceptance = project.findProperty("pairM10Acceptance")?.toString()?.equals("true", ignoreCase = true) == true
+        val m65Acceptance = project.findProperty("pairM65Acceptance")?.toString()?.equals("true", ignoreCase = true) == true
+        val pairingPersistenceAcceptance = project.findProperty("pairPersistenceAcceptance")?.toString()?.equals("true", ignoreCase = true) == true
+        val acceptanceCount = listOf(m10Acceptance, m65Acceptance, pairingPersistenceAcceptance).count { it }
+        require(acceptanceCount <= 1) { "Only one PAIR acceptance runner can run in the same instrumentation invocation." }
+        val excludedInstrumentedTests = mutableListOf<String>()
         if (m10Acceptance) {
             testInstrumentationRunnerArguments["pairHostIp"] = project.findProperty("pairM10PcAddress")?.toString().orEmpty()
             testInstrumentationRunnerArguments["class"] = "com.nv.pair.M10PcToAndroidMnnInstrumentedTest"
         } else {
             excludedInstrumentedTests += "com.nv.pair.M10PcToAndroidMnnInstrumentedTest"
+        }
+        if (m65Acceptance) {
+            testInstrumentationRunnerArguments["pairHostIp"] = project.findProperty("pairM65PcAddress")?.toString().orEmpty()
+            testInstrumentationRunnerArguments["pairModelId"] = project.findProperty("pairM65ModelId")?.toString().orEmpty()
+            testInstrumentationRunnerArguments["pairEngine"] = project.findProperty("pairM65Engine")?.toString().orEmpty()
+            testInstrumentationRunnerArguments["class"] =
+                "com.nv.pair.M65AndroidToPcRoutingInstrumentedTest#streamsPcOnlyModelThroughAndroidEngineFacade"
+        } else {
+            excludedInstrumentedTests += "com.nv.pair.M65AndroidToPcRoutingInstrumentedTest"
+        }
+        if (pairingPersistenceAcceptance) {
+            testInstrumentationRunnerArguments["pairHostIp"] = project.findProperty("pairPersistencePcAddress")?.toString().orEmpty()
+            testInstrumentationRunnerArguments["class"] =
+                "com.nv.pair.PairRuntimeServiceInstrumentedTest#pairedPeerMembershipSurvivesStopAndStart"
         }
         if (modelSwitchFixture.isBlank()) {
             excludedInstrumentedTests += "com.nv.pair.mnn.MnnModelSwitchInstrumentedTest"
@@ -156,6 +172,8 @@ dependencies {
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
