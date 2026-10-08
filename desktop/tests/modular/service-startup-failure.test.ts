@@ -65,7 +65,7 @@ import {
     getConnectorError,
     getConnectorStatus,
     initializeConnector,
-    leaveClusterBeforeShutdown
+    shutdownConnector
 } from '@/electron/connector'
 
 describe('service startup failure handling', () => {
@@ -94,12 +94,14 @@ describe('service startup failure handling', () => {
         )
     })
 
-    it('leaves the cluster before an app shutdown', async () => {
+    it('stops services without leaving the cluster on app shutdown', async () => {
+        mocks.supervisor.stop.mockClear()
         await initializeConnector()
 
-        await leaveClusterBeforeShutdown()
+        await shutdownConnector()
 
-        expect(mocks.supervisor.callProcess).toHaveBeenCalledWith('broker', 'cluster:leave')
+        expect(mocks.supervisor.stop).toHaveBeenCalledOnce()
+        expect(mocks.supervisor.callProcess).not.toHaveBeenCalledWith('broker', 'cluster:leave')
     })
 
     it('surfaces a readiness timeout and recovers if readiness arrives later', async () => {

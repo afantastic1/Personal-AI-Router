@@ -22,10 +22,9 @@ import { macPrivilege } from '@/electron/services/mac-privilege-service'
 
 import { registerAllIpc } from '@/electron/ipc'
 import {
-    destroyConnector,
+    shutdownConnector,
     destroyConnectorSync,
-    initializeConnector,
-    leaveClusterBeforeShutdown
+    initializeConnector
 } from '@/electron/connector'
 import { initializeUpdater } from '@/electron/updater'
 import { ensureNvpairOnPath } from '@/electron/nvpair-command'
@@ -222,14 +221,7 @@ if (!gotTheLock || exitRequested) {
         // Cancel any pending demo submissions before we start tearing down.
         // Requests already in flight are reaped by destroyInferenceDemoSync on exit.
         stopInferenceDemo()
-        leaveClusterBeforeShutdown()
-            .catch(() => {
-                log.warn({
-                    sublevel: 'lifecycle',
-                    message: 'Could not announce cluster departure before app shutdown'
-                })
-            })
-            .then(() => destroyConnector())
+        shutdownConnector()
             .catch(() => {})
             .finally(() => {
                 log.info({ sublevel: 'lifecycle', message: 'App shut down' })
@@ -243,14 +235,7 @@ if (!gotTheLock || exitRequested) {
             log.info({ sublevel: 'lifecycle', message: `Received ${signal}` })
             destroyTray()
             stopInferenceDemo()
-            leaveClusterBeforeShutdown()
-                .catch(() => {
-                    log.warn({
-                        sublevel: 'lifecycle',
-                        message: 'Could not announce cluster departure before app shutdown'
-                    })
-                })
-                .then(() => destroyConnector())
+            shutdownConnector()
                 .catch(() => {})
                 .finally(() => {
                     log.info({ sublevel: 'lifecycle', message: 'App shut down' })

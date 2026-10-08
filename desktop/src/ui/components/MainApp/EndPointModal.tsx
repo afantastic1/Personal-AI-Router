@@ -28,7 +28,7 @@ export default function EndPointModal({
                     >
                         API endpoints
                     </DialogHeader>
-                    <EndpointContent selfId={selfId} />
+                    <EndpointContent />
                 </ModalContent>
             </ModalDialog>
         </ModalRoot>

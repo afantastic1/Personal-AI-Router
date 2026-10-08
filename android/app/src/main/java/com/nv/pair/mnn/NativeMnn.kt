@@ -9,9 +9,15 @@ import java.io.File
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-class NativeMnn private constructor(
+internal interface NativeSessionCleanup {
+    fun unloadModel(handle: Long): Int
+    fun destroySession(handle: Long)
+}
+
+class NativeMnn internal constructor(
     private var nativeHandle: Long,
-    private val initializationError: MnnError?
+    private val initializationError: MnnError?,
+    private val cleanupApi: NativeSessionCleanup? = null,
 ) : MnnRuntime {
     private val lock = ReentrantLock(true)
     private val requestFinished = lock.newCondition()
@@ -218,8 +224,8 @@ class NativeMnn private constructor(
             state = when {
                 closed -> MnnEngineState.UNLOADED
                 activeRequestId != null -> MnnEngineState.GENERATING
-                loadedModel != null -> MnnEngineState.READY
                 lastError != null -> MnnEngineState.ERROR
+                loadedModel != null -> MnnEngineState.READY
                 else -> MnnEngineState.UNLOADED
             },
             backend = loadedModel?.backend,
@@ -244,14 +250,53 @@ class NativeMnn private constructor(
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
-                return
+                unloadRequested = false
+                val message = "MNN close was interrupted while waiting for generation to finish."
+                lastError = MnnError(MnnErrorCode.INTERNAL_ERROR, message)
+                throw IllegalStateException(message)
             }
             if (nativeHandle != 0L && initializationError == null) {
-                runCatching { nativeUnloadModel(nativeHandle) }
-                runCatching { nativeDestroySession(nativeHandle) }
+                val handle = nativeHandle
+                val unloadCode = try {
+                    cleanupApi?.unloadModel(handle) ?: nativeUnloadModel(handle)
+                } catch (failure: Exception) {
+                    unloadRequested = false
+                    lastError = MnnError(MnnErrorCode.MODEL_LOAD_FAILED, "MNN could not unload the model during close.")
+                    throw IllegalStateException(lastError?.message, failure)
+                } catch (failure: UnsatisfiedLinkError) {
+                    unloadRequested = false
+                    lastError = MnnError(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, "MNN native cleanup is unavailable.")
+                    throw IllegalStateException(lastError?.message, failure)
+                }
+                if (unloadCode != NATIVE_SUCCESS) {
+                    unloadRequested = false
+                    val error = if (unloadCode == NATIVE_ERROR_UNAVAILABLE) {
+                        MnnError(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, "MNN native cleanup is unavailable.")
+                    } else {
+                        MnnError(MnnErrorCode.MODEL_LOAD_FAILED, "MNN could not unload the model cleanly during close.")
+                    }
+                    val message = error.message
+                    lastError = error
+                    throw IllegalStateException(message)
+                }
+                loadedModel = null
+                metrics = MnnRuntimeMetrics()
+                try {
+                    cleanupApi?.destroySession(handle) ?: nativeDestroySession(handle)
+                } catch (failure: Exception) {
+                    unloadRequested = false
+                    lastError = MnnError(MnnErrorCode.INTERNAL_ERROR, "MNN session could not be destroyed during close.")
+                    throw IllegalStateException(lastError?.message, failure)
+                } catch (failure: UnsatisfiedLinkError) {
+                    unloadRequested = false
+                    lastError = MnnError(MnnErrorCode.NATIVE_LIBRARY_UNAVAILABLE, "MNN native cleanup is unavailable.")
+                    throw IllegalStateException(lastError?.message, failure)
+                }
                 nativeHandle = 0L
             }
             loadedModel = null
+            lastError = null
+            unloadRequested = false
             closed = true
         }
     }

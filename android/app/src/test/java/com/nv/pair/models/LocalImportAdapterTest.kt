@@ -86,7 +86,29 @@ class LocalImportAdapterTest {
 
             assertTrue("the import coroutine should observe cancellation", importJob.isCancelled)
             assertTrue("cancelled imports must not become installed", File(root, "cancelled-model").exists().not())
-            assertTrue("cancelled imports must remove staging", File(root, ".cancelled-model.importing").exists().not())
+            assertTrue(
+                "cancelled imports must remove their unique staging directory",
+                root.listFiles().orEmpty().none { it.name.startsWith(".cancelled-model.importing-") },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun importRemovesOnlyOldOrphanedStagingDirectories() = runBlocking {
+        val root = Files.createTempDirectory("pair-model-import-orphans").toFile()
+        val stale = File(root, ".safe-model.importing-crashed")
+        val unrelated = File(root, ".other-model.importing-crashed")
+        try {
+            assertTrue(stale.mkdir())
+            assertTrue(unrelated.mkdir())
+            assertTrue(stale.setLastModified(System.currentTimeMillis() - 2L * 24L * 60L * 60L * 1000L))
+
+            LocalImportAdapter(root).importMnnModel("safe-model", validModelFiles())
+
+            assertTrue("a crashed import orphan should be removed", stale.exists().not())
+            assertTrue("another model's staging must remain untouched", unrelated.isDirectory)
         } finally {
             root.deleteRecursively()
         }

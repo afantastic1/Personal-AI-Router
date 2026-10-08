@@ -22,6 +22,8 @@ class OpenAiRequestException(
     val statusCode: Int,
     val code: String,
     message: String,
+    val fieldPath: String? = null,
+    val fieldKind: String? = null,
 ) : Exception(message)
 
 object OpenAiRequestParser {
@@ -34,18 +36,18 @@ object OpenAiRequestParser {
     fun parse(body: JSONObject): OpenAiChatCompletionRequest {
         body.keys().forEach { key ->
             if (key in unsupportedFields || key !in supportedFields) {
-                throw badRequest("unsupported_parameter", "The '$key' parameter is not supported.")
+                throw badRequest("unsupported_parameter", "The '$key' parameter is not supported.", key)
             }
         }
-        val modelId = requiredString(body, "model")
+        val modelId = requiredString(body, "model", "model")
         val messages = parseMessages(body.optJSONArray("messages"))
         val stream = optionalBoolean(body, "stream", false)
         val includeUsage = if (body.has("stream_options")) {
             val options = body.optJSONObject("stream_options")
-                ?: throw badRequest("invalid_request_error", "'stream_options' must be an object.")
+                ?: throw badRequest("invalid_request_error", "'stream_options' must be an object.", "stream_options")
             options.keys().forEach { key ->
                 if (key != "include_usage") {
-                    throw badRequest("unsupported_parameter", "The 'stream_options.$key' parameter is not supported.")
+                    throw badRequest("unsupported_parameter", "The 'stream_options.$key' parameter is not supported.", "stream_options.$key")
                 }
             }
             optionalBoolean(options, "include_usage", false)
@@ -61,6 +63,7 @@ object OpenAiRequestParser {
             is com.nv.pair.mnn.MnnResult.Failure -> throw badRequest(
                 "invalid_request_error",
                 validation.error.message,
+                "messages",
             )
             is com.nv.pair.mnn.MnnResult.Success -> Unit
         }
@@ -69,31 +72,80 @@ object OpenAiRequestParser {
 
     private fun parseMessages(messages: JSONArray?): List<MnnChatMessage> {
         if (messages == null || messages.length() == 0) {
-            throw badRequest("invalid_request_error", "'messages' must be a non-empty array.")
+            throw badRequest("invalid_request_error", "'messages' must be a non-empty array.", "messages")
         }
-        return (0 until messages.length()).map { index ->
+        return (0 until messages.length()).mapNotNull { index ->
             val message = try {
                 messages.getJSONObject(index)
             } catch (_: JSONException) {
-                throw badRequest("invalid_request_error", "Each message must be an object with role and content.")
+                throw badRequest("invalid_request_error", "Each message must be an object with role and content.", "messages[$index]")
             }
             message.keys().forEach { key ->
                 if (key != "role" && key != "content") {
-                    throw badRequest("unsupported_parameter", "The message '$key' field is not supported.")
+                throw badRequest("unsupported_parameter", "The message '$key' field is not supported.", "messages[$index].$key")
                 }
             }
-            val roleName = requiredString(message, "role")
+            val roleName = requiredString(message, "role", "messages[$index].role")
             val role = MnnChatRole.entries.firstOrNull { it.wireName == roleName }
-                ?: throw badRequest("invalid_request_error", "Message role '$roleName' is not supported.")
-            val content = requiredString(message, "content")
-            MnnChatMessage(role, content)
+                ?: throw badRequest("invalid_request_error", "Message role '$roleName' is not supported.", "messages[$index].role")
+            val content = parseMessageContent(message.opt("content"), index, role == MnnChatRole.ASSISTANT)
+            if (role == MnnChatRole.ASSISTANT && content.isBlank()) null else MnnChatMessage(role, content)
         }
     }
 
-    private fun requiredString(body: JSONObject, field: String): String {
+    private fun parseMessageContent(value: Any?, messageIndex: Int, allowEmpty: Boolean): String {
+        val fieldPath = "messages[$messageIndex].content"
+        return when (value) {
+            is String -> {
+                if (value.isBlank() && !allowEmpty) {
+                    throw badRequest("invalid_request_error", "'content' must be a non-empty string.", fieldPath)
+                }
+                value
+            }
+            is JSONArray -> parseTextContentParts(value, fieldPath, allowEmpty)
+            else -> throw badRequest(
+                "invalid_request_error",
+                "'content' must be text or an array of text parts.",
+                fieldPath,
+                jsonKind(value),
+            )
+        }
+    }
+
+    private fun jsonKind(value: Any?): String = when (value) {
+        null, JSONObject.NULL -> "null"
+        is JSONObject -> "object"
+        is JSONArray -> "array"
+        is String -> "string"
+        is Number -> "number"
+        is Boolean -> "boolean"
+        else -> "other"
+    }
+
+    private fun parseTextContentParts(parts: JSONArray, fieldPath: String, allowEmpty: Boolean): String {
+        val textParts = (0 until parts.length()).map { index ->
+            val partPath = "$fieldPath[$index]"
+            val part = parts.optJSONObject(index)
+                ?: throw badRequest("invalid_request_error", "Each content part must be an object.", partPath)
+            if (part.optString("type") != "text") {
+                throw badRequest("unsupported_parameter", "Only text content parts are supported.", partPath)
+            }
+            val text = part.opt("text")
+            if (text !is String) {
+                throw badRequest("invalid_request_error", "Text content parts must contain a string 'text' field.", "$partPath.text")
+            }
+            text
+        }.filter(String::isNotBlank)
+        if (textParts.isEmpty() && !allowEmpty) {
+            throw badRequest("invalid_request_error", "'content' must contain non-empty text.", fieldPath)
+        }
+        return textParts.joinToString("\n")
+    }
+
+    private fun requiredString(body: JSONObject, field: String, fieldPath: String): String {
         val value = body.opt(field)
         if (value !is String || value.isBlank()) {
-            throw badRequest("invalid_request_error", "'$field' must be a non-empty string.")
+            throw badRequest("invalid_request_error", "'$field' must be a non-empty string.", fieldPath)
         }
         return value
     }
@@ -102,7 +154,7 @@ object OpenAiRequestParser {
         if (!body.has(field)) return default
         return when (val value = body.opt(field)) {
             is Boolean -> value
-            else -> throw badRequest("invalid_request_error", "'$field' must be a boolean.")
+            else -> throw badRequest("invalid_request_error", "'$field' must be a boolean.", field)
         }
     }
 
@@ -110,11 +162,11 @@ object OpenAiRequestParser {
         if (!body.has(field)) return default
         val number = when (val value = body.opt(field)) {
             is Number -> value
-            else -> throw badRequest("invalid_request_error", "'$field' must be an integer.")
+            else -> throw badRequest("invalid_request_error", "'$field' must be an integer.", field)
         }
         val value = number.toDouble()
         if (!value.isFinite() || value % 1.0 != 0.0 || value < Int.MIN_VALUE || value > Int.MAX_VALUE) {
-            throw badRequest("invalid_request_error", "'$field' must be an integer.")
+            throw badRequest("invalid_request_error", "'$field' must be an integer.", field)
         }
         return value.toInt()
     }
@@ -123,14 +175,19 @@ object OpenAiRequestParser {
         if (!body.has(field)) return default
         val number = when (val value = body.opt(field)) {
             is Number -> value
-            else -> throw badRequest("invalid_request_error", "'$field' must be a number.")
+            else -> throw badRequest("invalid_request_error", "'$field' must be a number.", field)
         }
         val value = number.toDouble()
-        if (!value.isFinite()) throw badRequest("invalid_request_error", "'$field' must be finite.")
+        if (!value.isFinite()) throw badRequest("invalid_request_error", "'$field' must be finite.", field)
         return value
     }
 
-    private fun badRequest(code: String, message: String) = OpenAiRequestException(400, code, message)
+    private fun badRequest(
+        code: String,
+        message: String,
+        fieldPath: String? = null,
+        fieldKind: String? = null,
+    ) = OpenAiRequestException(400, code, message, fieldPath, fieldKind)
 
     private const val DEFAULT_MAX_TOKENS = 128
     private const val DEFAULT_TEMPERATURE = 0.7

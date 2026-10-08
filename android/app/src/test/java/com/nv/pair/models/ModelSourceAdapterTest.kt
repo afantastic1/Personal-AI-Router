@@ -176,6 +176,16 @@ class ModelSourceAdapterTest {
     }
 
     @Test
+    fun modelScopeSearchPageRejectsPageSizesAboveTheProviderLimit() {
+        val error = runCatching {
+            ModelScopeAdapter("https://modelscope.test", transport = ModelHubHttpTransport { _, _ -> "{}" })
+                .searchPage("Qwen", page = 1, pageSize = 51)
+        }.exceptionOrNull()
+
+        assertTrue("ModelScope page sizes above 50 must be rejected", error is IllegalArgumentException)
+    }
+
+    @Test
     fun huggingFaceSearchPageFollowsTheNextLinkHeader() {
         val requests = mutableListOf<String>()
         val transport = object : ModelHubHttpTransport {

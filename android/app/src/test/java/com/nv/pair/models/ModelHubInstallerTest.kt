@@ -20,20 +20,40 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ModelHubInstallerTest {
+    private companion object {
+        const val INSTALLED_MODEL_ID = "Qwen3-0.6B-MNN-53d1cbe871c27025"
+    }
+    @Test
+    fun storageIdsRemainDistinctForRepositoriesWithTheSameModelName() {
+        val first = catalogDescriptor(mnnArtifacts())
+        val second = first.copy(
+            logicalId = "hugging_face:another-owner/Qwen3-0.6B-MNN",
+            engineModelId = "another-owner/Qwen3-0.6B-MNN",
+            source = first.source.copy(repository = "another-owner/Qwen3-0.6B-MNN"),
+        )
+
+        val firstInstalledId = ModelHubInstaller.installedModelIdFor(first)
+        val secondInstalledId = ModelHubInstaller.installedModelIdFor(second)
+
+        assertTrue(firstInstalledId != secondInstalledId)
+        assertTrue(firstInstalledId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")))
+        assertTrue(secondInstalledId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")))
+    }
+
     @Test
     fun installRecoversWhenOnlyTheInitialTaskManifestTemporaryFileRemains() {
         val artifacts = mnnArtifacts()
         val server = ArtifactServer(artifacts)
         val root = Files.createTempDirectory("pair-model-manifest-recovery").toFile()
-        val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+        val staging = root.resolve(".$INSTALLED_MODEL_ID.downloading")
         assertTrue(staging.mkdir())
         staging.resolve(".pair-download.json.tmp").writeText("incomplete")
         try {
             val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                 .installMnnModel(catalogDescriptor(artifacts), localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
+            assertEquals(INSTALLED_MODEL_ID, installed.engineModelId)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/.pair-model.json").isFile)
         } finally {
             server.close()
             root.deleteRecursively()
@@ -60,7 +80,7 @@ class ModelHubInstallerTest {
             }.exceptionOrNull()
 
             assertTrue(firstFailure is InterruptedIOException)
-            val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+            val staging = root.resolve(".$INSTALLED_MODEL_ID.downloading")
             val partialWeight = staging.resolve("llm.mnn.weight.part")
             assertTrue(staging.isDirectory)
             assertTrue(partialWeight.length() in 1 until artifacts.getValue("llm.mnn.weight").size.toLong())
@@ -68,8 +88,8 @@ class ModelHubInstallerTest {
             val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                 .installMnnModel(descriptor, localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
-            assertTrue(artifacts.getValue("llm.mnn.weight").contentEquals(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").readBytes()))
+            assertEquals(INSTALLED_MODEL_ID, installed.engineModelId)
+            assertTrue(artifacts.getValue("llm.mnn.weight").contentEquals(root.resolve("$INSTALLED_MODEL_ID/llm.mnn.weight").readBytes()))
             assertEquals(
                 "unexpected resume request sequence",
                 listOf(null, null, null, null, "bytes=$interruptedAtBytes-", null),
@@ -91,12 +111,37 @@ class ModelHubInstallerTest {
             val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                 .installMnnModel(descriptor, localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
+            assertEquals(INSTALLED_MODEL_ID, installed.engineModelId)
             assertEquals(ModelSourceKind.LOCAL, installed.source.kind)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/config.json").isFile)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").isFile)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
-            assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").exists().not())
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/config.json").isFile)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/llm.mnn.weight").isFile)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/.pair-model.json").isFile)
+            assertTrue(root.resolve(".$INSTALLED_MODEL_ID.downloading").exists().not())
+        } finally {
+            server.close()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun existingLegacyModelDirectoryRemainsUsableWithoutAutomaticRename() {
+        val artifacts = mnnArtifacts()
+        val server = ArtifactServer(artifacts)
+        val root = Files.createTempDirectory("pair-model-legacy-id").toFile()
+        val descriptor = catalogDescriptor(artifacts)
+        val legacyModelId = descriptor.engineModelId.substringAfterLast('/')
+        try {
+            ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+                .installMnnModel(descriptor, localHttpAdapter(server.port))
+            Files.move(root.resolve(INSTALLED_MODEL_ID).toPath(), root.resolve(legacyModelId).toPath())
+
+            val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
+                .installMnnModel(descriptor, localHttpAdapter(server.port))
+
+            assertEquals(legacyModelId, installed.engineModelId)
+            assertTrue(root.resolve(legacyModelId).isDirectory)
+            assertTrue(root.resolve(INSTALLED_MODEL_ID).exists().not())
+            assertEquals("legacy recovery must not redownload artifacts", 5, server.requestedPaths.size)
         } finally {
             server.close()
             root.deleteRecursively()
@@ -112,14 +157,14 @@ class ModelHubInstallerTest {
         try {
             val installer = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
             installer.installMnnModel(descriptor, localHttpAdapter(server.port))
-            writeDownloadTask(root.resolve("Qwen3-0.6B-MNN"), descriptor, "PUBLISHING")
+            writeDownloadTask(root.resolve(INSTALLED_MODEL_ID), descriptor, "PUBLISHING")
 
             val retried = installer.installMnnModel(descriptor, localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", retried.engineModelId)
+            assertEquals(INSTALLED_MODEL_ID, retried.engineModelId)
             assertEquals(5, server.requestedPaths.size)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-download.json").exists().not())
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/.pair-model.json").isFile)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/.pair-download.json").exists().not())
         } finally {
             server.close()
             root.deleteRecursively()
@@ -153,7 +198,7 @@ class ModelHubInstallerTest {
             }.exceptionOrNull()
 
             assertTrue("a receipt must not override the provider's expected size", failure is java.io.IOException)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN").exists().not())
+            assertTrue(root.resolve(INSTALLED_MODEL_ID).exists().not())
             assertEquals(6, server.requestedPaths.size)
         } finally {
             server.close()
@@ -167,7 +212,7 @@ class ModelHubInstallerTest {
         val server = ArtifactServer(artifacts)
         val root = Files.createTempDirectory("pair-model-verified-stage").toFile()
         val descriptor = catalogDescriptor(artifacts)
-        val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+        val staging = root.resolve(".$INSTALLED_MODEL_ID.downloading")
         try {
             assertTrue(staging.mkdir())
             artifacts.forEach { (path, content) -> staging.resolve(path).writeBytes(content) }
@@ -177,9 +222,9 @@ class ModelHubInstallerTest {
             val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                 .installMnnModel(descriptor, localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/llm.mnn.weight").isFile)
-            assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").exists().not())
+            assertEquals(INSTALLED_MODEL_ID, installed.engineModelId)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/llm.mnn.weight").isFile)
+            assertTrue(root.resolve(".$INSTALLED_MODEL_ID.downloading").exists().not())
             assertTrue("verified recovery must not fetch artifacts", server.requestedPaths.isEmpty())
         } finally {
             server.close()
@@ -193,7 +238,7 @@ class ModelHubInstallerTest {
         val server = ArtifactServer(artifacts)
         val root = Files.createTempDirectory("pair-model-legacy-stage").toFile()
         val descriptor = catalogDescriptor(artifacts)
-        val staging = root.resolve(".Qwen3-0.6B-MNN.downloading")
+        val staging = root.resolve(".$INSTALLED_MODEL_ID.downloading")
         try {
             assertTrue(staging.mkdir())
             artifacts.forEach { (path, content) -> staging.resolve(path).writeBytes(content) }
@@ -202,8 +247,8 @@ class ModelHubInstallerTest {
             val installed = ModelHubInstaller(root, ResumableModelDownloader(allowLoopbackHttpForTests = true))
                 .installMnnModel(descriptor, localHttpAdapter(server.port))
 
-            assertEquals("Qwen3-0.6B-MNN", installed.engineModelId)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").isFile)
+            assertEquals(INSTALLED_MODEL_ID, installed.engineModelId)
+            assertTrue(root.resolve("$INSTALLED_MODEL_ID/.pair-model.json").isFile)
             assertTrue(server.requestedPaths.isEmpty())
         } finally {
             server.close()
@@ -225,8 +270,8 @@ class ModelHubInstallerTest {
             }.exceptionOrNull()
 
             assertTrue(failure is java.io.IOException)
-            assertTrue(root.resolve("Qwen3-0.6B-MNN").exists().not())
-            assertTrue(root.resolve(".Qwen3-0.6B-MNN.downloading").isDirectory)
+            assertTrue(root.resolve(INSTALLED_MODEL_ID).exists().not())
+            assertTrue(root.resolve(".$INSTALLED_MODEL_ID.downloading").isDirectory)
         } finally {
             server.close()
             root.deleteRecursively()
@@ -250,7 +295,7 @@ class ModelHubInstallerTest {
             assertTrue(root.listFiles().orEmpty().isEmpty())
 
             installer.installMnnModel(descriptor, localHttpAdapter(server.port), allowUnverifiedSource = true)
-            val manifest = org.json.JSONObject(root.resolve("Qwen3-0.6B-MNN/.pair-model.json").readText())
+            val manifest = org.json.JSONObject(root.resolve("$INSTALLED_MODEL_ID/.pair-model.json").readText())
             assertEquals("UNVERIFIED_SOURCE_DIGEST", manifest.getString("digestStatus"))
             assertEquals(5, server.requestedPaths.size)
         } finally {
@@ -319,7 +364,7 @@ class ModelHubInstallerTest {
             .put("provider", descriptor.source.kind.name)
             .put("repository", descriptor.source.repository)
             .put("revision", descriptor.source.revision)
-            .put("modelId", "Qwen3-0.6B-MNN")
+            .put("modelId", INSTALLED_MODEL_ID)
             .put("phase", phase)
             .put("requiredArtifactPaths", org.json.JSONArray(descriptor.requiredArtifactPaths))
             .put("sourceSha256ByPath", sourceHashes)

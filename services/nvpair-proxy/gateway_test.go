@@ -13,6 +13,33 @@ import (
 	"testing"
 )
 
+func TestGatewayRequestCapabilitiesInspectStructuredImageParts(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "image content part", body: `{"messages":[{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`, want: true},
+		{name: "ordinary text mentioning image", body: `{"messages":[{"content":"describe the image field in this JSON"}]}`},
+		{name: "unrelated object field", body: `{"messages":[{"content":[{"type":"text","text":"image"}]}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := requiredGatewayCapabilities([]byte(test.body))["vision"]
+			if got != test.want {
+				t.Fatalf("vision requirement = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGatewayModelCapabilitiesDoNotInferFromNames(t *testing.T) {
+	capabilities := modelCapabilities()
+	if !capabilities["chat"] || capabilities["vision"] || capabilities["tools"] || capabilities["embeddings"] {
+		t.Errorf("capabilities for unknown models = %v, want chat only", capabilities)
+	}
+}
+
 func TestGatewayModelDirectoryUnionsEngineInventoriesWithoutNodeDetails(t *testing.T) {
 	ollama, _ := profileFor("ollama")
 	lmstudio, _ := profileFor("lmstudio")
@@ -266,5 +293,19 @@ func TestGatewayMissingModelReturnsOpenAIInvalidRequestError(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "invalid_request_error") {
 		t.Errorf("body = %s", response.Body.String())
+	}
+}
+
+func TestGatewayRejectsOversizedRequestBody(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"http://127.0.0.1:14326/v1/chat/completions",
+		strings.NewReader(strings.Repeat("x", (64<<20)+1)),
+	)
+	response := httptest.NewRecorder()
+	NewProxy(NewCodec(rwNop{})).serveGateway(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("gateway status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
 	}
 }

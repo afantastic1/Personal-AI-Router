@@ -65,8 +65,8 @@ export function BackendHeader({
             return ''
         }
 
-        return gatewayEndpointDisplayUrl(backend.proxyPort, backend.type)
-    }, [backend.proxyPort, backend.type])
+        return gatewayEndpointDisplayUrl()
+    }, [backend.proxyPort])
 
     const handleCopy = useCallback(() => {
         if (!proxyUrl) {

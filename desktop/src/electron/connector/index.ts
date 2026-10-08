@@ -189,6 +189,11 @@ export const destroyConnector = async (options?: { force?: boolean }): Promise<v
     log.info({ sublevel: 'lifecycle', message: 'Connector destroyed' })
 }
 
+/** Stop the app-owned service processes while preserving cluster membership. */
+export const shutdownConnector = async (): Promise<void> => {
+    await destroyConnector()
+}
+
 export const destroyConnectorSync = (): void => {
     setStatus('disconnected')
 
@@ -198,10 +203,4 @@ export const destroyConnectorSync = (): void => {
     }
 
     weSpawned = false
-}
-
-/** Announce cluster departure for an intentional app quit, not a service restart. */
-export const leaveClusterBeforeShutdown = async (): Promise<void> => {
-    if (!weSpawned) return
-    await getModularSupervisor().callProcess('broker', 'cluster:leave')
 }

@@ -44,6 +44,58 @@ class OpenAiRequestParserTest {
     }
 
     @Test
+    fun parsesTextContentPartsUsedByOpenAiCompatibleClients() {
+        val request = OpenAiRequestParser.parse(
+            JSONObject(
+                """{"model":"qwen3-0.6b","messages":[{"role":"user","content":[{"type":"text","text":"Attached notes"},{"type":"text","text":"Follow-up"}]}]}""",
+            ),
+        )
+
+        assertEquals("Attached notes\nFollow-up", request.chat.messages.single().content)
+    }
+
+    @Test
+    fun skipsEmptyAssistantMessagesFromConversationHistory() {
+        val request = OpenAiRequestParser.parse(
+            JSONObject(
+                """{"model":"qwen3-0.6b","messages":[{"role":"assistant","content":""},{"role":"user","content":"Continue"}]}""",
+            ),
+        )
+
+        assertEquals(1, request.chat.messages.size)
+        assertEquals(MnnChatRole.USER, request.chat.messages.single().role)
+        assertEquals("Continue", request.chat.messages.single().content)
+    }
+
+    @Test
+    fun rejectsUnsupportedMultimodalContentWithItsFieldPath() {
+        val failure = runCatching {
+            OpenAiRequestParser.parse(
+                JSONObject(
+                    """{"model":"qwen3-0.6b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}""",
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is OpenAiRequestException)
+        assertEquals("messages[0].content[0]", (failure as OpenAiRequestException).fieldPath)
+    }
+
+    @Test
+    fun reportsOnlyTheJsonKindForInvalidContentDiagnostics() {
+        val failure = runCatching {
+            OpenAiRequestParser.parse(
+                JSONObject("""{"model":"m","messages":[{"role":"assistant","content":null}]}"""),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is OpenAiRequestException)
+        val requestFailure = failure as OpenAiRequestException
+        assertEquals("messages[0].content", requestFailure.fieldPath)
+        assertEquals("null", requestFailure.fieldKind)
+    }
+
+    @Test
     fun defaultsToNonStreamingWithRuntimeSamplingDefaults() {
         val request = OpenAiRequestParser.parse(
             JSONObject("""{"model":"qwen3-0.6b","messages":[{"role":"user","content":"Hello."}]}"""),
@@ -71,6 +123,18 @@ class OpenAiRequestParserTest {
             }
             assertEquals(400, statusCode)
         }
+    }
+
+    @Test
+    fun reportsTheUnsupportedFieldPathForRequestDiagnostics() {
+        val failure = runCatching {
+            OpenAiRequestParser.parse(
+                JSONObject("""{"model":"m","messages":[{"role":"user","content":"x"}],"unknown_option":true}"""),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is OpenAiRequestException)
+        assertEquals("unknown_option", (failure as OpenAiRequestException).fieldPath)
     }
 
     @Test

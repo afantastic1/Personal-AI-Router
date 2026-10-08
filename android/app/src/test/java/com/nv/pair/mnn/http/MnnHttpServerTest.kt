@@ -28,9 +28,11 @@ import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -247,6 +249,101 @@ class MnnHttpServerTest {
     }
 
     @Test
+    fun healthRemainsAvailableWhileClientsHoldRequestHeadersOpen() {
+        val server = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        server.start()
+        val slowClients = List(4) {
+            Socket("127.0.0.1", server.localPort).apply {
+                getOutputStream().write("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n".toByteArray(StandardCharsets.US_ASCII))
+            }
+        }
+        try {
+            val health = http(server.localPort, "GET", "/healthz")
+
+            assertTrue("health request was not served: $health", health.startsWith("HTTP/1.1 200"))
+        } finally {
+            slowClients.forEach(Socket::close)
+            server.close()
+        }
+    }
+
+    @Test
+    fun rejectsNewConnectionsWithServiceUnavailableWhenRequestCapacityIsFull() {
+        val server = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        server.start()
+        val slowClients = List(24) {
+            Socket("127.0.0.1", server.localPort).apply {
+                getOutputStream().write("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n".toByteArray(StandardCharsets.US_ASCII))
+            }
+        }
+        try {
+            val rejected = rawHttp(
+                server.localPort,
+                "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+
+            assertTrue("server did not report bounded-pool overload: $rejected", rejected.startsWith("HTTP/1.1 503"))
+            assertTrue(rejected.contains("\"code\":\"server_busy\""))
+        } finally {
+            slowClients.forEach(Socket::close)
+            server.close()
+        }
+    }
+
+    @Test
+    fun malformedOrAmbiguousContentLengthIsRejected() {
+        val server = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        server.start()
+        try {
+            val requests = listOf(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: nope\r\n\r\n{}",
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: +2\r\n\r\n{}",
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nContent-Length: 0\r\n\r\n{}",
+            )
+
+            requests.forEach { request ->
+                val response = rawHttp(server.localPort, request)
+                assertTrue("malformed framing was accepted: $response", response.startsWith("HTTP/1.1 400"))
+            }
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun overflowingContentLengthIsRejectedInsteadOfTreatedAsEmptyBody() {
+        val server = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        server.start()
+        try {
+            val response = rawHttp(
+                server.localPort,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 9223372036854775808\r\n\r\n",
+            )
+
+            assertTrue(response.startsWith("HTTP/1.1 400"))
+            assertTrue("overflow was not reported as invalid framing: $response", response.contains("HTTP Content-Length is invalid."))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun oversizedContentLengthReturnsPayloadTooLarge() {
+        val server = MnnHttpServer(FakeInferenceService(), TEST_PORT)
+        server.start()
+        try {
+            val response = rawHttp(
+                server.localPort,
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1048577\r\n\r\n",
+            )
+
+            assertTrue("oversized body returned unexpected response: $response", response.startsWith("HTTP/1.1 413"))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
     fun returnsConflictForSecondGenerationAndCancelsOnStreamDisconnect() {
         val service = FakeInferenceService(blockAfterFirstToken = true)
         val server = MnnHttpServer(service, TEST_PORT)
@@ -274,10 +371,100 @@ class MnnHttpServerTest {
         }
     }
 
+    @Test
+    fun healthRemainsAvailableDuringActiveGeneration() {
+        val service = FakeInferenceService(blockAfterFirstToken = true)
+        val server = MnnHttpServer(service, TEST_PORT)
+        server.start()
+        val generationClient = Socket("127.0.0.1", server.localPort)
+        generationClient.getOutputStream().write(requestBytes("POST", "/v1/chat/completions", chatBody(stream = true)))
+        val generationReader = BufferedReader(InputStreamReader(generationClient.getInputStream(), StandardCharsets.UTF_8))
+        try {
+            assertTrue(generationReader.readLine().orEmpty().contains("200"))
+            assertTrue("generation did not start", service.firstToken.await(2, TimeUnit.SECONDS))
+
+            val health = http(server.localPort, "GET", "/healthz")
+
+            assertTrue("health request was not served during generation: $health", health.startsWith("HTTP/1.1 200"))
+        } finally {
+            generationClient.close()
+            service.releaseGeneration.countDown()
+            server.close()
+        }
+    }
+
+    @Test
+    fun healthRemainsAvailableWhenAllInferenceWorkersAreOccupied() {
+        val service = FakeInferenceService(blockedGenerationCount = 4)
+        val server = MnnHttpServer(service, TEST_PORT)
+        server.start()
+        val generationClients = List(4) {
+            Thread {
+                runCatching {
+                    http(server.localPort, "POST", "/v1/chat/completions", chatBody(stream = false))
+                }
+            }.apply { start() }
+        }
+        try {
+            assertTrue("all inference workers did not start", service.generationsStarted.await(2, TimeUnit.SECONDS))
+
+            val health = http(server.localPort, "GET", "/healthz")
+
+            assertTrue("health request was not served while inference workers were occupied: $health", health.startsWith("HTTP/1.1 200"))
+        } finally {
+            service.releaseGeneration.countDown()
+            generationClients.forEach { it.join(2_000) }
+            server.close()
+        }
+    }
+
+    @Test
+    fun closeCanBeRetriedAfterAnInterruptedCleanupWaitAndPreventsRestart() {
+        val service = FakeInferenceService(blockedGenerationCount = 1)
+        val server = MnnHttpServer(service, TEST_PORT)
+        server.start()
+        val generationClient = Thread {
+            runCatching {
+                http(server.localPort, "POST", "/v1/chat/completions", chatBody(stream = false))
+            }
+        }.apply { start() }
+        try {
+            assertTrue("generation did not start", service.generationsStarted.await(2, TimeUnit.SECONDS))
+            Thread.currentThread().interrupt()
+            val firstCloseFailure = runCatching(server::close).exceptionOrNull()
+            assertNotNull("an interrupted close must report incomplete cleanup", firstCloseFailure)
+            assertTrue("close must preserve the interrupted status", Thread.currentThread().isInterrupted)
+
+            service.releaseGeneration.countDown()
+            generationClient.join(2_000)
+            server.close()
+            assertTrue("retry must restore the interrupted status", Thread.currentThread().isInterrupted)
+
+            try {
+                server.start()
+                throw AssertionError("a closed HTTP server must not restart")
+            } catch (_: IllegalStateException) {
+                // close is terminal even if its first cleanup pass was interrupted.
+            }
+        } finally {
+            Thread.interrupted()
+            service.releaseGeneration.countDown()
+            generationClient.join(2_000)
+            server.close()
+        }
+    }
+
     private fun http(port: Int, method: String, path: String, body: String = ""): String =
         Socket("127.0.0.1", port).use { socket ->
             socket.soTimeout = 5_000
             socket.getOutputStream().write(requestBytes(method, path, body))
+            socket.getInputStream().readBytes().toString(StandardCharsets.UTF_8)
+        }
+
+    private fun rawHttp(port: Int, request: String): String =
+        Socket("127.0.0.1", port).use { socket ->
+            socket.soTimeout = 5_000
+            socket.getOutputStream().write(request.toByteArray(StandardCharsets.US_ASCII))
             socket.getInputStream().readBytes().toString(StandardCharsets.UTF_8)
         }
 
@@ -292,6 +479,7 @@ class MnnHttpServerTest {
 
     private class FakeInferenceService(
         private val blockAfterFirstToken: Boolean = false,
+        blockedGenerationCount: Int = 0,
         private val available: Boolean = true,
         private val supportsOpenCl: Boolean = true,
         private val generationError: MnnErrorCode? = null,
@@ -301,6 +489,8 @@ class MnnHttpServerTest {
         val firstToken = CountDownLatch(1)
         val releaseGeneration = CountDownLatch(1)
         val cancelled = CountDownLatch(1)
+        val generationsStarted = CountDownLatch(blockedGenerationCount)
+        private val remainingBlockedGenerations = AtomicInteger(blockedGenerationCount)
         @Volatile var lastRequest: MnnChatRequest? = null
             private set
         @Volatile private var loaded = false
@@ -342,6 +532,10 @@ class MnnHttpServerTest {
                 is MnnResult.Success -> Unit
             }
             generationError?.let { return MnnResult.failure(it, "Synthetic inference failure.") }
+            if (remainingBlockedGenerations.getAndUpdate { count -> if (count > 0) count - 1 else 0 } > 0) {
+                generationsStarted.countDown()
+                releaseGeneration.await(30, TimeUnit.SECONDS)
+            }
             onToken("Hello")
             firstToken.countDown()
             if (blockAfterFirstToken) releaseGeneration.await(5, TimeUnit.SECONDS)

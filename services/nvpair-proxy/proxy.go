@@ -68,6 +68,8 @@ type ErrorParams struct {
 // sits in the implementation-defined -32000..-32099 server range.
 const codeFacadeBindFailed = -32010
 
+const maxInferenceRequestBytes int64 = 64 << 20
+
 type NodesResult struct {
 	Nodes []Node `json:"nodes"`
 }
@@ -215,26 +217,45 @@ type workloadParams struct {
 
 // bufferBodyAndModel reads the request body once and returns the raw bytes
 // (so each failover attempt can replay it — see the loop in handleHTTP) along
-// with the JSON "model" field for workload tracking. Inference bodies are
-// small (prompt + model), so full buffering is cheap. Returns (nil, "") when
-// the body is absent and an empty model when none is parseable. The caller
-// restores r.Body from the returned bytes before each forward attempt.
-func bufferBodyAndModel(r *http.Request) ([]byte, string) {
+// with the JSON "model" field for workload tracking. Bodies are bounded
+// before buffering so failover can replay them without unbounded memory use.
+// Returns (nil, "", nil) when the body is absent and an empty model when none
+// is parseable. The caller restores r.Body from the returned bytes before each
+// forward attempt.
+func bufferBodyAndModel(w http.ResponseWriter, r *http.Request) ([]byte, string, error) {
 	if r.Body == nil {
-		return nil, ""
+		return nil, "", nil
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInferenceRequestBytes))
 	_ = r.Body.Close()
 	if err != nil {
-		return body, ""
+		return nil, "", err
 	}
 	var probe struct {
 		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return body, ""
+		return body, "", nil
 	}
-	return body, probe.Model
+	return body, probe.Model, nil
+}
+
+func writeRequestBodyError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	message := "could not read request body"
+	var limitError *http.MaxBytesError
+	if stderrors.As(err, &limitError) {
+		status = http.StatusRequestEntityTooLarge
+		message = "request body exceeds the configured size limit"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{
+			"message": message,
+			"type":    "invalid_request_error",
+		},
+	})
 }
 
 type statusCapture struct {
@@ -1164,7 +1185,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse the request's model before choosing a node. Model eligibility only
 	// applies to inference routes; control endpoints retain their existing
 	// routing behavior even when their JSON happens to contain a model field.
-	bodyBytes, model := bufferBodyAndModel(r)
+	bodyBytes, model, bodyErr := bufferBodyAndModel(w, r)
+	if bodyErr != nil {
+		writeRequestBodyError(w, bodyErr)
+		return
+	}
 	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
 	routingModel := ""
 	if isInf {

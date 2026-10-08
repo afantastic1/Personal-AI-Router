@@ -18,6 +18,11 @@ import org.json.JSONObject
 
 data class BrokerRuntimeInfo(val version: String, val uptimeMillis: Long)
 
+internal interface BrokerProcessRunner {
+    fun start(): Process
+    fun stop(process: Process, timeoutMillis: Long): Int
+}
+
 class BrokerSession(
     private val binaries: NativeBinaryRegistry,
     private val filesDir: File,
@@ -35,23 +40,36 @@ class BrokerSession(
     private val cleanup = RetryableCleanup(actionCount = 4)
     private val ready = CompletableFuture<String>()
     private var process: Process? = null
-    private var processRunner: PairProcess? = null
+    private var processRunner: BrokerProcessRunner? = null
     private var rpc: JsonRpcClient? = null
     private var stderrThread: Thread? = null
     private var monitorThread: Thread? = null
 
     @Synchronized
     fun start(): BrokerRuntimeInfo {
+        val pairProcess = PairProcess(commandArguments(), runtimeEnvironment())
+        return startWithRunner(object : BrokerProcessRunner {
+            override fun start(): Process = pairProcess.start()
+            override fun stop(process: Process, timeoutMillis: Long): Int = pairProcess.stop(process, timeoutMillis)
+        })
+    }
+
+    @Synchronized
+    internal fun startWithRunner(runner: BrokerProcessRunner): BrokerRuntimeInfo {
         check(process == null) { "broker session already started" }
-        val environment = runtimeEnvironment()
-        val runner = PairProcess(
-            commandArguments(),
-            environment,
-        )
         processRunner = runner
         val child = runner.start()
         process = child
 
+        return try {
+            finishStartup(child)
+        } catch (failure: Exception) {
+            val startupFailure = if (failure is IOException) failure else IOException("broker startup failed", failure)
+            throw closeAfterStartupFailure(startupFailure)
+        }
+    }
+
+    private fun finishStartup(child: Process): BrokerRuntimeInfo {
         val client = JsonRpcClient(
             child.inputStream,
             child.outputStream,
@@ -69,13 +87,12 @@ class BrokerSession(
         val readyVersion = try {
             ready.get(15, TimeUnit.SECONDS)
         } catch (timeout: TimeoutException) {
-            throw closeAfterStartupFailure(IOException("broker did not emit app:ready within 15 seconds", timeout))
+            throw IOException("broker did not emit app:ready within 15 seconds", timeout)
         } catch (interrupted: InterruptedException) {
-            val startupFailure = closeAfterStartupFailure(IOException("interrupted while waiting for broker app:ready", interrupted))
             Thread.currentThread().interrupt()
-            throw startupFailure
+            throw IOException("interrupted while waiting for broker app:ready", interrupted)
         } catch (failure: ExecutionException) {
-            throw closeAfterStartupFailure(IOException("broker exited before app:ready", failure.cause))
+            throw IOException("broker exited before app:ready", failure.cause)
         }
 
         try {
@@ -87,7 +104,7 @@ class BrokerSession(
             return BrokerRuntimeInfo(reportedVersion, ping.uptimeMillis)
         } catch (failure: Exception) {
             val startupFailure = if (failure is IOException) failure else IOException("broker RPC verification failed", failure)
-            throw closeAfterStartupFailure(startupFailure)
+            throw startupFailure
         }
     }
 

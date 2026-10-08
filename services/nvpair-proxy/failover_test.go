@@ -62,6 +62,18 @@ func testProxy(p engineProfile, disc *Discovery, port int) *Proxy {
 	return newTestProxy(p, NewCodec(rwNop{}), disc, port)
 }
 
+func TestProxyRejectsOversizedRequestBody(t *testing.T) {
+	profile := ollamaOnlyProfile(t)
+	proxy := newTestProxy(profile, NewCodec(rwNop{}), NewDiscovery(), profile.FacadePort)
+	request := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(strings.Repeat("x", (64<<20)+1)))
+	response := httptest.NewRecorder()
+	proxy.soleFacade().handleHTTP(response, request)
+
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("proxy status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
 // nodeFor turns an httptest server URL into a discovery Node pointing at it.
 func nodeFor(t *testing.T, id, serverURL string) Node {
 	t.Helper()

@@ -12,6 +12,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.UUID
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
@@ -35,8 +36,8 @@ class LocalImportAdapter(
         val target = File(modelRoot, modelId)
         require(target.canonicalFile.parentFile == modelRoot.canonicalFile) { "Model target must stay inside the private model root." }
         require(!target.exists()) { "A model with this ID is already installed." }
-        val staging = File(modelRoot, ".$modelId.importing")
-        if (staging.exists()) staging.deleteRecursively()
+        cleanupAbandonedStaging(modelId)
+        val staging = File(modelRoot, ".$modelId.importing-${UUID.randomUUID()}")
         if (!staging.mkdir()) throw IOException("Could not create the private import staging directory.")
 
         var operationFailure: Throwable? = null
@@ -79,6 +80,19 @@ class LocalImportAdapter(
         }
     }
 
+    private fun cleanupAbandonedStaging(modelId: String) {
+        val cutoff = System.currentTimeMillis() - ABANDONED_STAGING_AGE_MILLIS
+        val prefix = ".$modelId.importing-"
+        modelRoot.listFiles()
+            .orEmpty()
+            .filter { entry -> entry.name.startsWith(prefix) && entry.isDirectory && entry.lastModified() < cutoff }
+            .forEach { stale ->
+                if (!stale.deleteRecursively()) {
+                    throw IOException("Could not remove an abandoned model import directory.")
+                }
+            }
+    }
+
     private fun descriptorFor(target: File, modelId: String) = ModelDescriptor(
         logicalId = "local:$modelId",
         engineModelId = modelId,
@@ -95,6 +109,7 @@ class LocalImportAdapter(
 
     companion object {
         private const val COPY_BUFFER_BYTES = 64 * 1024
+        private const val ABANDONED_STAGING_AGE_MILLIS = 24L * 60L * 60L * 1000L
         private val MODEL_ID = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
         private val SAFE_FILE_NAME = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
     }

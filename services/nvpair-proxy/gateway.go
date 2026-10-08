@@ -14,11 +14,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"nvpair-shared/modelselection"
 )
 
 const gatewayAddress = "127.0.0.1:14326"
+
+const (
+	gatewayReadHeaderTimeout = 5 * time.Second
+	gatewayIdleTimeout       = 60 * time.Second
+	gatewayMaxHeaderBytes    = 32 << 10
+)
 
 var gatewayEnginePreference = []string{"mnn", "ollama", "lmstudio"}
 
@@ -83,7 +90,7 @@ func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 				candidate.Model = modelselection.ModelDescriptor{
 					LogicalID: engine + ":" + model, EngineModelID: model,
 					Family: modelFamily(model), ParameterCount: modelParameterCount(model),
-					Capabilities: modelCapabilities(model), Compatible: true,
+					Capabilities: modelCapabilities(), Compatible: true,
 				}
 				candidate.Engine = engine
 				candidate.Available = true
@@ -129,14 +136,10 @@ func modelFamily(model string) string {
 	return strings.ToLower(model)
 }
 
-func modelCapabilities(model string) map[string]bool {
-	lower := strings.ToLower(model)
-	return map[string]bool{
-		"chat":       !strings.Contains(lower, "embed"),
-		"vision":     strings.Contains(lower, "vision") || strings.Contains(lower, "llava") || strings.Contains(lower, "-vl") || strings.Contains(lower, "_vl"),
-		"tools":      strings.Contains(lower, "tool"),
-		"embeddings": strings.Contains(lower, "embed"),
-	}
+func modelCapabilities() map[string]bool {
+	// Discovery currently provides model IDs only. Do not infer optional
+	// capabilities from names; unknown models are eligible for basic chat only.
+	return map[string]bool{"chat": true}
 }
 
 func requiredGatewayCapabilities(body []byte) map[string]bool {
@@ -150,12 +153,22 @@ func requiredGatewayCapabilities(body []byte) map[string]bool {
 		return nil
 	}
 	capabilities := map[string]bool{"chat": true}
-	if len(request.Tools) > 0 && string(request.Tools) != "null" && string(request.Tools) != "[]" {
+	var tools []json.RawMessage
+	if json.Unmarshal(request.Tools, &tools) == nil && len(tools) > 0 {
 		capabilities["tools"] = true
 	}
 	for _, message := range request.Messages {
-		if strings.Contains(string(message.Content), `"image_url"`) || strings.Contains(string(message.Content), `"image"`) {
-			capabilities["vision"] = true
+		var parts []struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(message.Content, &parts) != nil {
+			continue
+		}
+		for _, part := range parts {
+			if part.Type == "image_url" || part.Type == "image" {
+				capabilities["vision"] = true
+				break
+			}
 		}
 	}
 	return capabilities
@@ -224,7 +237,12 @@ func (p *Proxy) enableGateway(port int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	server := &gatewayServer{srv: &http.Server{Handler: http.HandlerFunc(p.serveGateway)}}
+	server := &gatewayServer{srv: &http.Server{
+		Handler:           http.HandlerFunc(p.serveGateway),
+		ReadHeaderTimeout: gatewayReadHeaderTimeout,
+		IdleTimeout:       gatewayIdleTimeout,
+		MaxHeaderBytes:    gatewayMaxHeaderBytes,
+	}}
 	p.gateway = server
 	go func() { _ = server.srv.Serve(listener) }()
 	return port, nil
@@ -241,7 +259,11 @@ func (p *Proxy) serveGateway(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	body, model := bufferBodyAndModel(r)
+	body, model, bodyErr := bufferBodyAndModel(w, r)
+	if bodyErr != nil {
+		writeRequestBodyError(w, bodyErr)
+		return
+	}
 	if model == "" {
 		writeGatewayError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
 		return

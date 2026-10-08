@@ -5,6 +5,7 @@
 
 package com.nv.pair.mnn.http
 
+import android.util.Log
 import com.nv.pair.mnn.MnnBackend
 import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.mnn.MnnInferenceService
@@ -18,8 +19,12 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONException
@@ -29,18 +34,22 @@ class MnnHttpServer(
     private val inference: MnnInferenceService,
     private val port: Int = DEFAULT_PORT,
 ) : AutoCloseable {
-    private val workers = Executors.newFixedThreadPool(HTTP_WORKER_COUNT) { task ->
-        Thread(task, "pair-mnn-http").apply { isDaemon = true }
-    }
+    private val requestWorkers = boundedExecutor(HTTP_REQUEST_WORKER_COUNT, HTTP_BACKLOG, "pair-mnn-http")
+    private val inferenceWorkers = boundedExecutor(INFERENCE_WORKER_COUNT, HTTP_BACKLOG, "pair-mnn-inference-http")
+    private val healthWorkers = boundedExecutor(1, HEALTH_QUEUE_CAPACITY, "pair-mnn-health-http")
     private val nextRequestId = AtomicLong()
     private val activeRequests = ConcurrentHashMap.newKeySet<Long>()
+    private val clientSockets = ConcurrentHashMap.newKeySet<Socket>()
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var acceptThread: Thread? = null
+    @Volatile private var closeRequested = false
 
     val localPort: Int
         get() = serverSocket?.localPort ?: 0
 
+    @Synchronized
     fun start() {
+        check(!closeRequested) { "MNN HTTP server is closed." }
         check(serverSocket == null) { "MNN HTTP server is already started." }
         val socket = ServerSocket()
         socket.reuseAddress = true
@@ -52,88 +61,208 @@ class MnnHttpServer(
         }
     }
 
+    @Synchronized
     override fun close() {
-        val socket = serverSocket ?: return
+        closeRequested = true
+        val failures = mutableListOf<Throwable>()
+        var interrupted = Thread.interrupted()
+        val socket = serverSocket
         serverSocket = null
-        runCatching { socket.close() }
-        activeRequests.toList().forEach(inference::cancel)
-        workers.shutdown()
-        if (!workers.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            activeRequests.toList().forEach(inference::cancel)
-            workers.shutdownNow()
+        if (socket != null) {
+            try {
+                socket.close()
+            } catch (failure: IOException) {
+                failures.add(failure)
+            }
         }
-        acceptThread?.join(SHUTDOWN_TIMEOUT_MILLIS)
-        acceptThread = null
+        clientSockets.toList().forEach(::closeClient)
+        activeRequests.toList().forEach(inference::cancel)
+        val executors = listOf(requestWorkers, inferenceWorkers, healthWorkers)
+        executors.forEach { it.shutdown() }
+        for (executor in executors) {
+            val terminated = try {
+                executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            } catch (failure: InterruptedException) {
+                interrupted = true
+                failures.add(failure)
+                false
+            }
+            if (!terminated) {
+                activeRequests.toList().forEach(inference::cancel)
+                executor.shutdownNow()
+                failures.add(IllegalStateException("MNN HTTP worker executor did not terminate."))
+            }
+        }
+        val currentAcceptThread = acceptThread
+        if (currentAcceptThread != null) {
+            try {
+                currentAcceptThread.join(SHUTDOWN_TIMEOUT_MILLIS)
+            } catch (failure: InterruptedException) {
+                interrupted = true
+                failures.add(failure)
+            }
+            if (currentAcceptThread.isAlive) {
+                failures.add(IllegalStateException("MNN HTTP accept thread did not terminate."))
+            } else {
+                acceptThread = null
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt()
+        if (failures.isNotEmpty()) {
+            throw IllegalStateException("MNN HTTP server cleanup is incomplete; call close() again to retry.", failures.first()).apply {
+                failures.drop(1).forEach(::addSuppressed)
+            }
+        }
     }
 
     private fun acceptConnections(listener: ServerSocket) {
         while (serverSocket === listener) {
             try {
                 val client = listener.accept()
-                workers.execute { handleClient(client) }
+                clientSockets.add(client)
+                if (serverSocket !== listener) {
+                    closeClient(client)
+                    return
+                }
+                try {
+                    requestWorkers.execute { handleClient(client) }
+                } catch (_: RejectedExecutionException) {
+                    rejectClient(client)
+                }
             } catch (_: SocketException) {
                 if (serverSocket === listener) return
-            } catch (_: java.util.concurrent.RejectedExecutionException) {
-                break
             }
         }
     }
 
     private fun handleClient(socket: Socket) {
-        socket.use { client ->
-            try {
-                client.soTimeout = REQUEST_TIMEOUT_MILLIS
-                val request = readRequest(client.getInputStream())
-                route(request, client)
-            } catch (failure: HttpProtocolException) {
-                runCatching {
-                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
+        var ownershipTransferred = false
+        try {
+            socket.soTimeout = REQUEST_TIMEOUT_MILLIS
+            val request = readRequest(socket.getInputStream())
+            ownershipTransferred = route(request, socket)
+        } catch (failure: HttpProtocolException) {
+            runCatching {
+                writeJson(socket, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
+            }
+        } catch (failure: OpenAiRequestException) {
+            logRequestRejection(failure)
+            runCatching {
+                writeJson(socket, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
+            }
+        } catch (failure: IOException) {
+            // A closed client is expected during streaming cancellation.
+        } catch (failure: Exception) {
+            logInternalFailure(failure)
+            runCatching {
+                writeJson(socket, HTTP_INTERNAL_SERVER_ERROR, OpenAiResponseWriter.error("server_error", "server_error", "MNN HTTP request failed."))
+            }
+        } finally {
+            if (!ownershipTransferred) closeClient(socket)
+        }
+    }
+
+    private fun route(request: MnnHttpRequest, socket: Socket): Boolean {
+        val path = request.target.substringBefore('?')
+        return when {
+            request.method == "GET" && path == "/healthz" -> {
+                dispatch(socket, healthWorkers) {
+                    val health = inference.health()
+                    writeJson(
+                        socket,
+                        if (health.available) HTTP_OK else HTTP_SERVICE_UNAVAILABLE,
+                        OpenAiResponseWriter.health(health, inference.status().modelId != null),
+                    )
                 }
-            } catch (failure: OpenAiRequestException) {
-                runCatching {
-                    writeJson(client, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
-                }
-            } catch (failure: IOException) {
-                // A closed client is expected during streaming cancellation.
-            } catch (_: Exception) {
-                runCatching {
-                    writeJson(client, HTTP_INTERNAL_SERVER_ERROR, OpenAiResponseWriter.error("server_error", "server_error", "MNN HTTP request failed."))
-                }
+            }
+            request.method == "GET" && path == "/v1/models" -> {
+                writeJson(socket, HTTP_OK, OpenAiResponseWriter.models(inference.listModels()))
+                false
+            }
+            request.method == "GET" && path == "/internal/models/loaded" -> {
+                writeJson(socket, HTTP_OK, OpenAiResponseWriter.loaded(inference.status()))
+                false
+            }
+            request.method == "POST" && path == "/internal/models/load" -> {
+                loadModel(request, socket)
+                false
+            }
+            request.method == "POST" && path == "/internal/models/unload" -> {
+                unloadModel(socket)
+                false
+            }
+            request.method == "POST" && path == "/v1/chat/completions" -> dispatch(socket, inferenceWorkers) {
+                chatCompletion(request, socket)
+            }
+            path in KNOWN_PATHS -> {
+                writeJson(
+                    socket,
+                    HTTP_METHOD_NOT_ALLOWED,
+                    OpenAiResponseWriter.error("invalid_request_error", "method_not_allowed", "The HTTP method is not supported for this path."),
+                )
+                false
+            }
+            else -> {
+                writeJson(socket, HTTP_NOT_FOUND, OpenAiResponseWriter.error("invalid_request_error", "not_found", "The requested path was not found."))
+                false
             }
         }
     }
 
-    private fun route(request: MnnHttpRequest, socket: Socket) {
-        val path = request.target.substringBefore('?')
-        when {
-            request.method == "GET" && path == "/healthz" -> {
-                val health = inference.health()
-                writeJson(
-                    socket,
-                    if (health.available) HTTP_OK else HTTP_SERVICE_UNAVAILABLE,
-                    OpenAiResponseWriter.health(health, inference.status().modelId != null),
-                )
+    private fun dispatch(socket: Socket, executor: ExecutorService, action: () -> Unit): Boolean = try {
+        executor.execute {
+            try {
+                if (!socket.isClosed) action()
+            } catch (failure: OpenAiRequestException) {
+                logRequestRejection(failure)
+                runCatching {
+                    writeJson(socket, failure.statusCode, OpenAiResponseWriter.error("invalid_request_error", failure.code, failure.message.orEmpty()))
+                }
+            } catch (failure: IOException) {
+                // A closed client is expected during streaming cancellation.
+            } catch (failure: Exception) {
+                logInternalFailure(failure)
+                runCatching {
+                    writeJson(socket, HTTP_INTERNAL_SERVER_ERROR, OpenAiResponseWriter.error("server_error", "server_error", "MNN HTTP request failed."))
+                }
+            } finally {
+                closeClient(socket)
             }
-            request.method == "GET" && path == "/v1/models" -> writeJson(
-                socket,
-                HTTP_OK,
-                OpenAiResponseWriter.models(inference.listModels()),
-            )
-            request.method == "GET" && path == "/internal/models/loaded" -> writeJson(
-                socket,
-                HTTP_OK,
-                OpenAiResponseWriter.loaded(inference.status()),
-            )
-            request.method == "POST" && path == "/internal/models/load" -> loadModel(request, socket)
-            request.method == "POST" && path == "/internal/models/unload" -> unloadModel(socket)
-            request.method == "POST" && path == "/v1/chat/completions" -> chatCompletion(request, socket)
-            path in KNOWN_PATHS -> writeJson(
-                socket,
-                HTTP_METHOD_NOT_ALLOWED,
-                OpenAiResponseWriter.error("invalid_request_error", "method_not_allowed", "The HTTP method is not supported for this path."),
-            )
-            else -> writeJson(socket, HTTP_NOT_FOUND, OpenAiResponseWriter.error("invalid_request_error", "not_found", "The requested path was not found."))
         }
+        true
+    } catch (_: RejectedExecutionException) {
+        rejectClient(socket)
+        true
+    }
+
+    private fun rejectClient(socket: Socket) {
+        runCatching {
+            writeJson(
+                socket,
+                HTTP_SERVICE_UNAVAILABLE,
+                OpenAiResponseWriter.error("server_error", "server_busy", "The MNN HTTP server is at capacity."),
+            )
+        }
+        closeClient(socket)
+    }
+
+    private fun logRequestRejection(failure: OpenAiRequestException) {
+        val field = failure.fieldPath?.let { " field=$it" }.orEmpty()
+        val kind = failure.fieldKind?.let { " kind=$it" }.orEmpty()
+        Log.w(LOG_TAG, "Rejected OpenAI request code=${failure.code}$field$kind")
+    }
+
+    private fun logInferenceFailure(code: MnnErrorCode) {
+        Log.w(LOG_TAG, "MNN inference failed code=${code.name}")
+    }
+
+    private fun logInternalFailure(failure: Exception) {
+        Log.e(LOG_TAG, "MNN HTTP request failed type=${failure.javaClass.simpleName}")
+    }
+
+    private fun closeClient(socket: Socket) {
+        clientSockets.remove(socket)
+        runCatching { socket.close() }
     }
 
     private fun loadModel(request: MnnHttpRequest, socket: Socket) {
@@ -188,6 +317,7 @@ class MnnHttpServer(
                         parsed.includeUsage,
                     )
                     is MnnResult.Failure -> {
+                        logInferenceFailure(result.error.code)
                         val error = OpenAiResponseWriter.error(errorType(result.error.code), errorCode(result.error.code), result.error.message)
                         if (stream.started) stream.error(error) else writeJson(socket, httpStatus(result.error.code), error)
                     }
@@ -207,11 +337,14 @@ class MnnHttpServer(
                             result.value.finishReason,
                         ),
                     )
-                    is MnnResult.Failure -> writeJson(
-                        socket,
-                        httpStatus(result.error.code),
-                        OpenAiResponseWriter.error(errorType(result.error.code), errorCode(result.error.code), result.error.message),
-                    )
+                    is MnnResult.Failure -> {
+                        logInferenceFailure(result.error.code)
+                        writeJson(
+                            socket,
+                            httpStatus(result.error.code),
+                            OpenAiResponseWriter.error(errorType(result.error.code), errorCode(result.error.code), result.error.message),
+                        )
+                    }
                 }
             }
         } finally {
@@ -244,15 +377,35 @@ class MnnHttpServer(
             if (line.isEmpty()) break
             val separator = line.indexOf(':')
             if (separator <= 0) throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP header is invalid.")
-            headers[line.substring(0, separator).trim().lowercase()] = line.substring(separator + 1).trim()
+            val rawName = line.substring(0, separator)
+            if (rawName != rawName.trim()) {
+                throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP header is invalid.")
+            }
+            val name = rawName.lowercase()
+            val value = line.substring(separator + 1).trim()
+            if (name.isEmpty() || name.any { it !in 'a'..'z' && it !in '0'..'9' && it !in HEADER_NAME_PUNCTUATION }) {
+                throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP header is invalid.")
+            }
+            if (name == "content-length" && headers.containsKey(name)) {
+                throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP Content-Length is ambiguous.")
+            }
+            headers[name] = value
         }
         if (headers["transfer-encoding"] != null) {
             throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "Transfer-encoded request bodies are not supported.")
         }
-        val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-        if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
-            throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP request body is too large.")
+        val contentLengthValue = headers["content-length"]
+        if (contentLengthValue != null && !CONTENT_LENGTH_PATTERN.matches(contentLengthValue)) {
+            throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP Content-Length is invalid.")
         }
+        val contentLengthLong = contentLengthValue?.toLongOrNull()
+            ?: if (contentLengthValue == null) 0L else {
+                throw HttpProtocolException(HTTP_BAD_REQUEST, "invalid_request_error", "HTTP Content-Length is invalid.")
+            }
+        if (contentLengthLong > MAX_BODY_BYTES) {
+            throw HttpProtocolException(HTTP_CONTENT_TOO_LARGE, "invalid_request_error", "HTTP request body is too large.")
+        }
+        val contentLength = contentLengthLong.toInt()
         val body = ByteArray(contentLength)
         var offset = 0
         while (offset < body.size) {
@@ -325,6 +478,7 @@ class MnnHttpServer(
         HTTP_NOT_FOUND -> "Not Found"
         HTTP_METHOD_NOT_ALLOWED -> "Method Not Allowed"
         HTTP_CONFLICT -> "Conflict"
+        HTTP_CONTENT_TOO_LARGE -> "Content Too Large"
         HTTP_UNPROCESSABLE_ENTITY -> "Unprocessable Entity"
         HTTP_SERVICE_UNAVAILABLE -> "Service Unavailable"
         else -> "Internal Server Error"
@@ -336,9 +490,21 @@ class MnnHttpServer(
         override val message: String,
     ) : Exception(message)
 
+    private fun boundedExecutor(workerCount: Int, queueCapacity: Int, threadName: String): ExecutorService = ThreadPoolExecutor(
+        workerCount,
+        workerCount,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(queueCapacity),
+        ThreadFactory { task -> Thread(task, threadName).apply { isDaemon = true } },
+    )
+
     companion object {
+        private const val LOG_TAG = "PAIR-MNN-HTTP"
         const val DEFAULT_PORT = 14325
-        private const val HTTP_WORKER_COUNT = 4
+        private const val HTTP_REQUEST_WORKER_COUNT = 8
+        private const val INFERENCE_WORKER_COUNT = 4
+        private const val HEALTH_QUEUE_CAPACITY = 4
         private const val HTTP_BACKLOG = 16
         private const val REQUEST_TIMEOUT_MILLIS = 30_000
         private const val MAX_HEADER_LINE_BYTES = 8 * 1024
@@ -351,11 +517,14 @@ class MnnHttpServer(
         private const val HTTP_NOT_FOUND = 404
         private const val HTTP_METHOD_NOT_ALLOWED = 405
         private const val HTTP_CONFLICT = 409
+        private const val HTTP_CONTENT_TOO_LARGE = 413
         private const val HTTP_UNPROCESSABLE_ENTITY = 422
         private const val HTTP_INTERNAL_SERVER_ERROR = 500
         private const val HTTP_SERVICE_UNAVAILABLE = 503
         private val LOOPBACK: InetAddress = InetAddress.getByName("127.0.0.1")
         private val SUPPORTED_HTTP_VERSIONS = setOf("HTTP/1.0", "HTTP/1.1")
+        private val CONTENT_LENGTH_PATTERN = Regex("[0-9]+")
+        private val HEADER_NAME_PUNCTUATION = setOf('!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~')
         private val KNOWN_PATHS = setOf(
             "/healthz", "/v1/models", "/internal/models/loaded", "/internal/models/load",
             "/internal/models/unload", "/v1/chat/completions",

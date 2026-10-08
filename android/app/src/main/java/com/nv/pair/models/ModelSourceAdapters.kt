@@ -446,7 +446,7 @@ class ModelScopeAdapter(
         private const val PACKET_DELIMITER = 1
         private const val PACKET_RESPONSE_END = 2
         private const val MINIMUM_GIT_REF_FIELDS = 2
-        private const val MAX_SEARCH_LIMIT = 100
+        private const val MAX_SEARCH_LIMIT = 50
         private const val MAX_SEARCH_RESULTS = 3_000
         private const val MNN_OWNER = "MNN"
         private val WHITESPACE = Regex("\\s+")

@@ -24,7 +24,9 @@ class MnnEngineHost(
         Thread(runnable, "pair-mnn-runtime").apply { isDaemon = true }
     }
     private val stateLock = ReentrantLock()
+    private val lifecycleLock = Any()
     private val isClosed = AtomicBoolean(false)
+    @Volatile private var closeRequested = false
     private val generationAdmission = AtomicReference<Long?>(null)
     private var state = MnnEngineState.UNLOADED
     private var loadedModel: MnnLoadedModel? = null
@@ -205,7 +207,7 @@ class MnnEngineHost(
     fun getMetrics(): MnnRuntimeMetrics = stateLock.withLock { metrics }
 
     fun getHealth(): MnnHealthStatus = stateLock.withLock {
-        val available = runtimeAvailable && !isClosed.get()
+        val available = runtimeAvailable && !closeRequested
         MnnHealthStatus(
             available = available,
             state = state,
@@ -214,41 +216,69 @@ class MnnEngineHost(
         )
     }
 
+    @Synchronized
     override fun close() {
-        if (isClosed.compareAndSet(false, true)) {
+        if (!isClosed.get()) {
+            synchronized(lifecycleLock) {
+                if (isClosed.get()) return
+                closeRequested = true
+            }
             val requestToCancel = stateLock.withLock { activeRequestId }
             requestToCancel?.let { requestId ->
                 runCatching { runtime.cancel(requestId) }
                     .onFailure { warnShutdown("Could not cancel active MNN generation during shutdown.") }
             }
-            val closeFuture: Future<*> = try {
-                executor.submit {
-                    runCatching { runtime.close() }
-                    stateLock.withLock {
-                        loadedModel = null
-                        activeRequestId = null
-                        state = MnnEngineState.UNLOADED
+            val closeFuture: Future<*> = synchronized(lifecycleLock) {
+                if (isClosed.get()) return
+                try {
+                    executor.submit {
+                        if (isClosed.get()) return@submit
+                        runtime.close()
+                        val runtimeStatus = runtime.getStatus()
+                        check(runtimeStatus.state == MnnEngineState.UNLOADED && runtime.getLoadedModel() == null) {
+                            "MNN runtime remained loaded after close."
+                        }
+                        stateLock.withLock {
+                            loadedModel = null
+                            activeRequestId = null
+                            state = MnnEngineState.UNLOADED
+                            lastError = null
+                            isClosed.set(true)
+                        }
                     }
+                } catch (failure: java.util.concurrent.RejectedExecutionException) {
+                    throw closeFailure("MNN runtime executor rejected close.", failure)
                 }
-            } catch (_: java.util.concurrent.RejectedExecutionException) {
-                executor.shutdownNow()
-                return
             }
             try {
                 closeFuture.get(shutdownTimeoutMillis, TimeUnit.MILLISECONDS)
                 executor.shutdown()
             } catch (_: TimeoutException) {
-                warnShutdown("MNN shutdown exceeded ${shutdownTimeoutMillis}ms; native runtime may remain allocated until process exit.")
-                executor.shutdownNow()
+                throw closeFailure(
+                    "MNN shutdown exceeded ${shutdownTimeoutMillis}ms; native runtime may remain allocated until process exit."
+                )
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
-                warnShutdown("MNN shutdown was interrupted; native runtime may remain allocated until process exit.")
-                executor.shutdownNow()
-            } catch (_: ExecutionException) {
-                warnShutdown("MNN runtime close failed; native runtime may remain allocated until process exit.")
-                executor.shutdownNow()
+                throw closeFailure("MNN shutdown was interrupted; native runtime may remain allocated until process exit.")
+            } catch (failure: ExecutionException) {
+                throw closeFailure(
+                    "MNN runtime close failed; native runtime may remain allocated until process exit.",
+                    failure.cause ?: failure,
+                )
             }
         }
+    }
+
+    private fun closeFailure(message: String, cause: Throwable? = null): IllegalStateException {
+        warnShutdown(message)
+        stateLock.withLock {
+            if (!isClosed.get()) {
+                state = MnnEngineState.ERROR
+                lastError = MnnError(MnnErrorCode.INTERNAL_ERROR, message)
+                runtimeAvailable = false
+            }
+        }
+        return IllegalStateException(message, cause)
     }
 
     private fun warnShutdown(message: String) {
@@ -256,24 +286,32 @@ class MnnEngineHost(
     }
 
     private fun <T> dispatch(action: () -> MnnResult<T>): MnnResult<T> {
-        if (isClosed.get()) {
-            return MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN engine host is closed.")
+        val operation = synchronized(lifecycleLock) {
+            if (isClosed.get() || closeRequested) {
+                return MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN engine host is closed.")
+            }
+            try {
+                executor.submit<MnnResult<T>> {
+                    if (isClosed.get() || closeRequested) {
+                        return@submit MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN engine host is closed.")
+                    }
+                    try {
+                        action()
+                    } catch (_: Exception) {
+                        MnnResult.failure(MnnErrorCode.INTERNAL_ERROR, "MNN runtime operation failed.")
+                    }
+                }
+            } catch (_: java.util.concurrent.RejectedExecutionException) {
+                return MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN engine host is closed.")
+            }
         }
         return try {
-            executor.submit<MnnResult<T>> {
-                try {
-                    action()
-                } catch (_: Exception) {
-                    MnnResult.failure(MnnErrorCode.INTERNAL_ERROR, "MNN runtime operation failed.")
-                }
-            }.get()
+            operation.get()
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             MnnResult.failure(MnnErrorCode.INTERNAL_ERROR, "MNN runtime operation was interrupted.")
         } catch (_: ExecutionException) {
             MnnResult.failure(MnnErrorCode.INTERNAL_ERROR, "MNN runtime operation failed.")
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
-            MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN engine host is closed.")
         }
     }
 

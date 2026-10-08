@@ -6,14 +6,43 @@
 package com.nv.pair.rpc
 
 import com.nv.pair.runtime.NativeBinaryRegistry
-import java.nio.file.Files
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BrokerSessionTest {
+    @Test
+    fun startupCallbackFailureStopsTheAlreadyStartedBroker() {
+        val (_, root) = session(emptyList())
+        val child = FakeProcess()
+        val runner = FakeRunner(child)
+        val failingSession = BrokerSession(
+            binaries = NativeBinaryRegistry(root),
+            filesDir = root.resolve("files"),
+            cacheDir = root.resolve("cache"),
+            onWaitingReady = { error("synthetic startup callback failure") },
+        )
+
+        try {
+            val failure = runCatching { failingSession.startWithRunner(runner) }.exceptionOrNull()
+
+            assertTrue("startup failure should remain visible", failure is IOException)
+            assertEquals("started child must be stopped during rollback", 1, runner.stopCount.get())
+            assertTrue("child must no longer be alive", !child.isAlive)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test
     fun brokerCommandIncludesConfiguredProxyEngines() {
         val (session, root) = session(listOf("ollama", "lmstudio", "mnn"))
@@ -81,5 +110,42 @@ class BrokerSessionTest {
     private fun proxyEngines(arguments: List<String>): String {
         val flagIndex = arguments.indexOf("--proxy-engines")
         return arguments[flagIndex + 1]
+    }
+
+    private class FakeRunner(private val process: FakeProcess) : BrokerProcessRunner {
+        val stopCount = AtomicInteger()
+
+        override fun start(): Process = process
+
+        override fun stop(process: Process, timeoutMillis: Long): Int {
+            stopCount.incrementAndGet()
+            process.destroyForcibly()
+            return process.exitValue()
+        }
+    }
+
+    private class FakeProcess : Process() {
+        private val exited = CountDownLatch(1)
+        private val childOutput = ByteArrayOutputStream()
+        @Volatile private var childExitCode: Int? = null
+
+        override fun getOutputStream(): OutputStream = childOutput
+        override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+        override fun waitFor(): Int {
+            exited.await()
+            return exitValue()
+        }
+        override fun waitFor(timeout: Long, unit: TimeUnit): Boolean = exited.await(timeout, unit)
+        override fun exitValue(): Int = childExitCode ?: throw IllegalThreadStateException("process is still running")
+        override fun destroy() {
+            destroyForcibly()
+        }
+        override fun destroyForcibly(): Process {
+            childExitCode = 137
+            exited.countDown()
+            return this
+        }
+        override fun isAlive(): Boolean = childExitCode == null
     }
 }

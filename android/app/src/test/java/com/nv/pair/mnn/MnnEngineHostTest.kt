@@ -9,12 +9,34 @@ import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MnnEngineHostTest {
+    private companion object {
+        const val SYNTHETIC_NATIVE_ERROR_LOAD = 4
+    }
+
+    @Test
+    fun nativeCloseFailureRemainsVisibleAndCanBeRetried() {
+        val cleanup = FakeNativeCleanup(failUnloadAttempts = 1)
+        val runtime = NativeMnn(42L, null, cleanup)
+
+        val firstFailure = runCatching { runtime.close() }.exceptionOrNull()
+
+        assertTrue("native close failure must be reported", firstFailure is IllegalStateException)
+        assertEquals(MnnEngineState.ERROR, runtime.getStatus().state)
+        assertEquals(0, cleanup.destroyCount.get())
+
+        runtime.close()
+
+        assertEquals(MnnEngineState.UNLOADED, runtime.getStatus().state)
+        assertEquals(1, cleanup.destroyCount.get())
+    }
+
     @Test
     fun closeCancelsActiveGeneration() {
         val runtime = FakeMnnRuntime(blockGeneration = true)
@@ -43,12 +65,48 @@ class MnnEngineHostTest {
         assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
         val startedAt = System.nanoTime()
 
-        host.close()
+        val closeFailure = runCatching { host.close() }.exceptionOrNull()
 
         val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
         assertTrue("close took ${elapsedMillis}ms", elapsedMillis < 1_000)
+        assertTrue("timed out close must be reported", closeFailure is IllegalStateException)
         assertTrue(warnings.single().contains("native runtime may remain allocated until process exit"))
         runtime.releaseGeneration.countDown()
+    }
+
+    @Test
+    fun interruptedCloseRemainsUnavailableAndCanBeRetried() {
+        val runtime = FakeMnnRuntime(blockGeneration = true, ignoreCancellation = true)
+        val host = MnnEngineHost(runtime, shutdownTimeoutMillis = 5_000, logWarning = {})
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        val generationFinished = CountDownLatch(1)
+        Thread {
+            host.generate(33, chatRequest()) { }
+            generationFinished.countDown()
+        }.start()
+        assertTrue(runtime.generationStarted.await(2, TimeUnit.SECONDS))
+
+        val closeStarted = CountDownLatch(1)
+        val closeFinished = CountDownLatch(1)
+        val closeFailure = AtomicReference<Throwable?>()
+        val closeThread = Thread {
+            closeStarted.countDown()
+            closeFailure.set(runCatching { host.close() }.exceptionOrNull())
+            closeFinished.countDown()
+        }
+        closeThread.start()
+        assertTrue(closeStarted.await(2, TimeUnit.SECONDS))
+        closeThread.interrupt()
+
+        assertTrue(closeFinished.await(2, TimeUnit.SECONDS))
+        assertTrue("interrupted close must be reported", closeFailure.get() is IllegalStateException)
+        assertFalse("host must stay unavailable until close succeeds", host.getHealth().available)
+
+        runtime.releaseGeneration.countDown()
+        assertTrue(generationFinished.await(2, TimeUnit.SECONDS))
+        host.close()
+
+        assertEquals(MnnEngineState.UNLOADED, host.getStatus().state)
     }
 
     @Test
@@ -61,8 +119,11 @@ class MnnEngineHostTest {
         val stopContinued = CountDownLatch(1)
 
         Thread {
-            host.close()
-            stopContinued.countDown()
+            try {
+                host.close()
+            } finally {
+                stopContinued.countDown()
+            }
         }.start()
 
         assertTrue("PAIR stop remained blocked on MNN close", stopContinued.await(1, TimeUnit.SECONDS))
@@ -79,6 +140,27 @@ class MnnEngineHostTest {
 
         assertEquals(1, runtime.closeCount.get())
         assertEquals(1, runtime.unloadCount.get())
+    }
+
+    @Test
+    fun failedRuntimeCloseKeepsErrorStateAndCanBeRetried() {
+        val runtime = FakeMnnRuntime(closeFailures = 1)
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+
+        val firstFailure = runCatching { host.close() }.exceptionOrNull()
+
+        assertEquals(MnnEngineState.ERROR, host.getStatus().state)
+        assertTrue("runtime close failure must be reported", firstFailure is IllegalStateException)
+        assertEquals("runtime close failure must remain visible", 1, runtime.closeCount.get())
+        assertFalse("host must reject new work while cleanup is unresolved", host.getHealth().available)
+        assertTrue("model load must not be admitted during close retry", host.loadModel(model(), MnnBackend.CPU) is MnnResult.Failure)
+        assertEquals("rejected work must not reach the runtime", 1, runtime.loadCount.get())
+
+        host.close()
+
+        assertEquals(MnnEngineState.UNLOADED, host.getStatus().state)
+        assertEquals(2, runtime.closeCount.get())
     }
 
     @Test
@@ -332,6 +414,7 @@ class MnnEngineHostTest {
         failLoadAttempts: Int = 0,
         private val failingRequestId: Long? = null,
         private val unloadFailureDropsModel: Boolean = false,
+        closeFailures: Int = 0,
     ) : MnnRuntime {
         val generationStarted = CountDownLatch(1)
         val releaseGeneration = CountDownLatch(1)
@@ -339,6 +422,7 @@ class MnnEngineHostTest {
         val unloadCount = AtomicInteger()
         val cancelCount = AtomicInteger()
         val closeCount = AtomicInteger()
+        private val closeFailuresRemaining = AtomicInteger(closeFailures)
         private val loadFailuresRemaining = AtomicInteger(failLoadAttempts)
         val throwOnNextMetricsRead = java.util.concurrent.atomic.AtomicBoolean(false)
         private var loadedModel: MnnLoadedModel? = null
@@ -438,7 +522,26 @@ class MnnEngineHostTest {
 
         override fun close() {
             closeCount.incrementAndGet()
+            if (closeFailuresRemaining.getAndUpdate { remaining -> if (remaining > 0) remaining - 1 else remaining } > 0) {
+                error("Synthetic runtime close failure")
+            }
             unloadModel()
+        }
+    }
+
+    private class FakeNativeCleanup(failUnloadAttempts: Int) : NativeSessionCleanup {
+        private val failuresRemaining = AtomicInteger(failUnloadAttempts)
+        val destroyCount = AtomicInteger()
+
+        override fun unloadModel(handle: Long): Int =
+            if (failuresRemaining.getAndUpdate { remaining -> if (remaining > 0) remaining - 1 else remaining } > 0) {
+                SYNTHETIC_NATIVE_ERROR_LOAD
+            } else {
+                0
+            }
+
+        override fun destroySession(handle: Long) {
+            destroyCount.incrementAndGet()
         }
     }
 }

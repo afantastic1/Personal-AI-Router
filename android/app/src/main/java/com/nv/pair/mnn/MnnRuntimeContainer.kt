@@ -16,6 +16,7 @@ class MnnRuntimeContainer(
     preferredBackend: MnnBackend = MnnBackend.CPU,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val closeRequested = AtomicBoolean(false)
     private val backendSelection = MnnBackendSelection(preferredBackend)
     private val inference = LocalMnnInferenceService(
         MnnModelCatalog(modelRoot),
@@ -38,17 +39,28 @@ class MnnRuntimeContainer(
     fun deleteModel(modelId: String, deleteFiles: () -> Unit): MnnResult<Unit> =
         inference.deleteModel(modelId, deleteFiles)
 
+    @Synchronized
     fun start() {
-        check(!closed.get()) { "MNN runtime container is closed." }
+        check(!closeRequested.get() && !closed.get()) { "MNN runtime container is closing or closed." }
         httpServer.start()
     }
 
+    @Synchronized
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        if (closed.get()) return
+        closeRequested.set(true)
+        var failure: Exception? = null
         try {
             httpServer.close()
-        } finally {
-            inference.close()
+        } catch (closeFailure: Exception) {
+            failure = closeFailure
         }
+        try {
+            inference.close()
+        } catch (closeFailure: Exception) {
+            if (failure == null) failure = closeFailure else failure.addSuppressed(closeFailure)
+        }
+        failure?.let { throw it }
+        closed.set(true)
     }
 }
