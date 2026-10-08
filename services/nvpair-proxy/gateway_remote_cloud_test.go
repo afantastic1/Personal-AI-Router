@@ -110,6 +110,14 @@ func TestPairedCloudGatewayRequiresExplicitHostAuthorization(t *testing.T) {
 	if got := upstreamHits.Load(); got != 1 {
 		t.Fatalf("approved paired node reached Provider %d times, want one", got)
 	}
+	server.Close()
+	offline := call()
+	if offline.Code != http.StatusBadGateway {
+		t.Fatalf("offline Cloud host response=%d %s, want a Gateway failure", offline.Code, offline.Body.String())
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("offline Cloud host reached Provider %d times, want one total", got)
+	}
 }
 
 func TestPairedCloudAuthorizationRevocationCancelsActiveProviderRequest(t *testing.T) {
