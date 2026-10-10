@@ -25,6 +25,7 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunnerArguments["pairMnnOpenCL"] = useOpenClMnn.toString()
         testInstrumentationRunnerArguments["pairMnnModelDir"] =
             project.findProperty("pairMnnDeviceModelDir")?.toString().orEmpty()
         testInstrumentationRunnerArguments["pairModelId"] =

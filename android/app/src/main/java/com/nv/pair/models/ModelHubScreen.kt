@@ -39,7 +39,11 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.nv.pair.data.PairNode
 import com.nv.pair.mnn.MnnBackend
-import com.nv.pair.mnn.MnnErrorCode
+import com.nv.pair.mnn.BackendChoice
+import com.nv.pair.mnn.EffectiveBackendSelection
+import com.nv.pair.mnn.MnnCapabilitySnapshot
+import com.nv.pair.mnn.ProbeReason
+import com.nv.pair.mnn.ProbeState
 import com.nv.pair.runtime.MnnLocalEngineStatus
 import com.nv.pair.rpc.CloudProviderSettings
 
@@ -47,9 +51,14 @@ import com.nv.pair.rpc.CloudProviderSettings
 fun ModelHubScreen(
     nodes: List<PairNode>,
     gatewayModels: List<GatewayModel>?,
-    preferredBackend: MnnBackend,
+    backendChoice: BackendChoice,
+    capabilities: MnnCapabilitySnapshot,
+    effectiveBackendSelection: EffectiveBackendSelection,
     localEngineStatus: MnnLocalEngineStatus,
-    onBackendChange: (MnnBackend) -> Unit,
+    serviceRunning: Boolean,
+    onManualBackendChange: (MnnBackend) -> Unit,
+    onResetBackendToAuto: () -> Unit,
+    onReprobeOpenCl: () -> Unit,
     cloudProviderSettings: CloudProviderSettings?,
     onCloudEnabledChange: (Boolean) -> Unit,
     onCloudPolicyChange: (String) -> Unit,
@@ -86,16 +95,45 @@ fun ModelHubScreen(
                     "The selected engine applies to the next MNN model request.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Column(Modifier.selectableGroup()) {
-                    MnnBackendOption("CPU", MnnBackend.CPU, preferredBackend, onBackendChange)
-                    MnnBackendOption("OpenCL", MnnBackend.OPENCL, preferredBackend, onBackendChange)
+                Text("Selection mode: ${if (backendChoice == BackendChoice.Auto) "Automatic" else "Manual"}")
+                Text(
+                    if (effectiveBackendSelection.resolving) {
+                        "Effective engine: CPU (temporary while checking)"
+                    } else {
+                        "Effective engine: ${effectiveBackendSelection.effectiveBackend.name}"
+                    },
+                )
+                Text(if (localEngineStatus.available) "CPU runtime: Available" else "CPU runtime: Runtime unavailable")
+                Text("OpenCL: ${openClProbeLabel(capabilities.openCl.state, capabilities.openCl.reason)}")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        onClick = onReprobeOpenCl,
+                        enabled = serviceRunning && capabilities.openCl.state != ProbeState.CHECKING,
+                    ) { Text("Reprobe") }
+                    TextButton(
+                        onClick = onResetBackendToAuto,
+                        enabled = backendChoice !is BackendChoice.Auto,
+                    ) { Text("Restore automatic selection") }
                 }
-                if (
-                    preferredBackend == MnnBackend.OPENCL &&
-                    localEngineStatus.errorCode == MnnErrorCode.BACKEND_UNSUPPORTED
-                ) {
+                Column(Modifier.selectableGroup()) {
+                    MnnBackendOption(
+                        "CPU",
+                        MnnBackend.CPU,
+                        backendChoice,
+                        enabled = true,
+                        onManualBackendChange,
+                    )
+                    MnnBackendOption(
+                        "OpenCL",
+                        MnnBackend.OPENCL,
+                        backendChoice,
+                        enabled = capabilities.openCl.state == ProbeState.AVAILABLE,
+                        onManualBackendChange,
+                    )
+                }
+                if (effectiveBackendSelection.unavailableManualChoice) {
                     Text(
-                        "OpenCL is not available on this device/runtime. CPU remains available.",
+                        "Manual OpenCL preference is saved. OpenCL is currently unavailable, so CPU is the safe fallback.",
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
@@ -364,20 +402,36 @@ fun ModelHubScreen(
 private fun MnnBackendOption(
     label: String,
     backend: MnnBackend,
-    preferredBackend: MnnBackend,
+    choice: BackendChoice,
+    enabled: Boolean,
     onBackendChange: (MnnBackend) -> Unit,
 ) {
-    val selected = backend == preferredBackend
+    val selected = when (choice) {
+        BackendChoice.Auto -> false
+        is BackendChoice.Manual -> choice.backend == backend
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .selectable(selected = selected, role = Role.RadioButton) { onBackendChange(backend) }
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton) { onBackendChange(backend) }
             .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         RadioButton(selected = selected, onClick = null)
         Text(label, modifier = Modifier.weight(1f))
     }
+}
+
+private fun openClProbeLabel(state: ProbeState, reason: ProbeReason?): String = when (state) {
+    ProbeState.UNKNOWN -> "Not checked"
+    ProbeState.CHECKING -> "Checking"
+    ProbeState.AVAILABLE -> "Can initialize (model not verified)"
+    ProbeState.UNAVAILABLE -> when (reason) {
+        ProbeReason.NOT_COMPILED -> "OpenCL is not compiled into this APK"
+        ProbeReason.RUNTIME_INIT_FAILED -> "OpenCL runtime unavailable on this device or driver"
+        else -> "OpenCL unavailable"
+    }
+    ProbeState.ERROR -> "Probe failed; retry is available"
 }
 
 @Composable

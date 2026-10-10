@@ -34,6 +34,20 @@ class MnnRuntimeContainerTest {
         }
     }
 
+    @Test
+    fun probeUsesContainerHostAndIsRejectedAfterCloseStarts() {
+        val modelRoot = Files.createTempDirectory("pair-container-probe").toFile()
+        val container = MnnRuntimeContainer(modelRoot, port = 0, runtime = CloseFailingRuntime(failures = 0))
+        try {
+            assertEquals(MnnResult.Success(BackendCapabilityResult.Available), container.probeOpenCl())
+            container.close()
+            val result = container.probeOpenCl()
+            assertTrue(result is MnnResult.Failure)
+        } finally {
+            modelRoot.deleteRecursively()
+        }
+    }
+
     private class CloseFailingRuntime(failures: Int) : MnnRuntime {
         val closeCount = AtomicInteger()
         private val failuresRemaining = AtomicInteger(failures)
@@ -56,6 +70,8 @@ class MnnRuntimeContainerTest {
         override fun getLoadedModel(): MnnLoadedModel? = null
 
         override fun getMetrics(): MnnRuntimeMetrics = MnnRuntimeMetrics()
+
+        override fun probeOpenCl(): BackendCapabilityResult = BackendCapabilityResult.Available
 
         override fun close() {
             closeCount.incrementAndGet()

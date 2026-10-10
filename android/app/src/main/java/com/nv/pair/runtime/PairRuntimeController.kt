@@ -15,6 +15,9 @@ import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.PairWorkload
 import com.nv.pair.mnn.MnnBackend
 import com.nv.pair.mnn.MnnSettingsRepository
+import com.nv.pair.mnn.BackendChoice
+import com.nv.pair.mnn.EffectiveBackendSelection
+import com.nv.pair.mnn.MnnCapabilitySnapshot
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.async
@@ -36,7 +39,9 @@ class PairRuntimeController(context: Context) {
     val cluster: StateFlow<ClusterState> = PairRuntimeService.clusterState
     val proxies: StateFlow<List<EngineProxyStatus>> = PairRuntimeService.proxyStatuses
     val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = PairRuntimeService.mnnLocalEngine
-    val preferredMnnBackend: Flow<MnnBackend> = mnnSettings.preferredBackend
+    val backendChoice: Flow<BackendChoice> = mnnSettings.backendChoice
+    val mnnCapabilities: StateFlow<MnnCapabilitySnapshot> = PairRuntimeService.mnnCapabilities
+    val effectiveBackendSelection: StateFlow<EffectiveBackendSelection> = PairRuntimeService.effectiveBackendSelection
     val workloads: StateFlow<List<PairWorkload>> = PairRuntimeService.workloads
     val cloudProviderSettings = PairRuntimeService.cloudProviderSettings
 
@@ -57,14 +62,34 @@ class PairRuntimeController(context: Context) {
     }
 
     suspend fun setPreferredMnnBackend(backend: MnnBackend) {
-        mnnSettings.setPreferredBackend(backend)
+        setManualBackend(backend)
+    }
+
+    suspend fun setManualBackend(backend: MnnBackend) {
+        mnnSettings.setBackendChoice(BackendChoice.Manual(backend))
         if (PairRuntimeService.runtimeState.value.desiredRunning) {
             applicationContext.startService(
                 Intent(applicationContext, PairRuntimeService::class.java)
-                    .setAction(PairRuntimeService.ACTION_MNN_BACKEND_CHANGED)
-                    .putExtra(PairRuntimeService.EXTRA_MNN_BACKEND, backend.preferenceValue),
+                    .setAction(PairRuntimeService.ACTION_MNN_BACKEND_CHANGED),
             )
         }
+    }
+
+    suspend fun resetBackendToAuto() {
+        mnnSettings.resetBackendToAuto()
+        if (PairRuntimeService.runtimeState.value.desiredRunning) {
+            applicationContext.startService(
+                Intent(applicationContext, PairRuntimeService::class.java)
+                    .setAction(PairRuntimeService.ACTION_MNN_BACKEND_CHANGED),
+            )
+        }
+    }
+
+    fun reprobeOpenCl() {
+        applicationContext.startService(
+            Intent(applicationContext, PairRuntimeService::class.java)
+                .setAction(PairRuntimeService.ACTION_MNN_REPROBE_OPENCL),
+        )
     }
 
     suspend fun deleteInstalledModel(modelId: String) {

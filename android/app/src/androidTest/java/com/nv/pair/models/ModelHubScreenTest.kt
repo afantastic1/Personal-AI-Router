@@ -17,7 +17,11 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.Modifier
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.nv.pair.mnn.MnnBackend
-import com.nv.pair.mnn.MnnErrorCode
+import com.nv.pair.mnn.BackendChoice
+import com.nv.pair.mnn.EffectiveBackendSelection
+import com.nv.pair.mnn.MnnCapabilitySnapshot
+import com.nv.pair.mnn.BackendCapability
+import com.nv.pair.mnn.ProbeState
 import com.nv.pair.runtime.MnnLocalEngineStatus
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -41,9 +45,14 @@ class ModelHubScreenTest {
                         GatewayModel("auto-balanced", GatewayModelKind.AUTOMATIC),
                         GatewayModel("auto-new-policy", GatewayModelKind.AUTOMATIC),
                     ),
-                    preferredBackend = MnnBackend.CPU,
+                    backendChoice = BackendChoice.Auto,
+                    capabilities = MnnCapabilitySnapshot(),
+                    effectiveBackendSelection = EffectiveBackendSelection(BackendChoice.Auto, MnnBackend.CPU, resolving = true),
                     localEngineStatus = MnnLocalEngineStatus(available = false),
-                    onBackendChange = {},
+                    serviceRunning = false,
+                    onManualBackendChange = {},
+                    onResetBackendToAuto = {},
+                    onReprobeOpenCl = {},
                     cloudProviderSettings = null,
                     onCloudEnabledChange = {},
                     onCloudPolicyChange = {},
@@ -66,9 +75,14 @@ class ModelHubScreenTest {
                     GatewayModel("auto", GatewayModelKind.AUTOMATIC),
                     GatewayModel("auto-balanced", GatewayModelKind.AUTOMATIC),
                 ),
-                preferredBackend = MnnBackend.CPU,
+                backendChoice = BackendChoice.Manual(MnnBackend.CPU),
+                capabilities = MnnCapabilitySnapshot(openCl = BackendCapability(MnnBackend.OPENCL, ProbeState.AVAILABLE)),
+                effectiveBackendSelection = EffectiveBackendSelection(BackendChoice.Manual(MnnBackend.CPU), MnnBackend.CPU),
                 localEngineStatus = MnnLocalEngineStatus(available = true),
-                onBackendChange = { selectedBackend = it },
+                serviceRunning = true,
+                onManualBackendChange = { selectedBackend = it },
+                onResetBackendToAuto = {},
+                onReprobeOpenCl = {},
                 cloudProviderSettings = null,
                 onCloudEnabledChange = {},
                 onCloudPolicyChange = {},
@@ -81,18 +95,26 @@ class ModelHubScreenTest {
     }
 
     @Test
-    fun unsupportedOpenClExplainsCpuRemainsAvailable() {
+    fun unavailableManualOpenClShowsSafeCpuFallback() {
         composeRule.setContent {
             ModelHubScreen(
                 nodes = emptyList(),
                 gatewayModels = null,
-                preferredBackend = MnnBackend.OPENCL,
+                backendChoice = BackendChoice.Manual(MnnBackend.OPENCL),
+                capabilities = MnnCapabilitySnapshot(
+                    openCl = BackendCapability(MnnBackend.OPENCL, ProbeState.UNAVAILABLE),
+                ),
+                effectiveBackendSelection = EffectiveBackendSelection(
+                    BackendChoice.Manual(MnnBackend.OPENCL), MnnBackend.CPU, unavailableManualChoice = true,
+                ),
                 localEngineStatus = MnnLocalEngineStatus(
                     available = true,
-                    backend = MnnBackend.OPENCL,
-                    errorCode = MnnErrorCode.BACKEND_UNSUPPORTED,
+                    backend = MnnBackend.CPU,
                 ),
-                onBackendChange = {},
+                serviceRunning = true,
+                onManualBackendChange = {},
+                onResetBackendToAuto = {},
+                onReprobeOpenCl = {},
                 cloudProviderSettings = null,
                 onCloudEnabledChange = {},
                 onCloudPolicyChange = {},
@@ -100,7 +122,7 @@ class ModelHubScreenTest {
         }
 
         composeRule.onNodeWithText(
-            "OpenCL is not available on this device/runtime. CPU remains available.",
+            "Manual OpenCL preference is saved. OpenCL is currently unavailable, so CPU is the safe fallback.",
         ).assertIsDisplayed()
     }
 
@@ -111,9 +133,14 @@ class ModelHubScreenTest {
                 ModelHubScreen(
                     nodes = emptyList(),
                     gatewayModels = listOf(GatewayModel("cloud/work/chat", GatewayModelKind.CLOUD)),
-                    preferredBackend = MnnBackend.CPU,
+                    backendChoice = BackendChoice.Auto,
+                    capabilities = MnnCapabilitySnapshot(),
+                    effectiveBackendSelection = EffectiveBackendSelection(BackendChoice.Auto, MnnBackend.CPU, resolving = true),
                     localEngineStatus = MnnLocalEngineStatus(available = false),
-                    onBackendChange = {},
+                    serviceRunning = false,
+                    onManualBackendChange = {},
+                    onResetBackendToAuto = {},
+                    onReprobeOpenCl = {},
                     cloudProviderSettings = null,
                     onCloudEnabledChange = {},
                     onCloudPolicyChange = {},

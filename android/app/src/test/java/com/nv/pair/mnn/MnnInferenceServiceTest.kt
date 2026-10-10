@@ -312,6 +312,8 @@ class MnnInferenceServiceTest {
 
         override fun getMetrics() = MnnRuntimeMetrics()
 
+        override fun probeOpenCl(): BackendCapabilityResult = BackendCapabilityResult.Available
+
         override fun close() {
             unloadModel()
         }

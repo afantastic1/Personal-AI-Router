@@ -51,6 +51,10 @@ import com.nv.pair.data.ClusterState
 import com.nv.pair.data.EngineProxyStatus
 import com.nv.pair.data.PairWorkload
 import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.mnn.BackendChoice
+import com.nv.pair.mnn.EffectiveBackendSelection
+import com.nv.pair.mnn.MnnCapabilitySnapshot
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nv.pair.runtime.MnnLocalEngineStatus
 import com.nv.pair.ui.theme.PAIRTheme
 import com.nv.pair.models.ModelHubScreen
@@ -98,13 +102,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                val preferredMnnBackend by runtimeController.preferredMnnBackend.collectAsState(initial = MnnBackend.CPU)
+                val backendChoice by runtimeController.backendChoice.collectAsStateWithLifecycle(initialValue = BackendChoice.Auto)
+                val capabilities by runtimeController.mnnCapabilities.collectAsStateWithLifecycle()
+                val effectiveBackend by runtimeController.effectiveBackendSelection.collectAsStateWithLifecycle()
                 val mnnLocalEngine by runtimeController.mnnLocalEngine.collectAsState()
-                val displayedMnnBackend = if (mnnLocalEngine.available) {
-                    mnnLocalEngine.backend ?: preferredMnnBackend
-                } else {
-                    preferredMnnBackend
-                }
                 PairHomeScreen(
                     state = state,
                     nodes = nodes,
@@ -115,11 +116,15 @@ class MainActivity : ComponentActivity() {
                     onCloudEnabledChange = runtimeController::setCloudEnabled,
                     onCloudPolicyChange = runtimeController::setCloudPolicy,
                     gatewayModels = gatewayModels,
-                    preferredMnnBackend = displayedMnnBackend,
+                    backendChoice = backendChoice,
+                    capabilities = capabilities,
+                    effectiveBackendSelection = effectiveBackend,
                     mnnLocalEngine = mnnLocalEngine,
-                    onPreferredMnnBackendChange = { backend ->
-                        scope.launch { runtimeController.setPreferredMnnBackend(backend) }
+                    onManualMnnBackendChange = { backend ->
+                        scope.launch { runtimeController.setManualBackend(backend) }
                     },
+                    onResetMnnBackendToAuto = { scope.launch { runtimeController.resetBackendToAuto() } },
+                    onReprobeOpenCl = runtimeController::reprobeOpenCl,
                     onStart = ::startRuntime,
                     onStop = runtimeController::stop,
                     onCreateCluster = runtimeController::createCluster,
@@ -156,9 +161,13 @@ private fun PairHomeScreen(
     onCloudEnabledChange: (Boolean) -> Unit,
     onCloudPolicyChange: (String) -> Unit,
     gatewayModels: List<com.nv.pair.models.GatewayModel>?,
-    preferredMnnBackend: MnnBackend,
+    backendChoice: BackendChoice,
+    capabilities: MnnCapabilitySnapshot,
+    effectiveBackendSelection: EffectiveBackendSelection,
     mnnLocalEngine: MnnLocalEngineStatus,
-    onPreferredMnnBackendChange: (MnnBackend) -> Unit,
+    onManualMnnBackendChange: (MnnBackend) -> Unit,
+    onResetMnnBackendToAuto: () -> Unit,
+    onReprobeOpenCl: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onCreateCluster: (String) -> Unit,
@@ -277,9 +286,14 @@ private fun PairHomeScreen(
                     cloudProviderSettings = cloudProviderSettings,
                     onCloudEnabledChange = onCloudEnabledChange,
                     onCloudPolicyChange = onCloudPolicyChange,
-                    preferredBackend = preferredMnnBackend,
+                    backendChoice = backendChoice,
+                    capabilities = capabilities,
+                    effectiveBackendSelection = effectiveBackendSelection,
                     localEngineStatus = mnnLocalEngine,
-                    onBackendChange = onPreferredMnnBackendChange,
+                    serviceRunning = running,
+                    onManualBackendChange = onManualMnnBackendChange,
+                    onResetBackendToAuto = onResetMnnBackendToAuto,
+                    onReprobeOpenCl = onReprobeOpenCl,
                 )
             }
         }

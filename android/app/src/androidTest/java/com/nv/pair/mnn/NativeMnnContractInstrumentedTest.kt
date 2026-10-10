@@ -36,6 +36,26 @@ class NativeMnnContractInstrumentedTest {
     }
 
     @Test
+    fun probesOpenClWithoutLoadingAModelOrChangingRuntimeState() {
+        val runtime = NativeMnn.create()
+        try {
+            val before = runtime.getStatus()
+            val result = runtime.probeOpenCl()
+            val openClVariant = InstrumentationRegistry.getArguments().getString("pairMnnOpenCL") == "true"
+
+            if (openClVariant) {
+                assertFalse(result == BackendCapabilityResult.Unavailable(ProbeReason.NOT_COMPILED))
+            } else {
+                assertEquals(BackendCapabilityResult.Unavailable(ProbeReason.NOT_COMPILED), result)
+            }
+            assertEquals(before, runtime.getStatus())
+            assertEquals(null, runtime.getLoadedModel())
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
     fun rejectsInvalidModelConfigPathWithoutNativeCrash() {
         val runtime = NativeMnn.create()
 

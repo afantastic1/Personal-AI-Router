@@ -206,6 +206,15 @@ class MnnEngineHost(
 
     fun getMetrics(): MnnRuntimeMetrics = stateLock.withLock { metrics }
 
+    fun probeOpenCl(): MnnResult<BackendCapabilityResult> = dispatch {
+        val result = try {
+            runtime.probeOpenCl()
+        } catch (_: Exception) {
+            BackendCapabilityResult.Error(ProbeReason.PROBE_FAILED)
+        }
+        MnnResult.success(result)
+    }
+
     fun getHealth(): MnnHealthStatus = stateLock.withLock {
         val available = runtimeAvailable && !closeRequested
         MnnHealthStatus(

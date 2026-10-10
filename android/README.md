@@ -28,13 +28,28 @@ POST /internal/models/unload
 
 Install each model as one directory below the app-private `files/mnn/models/` directory. The directory name is the exact model ID exposed by `/v1/models`. One model may be loaded and one generation may run at a time; a simultaneous generation returns `409 engine_busy`. Stopping PAIR first stops HTTP acceptance and requests cancellation of any active generation. HTTP workers and native runtime shutdown each have a 10-second bound, so full MNN container shutdown can take up to 20 seconds. If native inference does not return, PAIR continues stopping and logs that native resources may remain allocated until process exit. In that case, MNN may not unload cleanly, but the PAIR foreground service does not wait indefinitely for the optional engine. A native call that never returns cannot be safely force-killed in-process; isolating MNN in a separate process is future work.
 
-The Models tab stores the preferred MNN compute engine as `cpu` or `opencl` in
-DataStore. The choice applies to the next implicit model load and is restored
-when PAIR starts. `POST /internal/models/load` with a `backend` value also
-changes the process-local preference for subsequent model loads, but does not
-persist it; a later UI selection replaces that runtime override, and restarting
-PAIR restores the saved UI choice. If OpenCL is unsupported, the request returns
-`422 backend_unsupported` without falling back to CPU.
+The Models tab stores either automatic selection or a manual CPU/OpenCL
+preference in DataStore. New installs use automatic selection: an OpenCL runtime
+probe that succeeds selects OpenCL; every other result selects CPU. Existing
+`mnn_preferred_backend` values migrate as manual preferences. Manual OpenCL stays
+saved when unavailable, while the effective engine safely falls back to CPU.
+Changing the effective engine applies to the next inference request and does
+not interrupt an active generation.
+
+The OpenCL probe initializes the MNN runtime without loading a model. An
+`AVAILABLE` result only means that the runtime initialized; model compatibility
+is determined when a model loads and generates. Probe results are not persisted
+and are refreshed when the runtime starts or when the user requests a reprobe.
+The CPU APK reports OpenCL as not compiled. OpenCL builds remain opt-in with
+`-PpairMnnOpenCL=true` and request optional access to the public system library
+`libOpenCL.so`; this does not bypass Android vendor library access rules.
+
+The broker currently advertises the local MNN engine from overall runtime
+health, not from model-level readiness or the effective OpenCL capability. Do
+not treat a successful probe or an engine health response as proof that a model
+can run. Tightening gateway advertisement for an unavailable effective engine
+is a follow-up acceptance item; P0 intentionally leaves the Go broker contract
+unchanged.
 
 Chat completions accept structured `system`, `user`, and `assistant` messages. MNN applies the model's chat template. Both streamed SSE and non-streamed responses support `max_tokens`, `temperature`, `top_p`, and `seed`; the native runtime's terminal status maps to `finish_reason: stop` or `finish_reason: length`. Error responses keep HTTP status, OpenAI error type, and error code aligned. Unsupported OpenAI capabilities return an explicit HTTP 400 response.
 

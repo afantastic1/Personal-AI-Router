@@ -18,9 +18,10 @@ class MnnRuntimeContainer(
     private val closed = AtomicBoolean(false)
     private val closeRequested = AtomicBoolean(false)
     private val backendSelection = MnnBackendSelection(preferredBackend)
+    private val host = MnnEngineHost(runtime)
     private val inference = LocalMnnInferenceService(
         MnnModelCatalog(modelRoot),
-        MnnEngineHost(runtime),
+        host,
         backendSelection,
     )
     private val httpServer = MnnHttpServer(inference, port)
@@ -35,6 +36,13 @@ class MnnRuntimeContainer(
     fun preferredBackend(): MnnBackend = inference.preferredBackend()
 
     fun setPreferredBackend(backend: MnnBackend) = inference.setPreferredBackend(backend)
+
+    fun probeOpenCl(): MnnResult<BackendCapabilityResult> =
+        if (closeRequested.get() || closed.get()) {
+            MnnResult.failure(MnnErrorCode.INVALID_STATE, "MNN runtime container is closed.")
+        } else {
+            host.probeOpenCl()
+        }
 
     fun deleteModel(modelId: String, deleteFiles: () -> Unit): MnnResult<Unit> =
         inference.deleteModel(modelId, deleteFiles)

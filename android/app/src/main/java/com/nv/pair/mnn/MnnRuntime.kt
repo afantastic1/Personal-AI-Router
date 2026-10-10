@@ -24,5 +24,7 @@ interface MnnRuntime : AutoCloseable {
 
     fun getMetrics(): MnnRuntimeMetrics
 
+    fun probeOpenCl(): BackendCapabilityResult
+
     override fun close()
 }

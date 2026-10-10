@@ -238,6 +238,22 @@ class NativeMnn internal constructor(
 
     override fun getMetrics(): MnnRuntimeMetrics = lock.withLock { metrics }
 
+    override fun probeOpenCl(): BackendCapabilityResult {
+        if (initializationError != null) {
+            return BackendCapabilityResult.Error(ProbeReason.NATIVE_LIBRARY_UNAVAILABLE)
+        }
+        if (lock.withLock { closed || nativeHandle == 0L }) {
+            return BackendCapabilityResult.Error(ProbeReason.RUNTIME_STOPPED)
+        }
+        return try {
+            mapNativeOpenClProbeResult(nativeProbeOpenCl())
+        } catch (_: UnsatisfiedLinkError) {
+            BackendCapabilityResult.Error(ProbeReason.NATIVE_LIBRARY_UNAVAILABLE)
+        } catch (_: Exception) {
+            BackendCapabilityResult.Error(ProbeReason.PROBE_FAILED)
+        }
+    }
+
     override fun close() {
         lock.withLock {
             if (closed) {
@@ -336,6 +352,7 @@ class NativeMnn internal constructor(
     }
 
     private external fun nativeVersion(): String
+    private external fun nativeProbeOpenCl(): Int
     private external fun nativeCreateSession(): Long
     private external fun nativeLoadModel(handle: Long, configPath: String, backend: Int): Int
     private external fun nativeGenerateChat(
@@ -391,4 +408,12 @@ class NativeMnn internal constructor(
             }
         }
     }
+}
+
+internal fun mapNativeOpenClProbeResult(code: Int): BackendCapabilityResult = when (code) {
+    0 -> BackendCapabilityResult.Available
+    1 -> BackendCapabilityResult.Unavailable(ProbeReason.NOT_COMPILED)
+    2 -> BackendCapabilityResult.Unavailable(ProbeReason.RUNTIME_INIT_FAILED)
+    3 -> BackendCapabilityResult.Error(ProbeReason.PROBE_FAILED)
+    else -> BackendCapabilityResult.Error(ProbeReason.PROBE_FAILED)
 }

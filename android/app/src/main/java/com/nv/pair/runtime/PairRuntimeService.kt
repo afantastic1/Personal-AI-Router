@@ -29,6 +29,14 @@ import com.nv.pair.mnn.MnnRuntimeContainer
 import com.nv.pair.mnn.MnnErrorCode
 import com.nv.pair.mnn.MnnSettingsRepository
 import com.nv.pair.mnn.MnnBackend
+import com.nv.pair.mnn.BackendChoice
+import com.nv.pair.mnn.BackendCapability
+import com.nv.pair.mnn.EffectiveBackendSelection
+import com.nv.pair.mnn.MnnCapabilitySnapshot
+import com.nv.pair.mnn.ProbeReason
+import com.nv.pair.mnn.ProbeState
+import com.nv.pair.mnn.BackendCapabilityResult
+import com.nv.pair.mnn.resolveBackendChoice
 import com.nv.pair.models.ModelHubInstaller
 import com.nv.pair.network.MulticastLockManager
 import com.nv.pair.network.AndroidNetworkContext
@@ -77,12 +85,15 @@ class PairRuntimeService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commandMutex = Mutex()
     private val modelLifecycleMutex = Mutex()
+    private val backendSelectionMutex = Mutex()
     private val pendingInviteTargets = ConcurrentHashMap.newKeySet<String>()
     private lateinit var preferences: UiPreferencesRepository
     private lateinit var mnnSettings: MnnSettingsRepository
     private lateinit var multicastLock: MulticastLockManager
     private var runtimeJob: Job? = null
     @Volatile private var mnnRuntimeContainer: MnnRuntimeContainer? = null
+    private var openClProbeJob: Job? = null
+    private var openClProbeGeneration = 0L
     private val activeSession = AtomicReference<BrokerSession?>()
     @Volatile
     private var foreground = false
@@ -92,9 +103,7 @@ class PairRuntimeService : Service() {
         preferences = UiPreferencesRepository(applicationContext)
         mnnSettings = MnnSettingsRepository(applicationContext)
         serviceScope.launch {
-            mnnSettings.preferredBackend.collect { backend ->
-                applyPreferredMnnBackend(backend)
-            }
+            mnnSettings.backendChoice.collect { reconcileBackendSelection() }
         }
         multicastLock = MulticastLockManager(applicationContext)
         createNotificationChannel()
@@ -103,9 +112,8 @@ class PairRuntimeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> serviceScope.launch { commandMutex.withLock { stopRuntime(startId) } }
-            ACTION_MNN_BACKEND_CHANGED -> serviceScope.launch {
-                applyPreferredMnnBackend(MnnBackend.fromPreferenceValue(intent.getStringExtra(EXTRA_MNN_BACKEND)))
-            }
+            ACTION_MNN_BACKEND_CHANGED -> serviceScope.launch { reconcileBackendSelection() }
+            ACTION_MNN_REPROBE_OPENCL -> startOpenClProbe()
             ACTION_DELETE_MODEL -> serviceScope.launch { deleteInstalledModel(intent) }
             ACTION_CLOUD_ENABLED_CHANGED -> serviceScope.launch { updateCloudEnabled(intent.getBooleanExtra(EXTRA_CLOUD_ENABLED, false)) }
             ACTION_CLOUD_POLICY_CHANGED -> serviceScope.launch { updateCloudPolicy(intent.getStringExtra(EXTRA_CLOUD_POLICY).orEmpty()) }
@@ -142,6 +150,7 @@ class PairRuntimeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        invalidateOpenClProbe()
         runCatching { multicastLock.release() }
             .onFailure { android.util.Log.w(TAG, "multicast lock release failed during service destruction") }
         serviceScope.cancel()
@@ -338,6 +347,8 @@ class PairRuntimeService : Service() {
     }
 
     private suspend fun startOptionalMnnRuntime(): Boolean {
+        invalidateOpenClProbe()
+        _mnnCapabilities.value = MnnCapabilitySnapshot()
         _mnnLocalEngine.value = MnnLocalEngineStatus(available = false)
         if (mnnRuntimeContainer != null) {
             closeMnnRuntime()
@@ -347,7 +358,7 @@ class PairRuntimeService : Service() {
             val container = withContext(Dispatchers.IO) {
                 MnnRuntimeContainer(
                     File(filesDir, MNN_MODELS_DIRECTORY),
-                    preferredBackend = mnnSettings.readPreferredBackend(),
+                    preferredBackend = MnnBackend.CPU,
                 )
             }
             candidate = container
@@ -366,10 +377,13 @@ class PairRuntimeService : Service() {
                 return false
             }
             mnnRuntimeContainer = container
-            val preferredBackend = withContext(Dispatchers.IO) { mnnSettings.readPreferredBackend() }
-            container.setPreferredBackend(preferredBackend)
-            _preferredMnnBackend.value = preferredBackend
-            _mnnLocalEngine.value = MnnLocalEngineStatus(available = true, backend = preferredBackend)
+            _mnnLocalEngine.value = MnnLocalEngineStatus(available = true, backend = MnnBackend.CPU)
+            _mnnCapabilities.value = MnnCapabilitySnapshot(
+                cpu = BackendCapability(MnnBackend.CPU, ProbeState.AVAILABLE, checkedAtEpochMillis = System.currentTimeMillis()),
+                openCl = BackendCapability(MnnBackend.OPENCL, ProbeState.CHECKING),
+            )
+            reconcileBackendSelection()
+            startOpenClProbe()
             return true
         } catch (cancelled: CancellationException) {
             candidate?.let { closeUnstartedMnnContainer(it) }
@@ -387,12 +401,74 @@ class PairRuntimeService : Service() {
         }
     }
 
-    private fun applyPreferredMnnBackend(backend: MnnBackend) {
-        _preferredMnnBackend.value = backend
-        mnnRuntimeContainer?.setPreferredBackend(backend)
-        if (_mnnLocalEngine.value.available) {
-            _mnnLocalEngine.value = _mnnLocalEngine.value.copy(backend = backend, errorCode = null)
+    private suspend fun reconcileBackendSelection() {
+        backendSelectionMutex.withLock {
+            val container = mnnRuntimeContainer
+            val selectedChoice = withContext(Dispatchers.IO) { mnnSettings.readBackendChoice() }
+            val resolved = resolveBackendChoice(
+                selectedChoice,
+                _mnnCapabilities.value.openCl.state,
+                _mnnLocalEngine.value.available,
+            )
+            if (container != null && mnnRuntimeContainer === container) {
+                withContext(Dispatchers.IO) { container.setPreferredBackend(resolved.effectiveBackend) }
+            }
+            _backendChoice.value = selectedChoice
+            _effectiveBackendSelection.value = resolved
+            _preferredMnnBackend.value = resolved.effectiveBackend
+            if (_mnnLocalEngine.value.available) {
+                _mnnLocalEngine.value = _mnnLocalEngine.value.copy(backend = resolved.effectiveBackend)
+            }
         }
+    }
+
+    private fun startOpenClProbe() {
+        val container = mnnRuntimeContainer ?: return
+        if (openClProbeJob?.isActive == true) return
+        val generation = ++openClProbeGeneration
+        _mnnCapabilities.value = _mnnCapabilities.value.copy(
+            openCl = BackendCapability(MnnBackend.OPENCL, ProbeState.CHECKING),
+        )
+        openClProbeJob = serviceScope.launch {
+            val result = withContext(Dispatchers.IO) { container.probeOpenCl() }
+            if (mnnRuntimeContainer !== container || generation != openClProbeGeneration) return@launch
+            val capability = when (result) {
+                is com.nv.pair.mnn.MnnResult.Success -> when (val probe = result.value) {
+                    BackendCapabilityResult.Available -> BackendCapability(
+                        MnnBackend.OPENCL, ProbeState.AVAILABLE, checkedAtEpochMillis = System.currentTimeMillis(),
+                    )
+                    is BackendCapabilityResult.Unavailable -> BackendCapability(
+                        MnnBackend.OPENCL, ProbeState.UNAVAILABLE, probe.reason, System.currentTimeMillis(),
+                    )
+                    is BackendCapabilityResult.Error -> BackendCapability(
+                        MnnBackend.OPENCL, ProbeState.ERROR, probe.reason, System.currentTimeMillis(),
+                    )
+                }
+                is com.nv.pair.mnn.MnnResult.Failure -> BackendCapability(
+                    MnnBackend.OPENCL, ProbeState.ERROR,
+                    if (result.error.code == MnnErrorCode.INVALID_STATE) ProbeReason.RUNTIME_STOPPED else ProbeReason.PROBE_FAILED,
+                    System.currentTimeMillis(),
+                )
+            }
+            _mnnCapabilities.value = _mnnCapabilities.value.copy(openCl = capability)
+            reconcileBackendSelection()
+        }
+    }
+
+    private fun invalidateOpenClProbe() {
+        openClProbeGeneration += 1
+        openClProbeJob?.cancel()
+        openClProbeJob = null
+        _mnnCapabilities.value = _mnnCapabilities.value.copy(
+            openCl = BackendCapability(MnnBackend.OPENCL, ProbeState.UNKNOWN, ProbeReason.RUNTIME_STOPPED),
+        )
+        _mnnLocalEngine.value = MnnLocalEngineStatus(available = false, backend = MnnBackend.CPU)
+        _preferredMnnBackend.value = MnnBackend.CPU
+        _effectiveBackendSelection.value = resolveBackendChoice(
+            _backendChoice.value,
+            ProbeState.UNKNOWN,
+            engineAvailable = false,
+        )
     }
 
     private suspend fun closeUnstartedMnnContainer(container: MnnRuntimeContainer) {
@@ -437,6 +513,7 @@ class PairRuntimeService : Service() {
     }
 
     private suspend fun closeMnnRuntime() {
+        invalidateOpenClProbe()
         modelLifecycleMutex.withLock {
             val container = mnnRuntimeContainer
             if (container != null) {
@@ -489,6 +566,7 @@ class PairRuntimeService : Service() {
                 routerRepository.setProxyStatus(status)
             }
             mnnRuntimeContainer?.let { container ->
+                val previousHealth = _mnnLocalEngine.value.available
                 val (health, status) = withContext(Dispatchers.IO) {
                     container.health() to container.runtimeStatus()
                 }
@@ -497,6 +575,7 @@ class PairRuntimeService : Service() {
                     backend = container.preferredBackend(),
                     errorCode = status.error?.code,
                 )
+                if (previousHealth != health.available) reconcileBackendSelection()
             }
             delay(2_000)
         }
@@ -734,6 +813,7 @@ class PairRuntimeService : Service() {
         const val ACTION_START = "com.nv.pair.action.START_RUNTIME"
         const val ACTION_STOP = "com.nv.pair.action.STOP_RUNTIME"
         const val ACTION_MNN_BACKEND_CHANGED = "com.nv.pair.action.MNN_BACKEND_CHANGED"
+        const val ACTION_MNN_REPROBE_OPENCL = "com.nv.pair.action.MNN_REPROBE_OPENCL"
         const val ACTION_DELETE_MODEL = "com.nv.pair.action.DELETE_MODEL"
         const val ACTION_CLOUD_ENABLED_CHANGED = "com.nv.pair.action.CLOUD_ENABLED_CHANGED"
         const val EXTRA_CLOUD_ENABLED = "com.nv.pair.extra.CLOUD_ENABLED"
@@ -748,7 +828,6 @@ class PairRuntimeService : Service() {
         const val EXTRA_VALUE = "com.nv.pair.extra.VALUE"
         const val EXTRA_SECONDARY = "com.nv.pair.extra.SECONDARY"
         const val EXTRA_ACCEPT = "com.nv.pair.extra.ACCEPT"
-        const val EXTRA_MNN_BACKEND = "com.nv.pair.extra.MNN_BACKEND"
         const val EXTRA_MODEL_DELETE_REQUEST_ID = "com.nv.pair.extra.MODEL_DELETE_REQUEST_ID"
         const val EXTRA_MODEL_DELETE_ID = "com.nv.pair.extra.MODEL_DELETE_ID"
 
@@ -774,6 +853,14 @@ class PairRuntimeService : Service() {
         private val _mnnLocalEngine = MutableStateFlow(MnnLocalEngineStatus(available = false))
         val mnnLocalEngine: StateFlow<MnnLocalEngineStatus> = _mnnLocalEngine.asStateFlow()
         private val _preferredMnnBackend = MutableStateFlow(MnnBackend.CPU)
+        private val _backendChoice = MutableStateFlow<BackendChoice>(BackendChoice.Auto)
+        val backendChoice: StateFlow<BackendChoice> = _backendChoice.asStateFlow()
+        private val _mnnCapabilities = MutableStateFlow(MnnCapabilitySnapshot())
+        val mnnCapabilities: StateFlow<MnnCapabilitySnapshot> = _mnnCapabilities.asStateFlow()
+        private val _effectiveBackendSelection = MutableStateFlow(
+            EffectiveBackendSelection(BackendChoice.Auto, MnnBackend.CPU, resolving = true),
+        )
+        val effectiveBackendSelection: StateFlow<EffectiveBackendSelection> = _effectiveBackendSelection.asStateFlow()
         val workloads = routerRepository.workloads
         val cloudProviderSettings: StateFlow<com.nv.pair.rpc.CloudProviderSettings?> = _cloudProviderSettings.asStateFlow()
         val modelDeletionResults = MutableSharedFlow<ModelDeletionResult>(extraBufferCapacity = 8)

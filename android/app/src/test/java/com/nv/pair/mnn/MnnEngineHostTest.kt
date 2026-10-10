@@ -187,6 +187,21 @@ class MnnEngineHostTest {
     }
 
     @Test
+    fun openClProbeRunsWithoutChangingEngineHealthOrStatus() {
+        val runtime = FakeMnnRuntime()
+        val host = MnnEngineHost(runtime)
+        assertTrue(host.loadModel(model(), MnnBackend.CPU) is MnnResult.Success)
+        val before = host.getStatus()
+
+        val result = host.probeOpenCl()
+
+        assertEquals(MnnResult.Success(BackendCapabilityResult.Available), result)
+        assertEquals(before, host.getStatus())
+        assertTrue(host.getHealth().available)
+        host.close()
+    }
+
+    @Test
     fun failedLoadReachesErrorAndLeavesNoLoadedModel() {
         val host = MnnEngineHost(FakeMnnRuntime(loadError = MnnErrorCode.MODEL_LOAD_FAILED))
 
@@ -519,6 +534,8 @@ class MnnEngineHostTest {
             }
             return MnnRuntimeMetrics()
         }
+
+        override fun probeOpenCl(): BackendCapabilityResult = BackendCapabilityResult.Available
 
         override fun close() {
             closeCount.incrementAndGet()

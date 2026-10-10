@@ -221,7 +221,7 @@ Session* ToSession(jlong handle) {
 }
 
 #if PAIR_MNN_HAS_OPENCL
-bool CanInitializeOpenClRuntime() {
+int ProbeOpenClRuntime() {
     try {
         MNN::ScheduleConfig config;
         config.type = MNN_FORWARD_OPENCL;
@@ -229,9 +229,9 @@ bool CanInitializeOpenClRuntime() {
         const std::vector<MNN::ScheduleConfig> configs{config};
         const MNN::RuntimeInfo runtime = MNN::Interpreter::createRuntime(configs);
         const auto openClRuntime = runtime.first.find(MNN_FORWARD_OPENCL);
-        return openClRuntime != runtime.first.end() && openClRuntime->second != nullptr;
+        return openClRuntime != runtime.first.end() && openClRuntime->second != nullptr ? 0 : 2;
     } catch (...) {
-        return false;
+        return 3;
     }
 }
 #endif
@@ -245,6 +245,19 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_nv_pair_mnn_NativeMnn_nativeVersion(JNIEnv* env, jobject) {
     return env->NewStringUTF("3.6.1");
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_nv_pair_mnn_NativeMnn_nativeProbeOpenCl(JNIEnv*, jobject) {
+#if !PAIR_MNN_HAS_OPENCL
+    return 1;
+#else
+    try {
+        return ProbeOpenClRuntime();
+    } catch (...) {
+        return 3;
+    }
+#endif
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -267,7 +280,7 @@ Java_com_nv_pair_mnn_NativeMnn_nativeLoadModel(JNIEnv* env, jobject, jlong handl
         return kUnsupported;
     }
 #else
-    if (backend == 1 && !CanInitializeOpenClRuntime()) {
+    if (backend == 1 && ProbeOpenClRuntime() != 0) {
         return kUnsupported;
     }
 #endif
