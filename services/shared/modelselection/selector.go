@@ -42,6 +42,9 @@ type RuntimeModel struct {
 	MemoryPressure         float64
 	AvailableMemoryBytes   int64
 	NetworkCost            float64
+	PendingRequests        int
+	GPUPressure            int
+	ResourcesKnown         bool
 }
 
 type Requirements struct {
@@ -68,6 +71,7 @@ func (AutoModelSelector) Select(requested string, requirements Requirements, inv
 	if policy == AutoAlias {
 		policy = AutoBalancedAlias
 	}
+	//只支持三种自动策略
 	if policy != AutoFastAlias && policy != AutoBalancedAlias && policy != AutoBestAlias {
 		return nil
 	}
@@ -136,6 +140,12 @@ func scoreCandidate(policy string, candidate RuntimeModel) float64 {
 	if candidate.MemoryPressure > 0 {
 		pressure = 1 - clamp(candidate.MemoryPressure)
 	}
+	pending := unknownSignalScore
+	gpuPressure := unknownSignalScore
+	if candidate.ResourcesKnown {
+		pending = 1 / (1 + float64(max(candidate.PendingRequests, 0)))
+		gpuPressure = 1 - clamp(float64(candidate.GPUPressure)/3)
+	}
 	network := unknownSignalScore
 	if candidate.NetworkCost > 0 {
 		network = 1 - clamp(candidate.NetworkCost)
@@ -143,13 +153,16 @@ func scoreCandidate(policy string, candidate RuntimeModel) float64 {
 
 	switch policy {
 	case AutoFastAlias:
-		return fastWeights.loaded*loaded + fastWeights.latency*latency + fastWeights.throughput*throughput + fastWeights.size*size
+		return fastWeights.loaded*loaded + fastWeights.latency*latency + fastWeights.throughput*throughput + fastWeights.size*size +
+			fastWeights.pending*pending + fastWeights.gpuPressure*gpuPressure
 	case AutoBestAlias:
 		capability := float64(capabilityCount(effectiveCapabilities(candidate))) / 4
-		return bestWeights.quality*quality + bestWeights.context*contextScore(candidate.Model.ContextLength) + bestWeights.capability*capability
+		return bestWeights.quality*quality + bestWeights.context*contextScore(candidate.Model.ContextLength) + bestWeights.capability*capability +
+			bestWeights.pending*pending + bestWeights.gpuPressure*gpuPressure
 	default:
 		return balancedWeights.quality*quality + balancedWeights.latency*latency + balancedWeights.loaded*loaded +
-			balancedWeights.network*network + balancedWeights.pressure*pressure
+			balancedWeights.network*network + balancedWeights.pressure*pressure + balancedWeights.pending*pending +
+			balancedWeights.gpuPressure*gpuPressure
 	}
 }
 
@@ -210,11 +223,14 @@ func engineRank(engine string) int {
 	return len(enginePreference)
 }
 
-type scoreWeights struct{ quality, latency, loaded, network, pressure, throughput, size, context, capability, parameters float64 }
+type scoreWeights struct {
+	quality, latency, loaded, network, pressure, throughput, size, context, capability, parameters float64
+	pending, gpuPressure                                                                           float64
+}
 
 var (
-	fastWeights     = scoreWeights{loaded: 0.45, latency: 0.30, throughput: 0.15, size: 0.10}
-	balancedWeights = scoreWeights{quality: 0.35, latency: 0.20, loaded: 0.15, network: 0.15, pressure: 0.15}
-	bestWeights     = scoreWeights{quality: 0.65, context: 0.25, capability: 0.10}
+	fastWeights     = scoreWeights{loaded: 0.25, latency: 0.20, throughput: 0.10, size: 0.05, pending: 0.20, gpuPressure: 0.20}
+	balancedWeights = scoreWeights{quality: 0.25, latency: 0.15, loaded: 0.10, network: 0.10, pressure: 0.05, pending: 0.20, gpuPressure: 0.15}
+	bestWeights     = scoreWeights{quality: 0.62, context: 0.23, capability: 0.10, pending: 0.03, gpuPressure: 0.02}
 	qualityWeights  = scoreWeights{parameters: 0.8, context: 0.2}
 )

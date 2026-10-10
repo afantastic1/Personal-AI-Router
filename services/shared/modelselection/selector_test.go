@@ -113,11 +113,84 @@ func TestLoadedCandidatePreferenceRemainsDeterministic(t *testing.T) {
 	}
 }
 
+func TestAutoBalancedPrefersLargerModelOnLessLoadedDeployment(t *testing.T) {
+	large := runtimeModel("model-32b", "ollama", 32_000_000_000, true, 300, 30, nil)
+	large.NodeID = "pc-a"
+	large.PendingRequests = 4
+	large.GPUPressure = 3
+	large.ResourcesKnown = true
+
+	mediumBusy := runtimeModel("model-8b", "ollama", 8_000_000_000, true, 300, 30, nil)
+	mediumBusy.NodeID = "pc-a"
+	mediumBusy.PendingRequests = 4
+	mediumBusy.GPUPressure = 3
+	mediumBusy.ResourcesKnown = true
+	mediumIdle := mediumBusy
+	mediumIdle.NodeID = "pc-b"
+	mediumIdle.PendingRequests = 0
+	mediumIdle.GPUPressure = 0
+
+	small := runtimeModel("model-4b", "ollama", 4_000_000_000, true, 300, 30, nil)
+	small.NodeID = "android"
+	small.PendingRequests = 0
+	small.GPUPressure = 0
+	small.ResourcesKnown = true
+
+	selection := (AutoModelSelector{}).Select(AutoBalancedAlias, Requirements{}, []RuntimeModel{large, mediumBusy, mediumIdle, small})
+	if selection == nil || selection.Model.EngineModelID != "model-8b" || selection.NodeID != "pc-b" {
+		t.Fatalf("selection = %+v, want 8B model using its low-load pc-b deployment", selection)
+	}
+}
+
+func TestAutoBestKeepsQualityAheadOfResourcePressure(t *testing.T) {
+	large := runtimeModel("model-32b", "ollama", 32_000_000_000, false, 500, 20, nil)
+	large.PendingRequests = 8
+	large.GPUPressure = 3
+	large.ResourcesKnown = true
+	small := runtimeModel("model-8b", "ollama", 8_000_000_000, false, 500, 20, nil)
+	small.PendingRequests = 0
+	small.GPUPressure = 0
+	small.ResourcesKnown = true
+
+	selection := (AutoModelSelector{}).Select(AutoBestAlias, Requirements{}, []RuntimeModel{small, large})
+	if selection == nil || selection.Model.EngineModelID != large.Model.EngineModelID {
+		t.Fatalf("selection = %+v, want quality-led 32B model", selection)
+	}
+}
+
+func TestAutoFastUsesFreshResourcesToChooseAmongModelDeployments(t *testing.T) {
+	busy := runtimeModel("same-model", "ollama", 8_000_000_000, true, 300, 30, nil)
+	busy.NodeID = "pc-a"
+	busy.PendingRequests = 3
+	busy.GPUPressure = 3
+	busy.ResourcesKnown = true
+	idle := busy
+	idle.NodeID = "pc-b"
+	idle.PendingRequests = 0
+	idle.GPUPressure = 0
+
+	selection := (AutoModelSelector{}).Select(AutoFastAlias, Requirements{}, []RuntimeModel{busy, idle})
+	if selection == nil || selection.NodeID != "pc-b" {
+		t.Fatalf("selection = %+v, want same model's idle pc-b deployment", selection)
+	}
+}
+
+func TestGPUPressureDoesNotActAsMemoryPressureOrCapacity(t *testing.T) {
+	candidate := runtimeModel("gpu-busy", "ollama", 8_000_000_000, false, 0, 0, nil)
+	candidate.ResourcesKnown = true
+	candidate.GPUPressure = 3
+	candidate.MemoryPressure = 0
+	candidate.AvailableMemoryBytes = candidate.Model.EstimatedMemoryBytes
+	if !eligible(candidate, Requirements{MaximumMemoryBytes: candidate.Model.EstimatedMemoryBytes}) {
+		t.Fatal("GPU pressure incorrectly disqualified a model with sufficient reported memory")
+	}
+}
+
 func TestUnknownSignalsUseNeutralScore(t *testing.T) {
 	candidate := runtimeModel("unknown", "ollama", 0, false, 0, 0, nil)
 	candidate.Model.ContextLength = 0
-	if score := scoreCandidate(AutoBalancedAlias, candidate); math.Abs(score-0.425) > 1e-12 {
-		t.Fatalf("score for unknown signals = %v, want neutral score 0.425", score)
+	if score := scoreCandidate(AutoBalancedAlias, candidate); math.Abs(score-0.45) > 1e-12 {
+		t.Fatalf("score for unknown signals = %v, want neutral score 0.45", score)
 	}
 }
 

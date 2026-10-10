@@ -26,6 +26,47 @@ func applySnapshot(p *Proxy, priority schedulerwire.Priority) int {
 	return p.SetPrioritySnapshot(priority)
 }
 
+func TestPrioritySnapshotReturnsDetachedResourceMap(t *testing.T) {
+	proxy := NewProxy(nil)
+	applySnapshot(proxy, schedulerwire.Priority{
+		Nodes: []string{"node-a"},
+		Ranks: []schedulerwire.NodeRank{{ID: "node-a", Pending: 2, GPUPressure: 1}},
+	})
+
+	snapshot := proxy.prioritySnapshot()
+	snapshot.nodes["node-a"] = priorityNodeSnapshot{pending: 99, gpuPressure: 99}
+	if got := proxy.prioritySnapshot().nodes["node-a"]; got.pending != 2 || got.gpuPressure != 1 {
+		t.Fatalf("mutating returned snapshot changed Proxy state: %+v", got)
+	}
+}
+
+func TestPrioritySnapshotReadsRemainConsistentDuringUpdates(t *testing.T) {
+	proxy := NewProxy(nil)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		for generation := uint64(1); generation <= 200; generation++ {
+			pending := int(generation)
+			proxy.SetPrioritySnapshot(schedulerwire.Priority{
+				Generation: generation,
+				Nodes:      []string{"node-a"},
+				Ranks:      []schedulerwire.NodeRank{{ID: "node-a", Pending: pending, GPUPressure: pending % (schedulerwire.MaxGPUPressure + 1)}},
+			})
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for range 1000 {
+			snapshot := proxy.prioritySnapshot()
+			if node, ok := snapshot.nodes["node-a"]; ok && node.gpuPressure != node.pending%(schedulerwire.MaxGPUPressure+1) {
+				t.Errorf("observed torn node snapshot: %+v", node)
+			}
+		}
+	}()
+	workers.Wait()
+}
+
 func reservationCandidates(ids ...string) []candidate {
 	out := make([]candidate, 0, len(ids))
 	for _, id := range ids {

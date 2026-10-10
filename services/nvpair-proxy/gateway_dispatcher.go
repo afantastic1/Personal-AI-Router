@@ -520,12 +520,13 @@ func facadeAdvertisesModel(f *facade, model string) bool {
 
 func localGatewayCapabilities(_ string) map[string]bool {
 	return map[string]bool{"chat": true, "streaming": true}
-}
+} //本地网关支持chat和streaming两种能力
 
 func localPublicModelID(engine, model string) string {
 	return "local/" + engine + "/" + url.PathEscape(model)
 }
 
+// 该函数是本地模型 ID 格式校验 + 解析工具，严格校验 local/目录/模型名 格式，返回目录、解码后的模型名和成功标识。
 func parseLocalPublicModelID(publicID string) (string, string, bool) {
 	parts := strings.SplitN(publicID, "/", 3)
 	if len(parts) != 3 || parts[0] != "local" || parts[1] == "" || parts[2] == "" {
@@ -748,6 +749,7 @@ func mapCloudGatewayError(err error) (int, string, string) {
 	}
 }
 
+// ：解析网关请求 JSON 数据，提取核心特征并生成gatewayRequestTraits结构体，返回解析结果和错误。
 func parseGatewayRequestTraits(body []byte) (gatewayRequestTraits, error) {
 	var request struct {
 		Model          string          `json:"model"`

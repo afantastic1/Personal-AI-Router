@@ -12,6 +12,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"nvpair-shared/modelselection"
+	"nvpair-shared/schedulerwire"
 )
 
 func TestGatewayRequestCapabilitiesInspectStructuredImageParts(t *testing.T) {
@@ -110,6 +114,112 @@ func TestGatewayAutoPoliciesSelectOnlyAdvertisedModels(t *testing.T) {
 	}
 	if got := proxy.resolveGatewayModel(AUTO_ALIAS, nil); got == nil || got.Model.EngineModelID != "qwen3-1.7b" {
 		t.Fatalf("default auto selection = %+v, want balanced alias selection", got)
+	}
+}
+
+func TestGatewayInventoryRetainsEveryModelDeploymentAndFreshNodeResources(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	proxy.facades = map[string]*facade{
+		"ollama": newFacade(proxy, ollama, NewDiscovery(), 11435),
+	}
+	proxy.facades["ollama"].discovery.AddManual(Node{ID: "pc-a", Models: []string{"model-8b"}})
+	proxy.facades["ollama"].discovery.AddManual(Node{ID: "pc-b", Models: []string{"model-8b"}})
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 1,
+		Nodes:      []string{"pc-b", "pc-a"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "pc-a", Pending: 2, GPUPressure: 3},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0},
+		},
+	})
+
+	inventory := proxy.gatewayInventory()
+	if len(inventory) != 2 {
+		t.Fatalf("inventory has %d deployments, want 2: %+v", len(inventory), inventory)
+	}
+	byNode := make(map[string]modelselection.RuntimeModel, len(inventory))
+	for _, candidate := range inventory {
+		byNode[candidate.NodeID] = candidate
+	}
+	if byNode["pc-a"].PendingRequests != 2 || byNode["pc-a"].GPUPressure != 3 || !byNode["pc-a"].ResourcesKnown ||
+		byNode["pc-a"].MemoryPressure != 0 || byNode["pc-a"].AvailableMemoryBytes != 0 {
+		t.Errorf("pc-a resource signals = %+v, want pending=2 GPU pressure=3 and unknown memory", byNode["pc-a"])
+	}
+	if byNode["pc-b"].PendingRequests != 0 || byNode["pc-b"].GPUPressure != 0 || !byNode["pc-b"].ResourcesKnown {
+		t.Errorf("pc-b resource signals = %+v, want known idle values", byNode["pc-b"])
+	}
+}
+
+func TestGatewayInventoryTreatsMissingPriorityRankAsUnknown(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	proxy.facades = map[string]*facade{"ollama": newFacade(proxy, ollama, NewDiscovery(), 11435)}
+	proxy.facades["ollama"].discovery.AddManual(Node{ID: "pc", Models: []string{"model-8b"}})
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{Generation: 1, Nodes: []string{"pc"}})
+
+	inventory := proxy.gatewayInventory()
+	if len(inventory) != 1 || inventory[0].ResourcesKnown {
+		t.Fatalf("inventory = %+v, want one deployment with unknown resources", inventory)
+	}
+}
+
+func TestGatewayInventoryTreatsExpiredPrioritySnapshotAsUnknown(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	proxy.facades = map[string]*facade{"ollama": newFacade(proxy, ollama, NewDiscovery(), 11435)}
+	proxy.facades["ollama"].discovery.AddManual(Node{ID: "pc", Models: []string{"model-8b"}})
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 1,
+		Nodes:      []string{"pc"},
+		Ranks:      []schedulerwire.NodeRank{{ID: "pc", Pending: 0, GPUPressure: 0}},
+	})
+	proxy.priorityMu.Lock()
+	proxy.prioritySnapshotAt = time.Now().Add(-gatewayPrioritySnapshotMaxAge - time.Second)
+	proxy.priorityMu.Unlock()
+
+	inventory := proxy.gatewayInventory()
+	if len(inventory) != 1 || inventory[0].ResourcesKnown {
+		t.Fatalf("inventory = %+v, want one deployment with expired resources unknown", inventory)
+	}
+}
+
+func TestGatewayModelRankingTracksUpdatedPrioritySnapshots(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	discovery := NewDiscovery()
+	discovery.AddManual(Node{ID: "pc-a", Models: []string{"model-32b", "model-8b"}})
+	discovery.AddManual(Node{ID: "pc-b", Models: []string{"model-8b"}})
+	proxy.facades = map[string]*facade{"ollama": newFacade(proxy, ollama, discovery, 11435)}
+
+	selectionFor := func() *modelselection.Selection {
+		t.Helper()
+		return (modelselection.AutoModelSelector{}).Select(AUTO_BALANCED_ALIAS, modelselection.Requirements{}, proxy.gatewayInventory())
+	}
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 1,
+		Nodes:      []string{"pc-b", "pc-a"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "pc-a", Pending: 4, GPUPressure: 3},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0},
+		},
+	})
+	first := selectionFor()
+	if first == nil || first.Model.EngineModelID != "model-8b" || first.NodeID != "pc-b" {
+		t.Fatalf("selection from first snapshot = %+v, want 8B on pc-b", first)
+	}
+
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 2,
+		Nodes:      []string{"pc-a", "pc-b"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "pc-a", Pending: 0, GPUPressure: 0},
+			{ID: "pc-b", Pending: 4, GPUPressure: 3},
+		},
+	})
+	second := selectionFor()
+	if second == nil || second.Model.EngineModelID != "model-32b" || second.NodeID != "pc-a" {
+		t.Fatalf("selection from updated snapshot = %+v, want 32B on pc-a", second)
 	}
 }
 

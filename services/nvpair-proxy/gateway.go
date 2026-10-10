@@ -19,6 +19,8 @@ import (
 
 const gatewayAddress = "127.0.0.1:14326"
 
+const gatewayPrioritySnapshotMaxAge = 10 * time.Second
+
 const (
 	gatewayReadHeaderTimeout = 5 * time.Second
 	gatewayIdleTimeout       = 60 * time.Second
@@ -51,7 +53,10 @@ func (p *Proxy) gatewayModels() []gatewayModel {
 	return p.gatewayDispatcher.modelDirectory()
 }
 
+// 收集所有可用的运行时模型
 func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
+	priority := p.prioritySnapshot()
+	priorityFresh := !priority.receivedAt.IsZero() && time.Since(priority.receivedAt) <= gatewayPrioritySnapshotMaxAge
 	candidates := make(map[string]modelselection.RuntimeModel)
 	for _, f := range p.enabledFacades() {
 		engine := f.profile.Name
@@ -60,15 +65,13 @@ func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 				if strings.TrimSpace(model) == "" {
 					continue
 				}
-				key := engine + "\x00" + model
-				candidate := candidates[key]
+				key := engine + "\x00" + model + "\x00" + node.ID
+				candidate := modelselection.RuntimeModel{NodeID: node.ID, Engine: engine, Available: true}
 				candidate.Model = modelselection.ModelDescriptor{
 					LogicalID: engine + ":" + model, EngineModelID: model,
 					Family: modelFamily(model), ParameterCount: modelParameterCount(model),
 					Capabilities: modelCapabilities(), Compatible: true,
 				}
-				candidate.Engine = engine
-				candidate.Available = true
 				if candidate.Model.ParameterCount > 0 {
 					candidate.Model.EstimatedMemoryBytes = candidate.Model.ParameterCount * 2
 				}
@@ -76,6 +79,13 @@ func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 					if f.profile.normalizeModel(loaded) == f.profile.normalizeModel(model) {
 						candidate.Loaded = true
 						break
+					}
+				}
+				if priorityFresh {
+					if resource, ok := priority.nodes[node.ID]; ok {
+						candidate.PendingRequests = resource.pending
+						candidate.GPUPressure = resource.gpuPressure
+						candidate.ResourcesKnown = true
 					}
 				}
 				candidates[key] = candidate
@@ -88,6 +98,8 @@ func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 	}
 	return result
 }
+
+//自动选择匹配的网关模型
 
 func (p *Proxy) resolveGatewayModel(alias string, requestBody []byte) *modelselection.Selection {
 	return (modelselection.AutoModelSelector{}).Select(alias, modelselection.Requirements{
@@ -114,11 +126,12 @@ func modelFamily(model string) string {
 func modelCapabilities() map[string]bool {
 	// Discovery currently provides model IDs only. Do not infer optional
 	// capabilities from names. Local facades expose basic chat and SSE.
+	// 没有可靠能力信息，就不宣称模型支持Tool Calling
 	return map[string]bool{"chat": true, "streaming": true}
 }
 
 func requiredGatewayCapabilities(body []byte) map[string]bool {
-	traits, err := parseGatewayRequestTraits(body)
+	traits, err := parseGatewayRequestTraits(body) //gateway_dispatcher
 	if err != nil {
 		return nil
 	}

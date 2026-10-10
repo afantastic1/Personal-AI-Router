@@ -412,6 +412,7 @@ type Proxy struct {
 	priorityPending      map[string]int
 	priorityGPUPressure  map[string]int
 	priorityReservations map[string]int
+	prioritySnapshotAt   time.Time
 
 	// appliedPriorityGeneration is the newest snapshot generation applied, so a
 	// redelivered or superseded one cannot clear reservations twice. See
@@ -2475,6 +2476,39 @@ func (p *Proxy) PriorityList() []string {
 	return append([]string(nil), p.priority...)
 }
 
+type priorityNodeSnapshot struct {
+	pending     int
+	gpuPressure int
+}
+
+type priorityStateSnapshot struct {
+	generation uint64
+	receivedAt time.Time
+	nodes      map[string]priorityNodeSnapshot
+}
+
+// prioritySnapshot returns a detached, read-only view of scheduler resource
+// signals. Nodes without a rank are deliberately absent, so callers can tell
+// unknown metrics from a measured zero.
+func (p *Proxy) prioritySnapshot() priorityStateSnapshot {
+	p.priorityMu.RLock()
+	defer p.priorityMu.RUnlock()
+
+	nodes := make(map[string]priorityNodeSnapshot, len(p.priorityPending))
+	for id, pending := range p.priorityPending {
+		pressure, ok := p.priorityGPUPressure[id]
+		if !ok {
+			continue
+		}
+		nodes[id] = priorityNodeSnapshot{pending: pending, gpuPressure: pressure}
+	}
+	return priorityStateSnapshot{
+		generation: p.appliedPriorityGeneration,
+		receivedAt: p.prioritySnapshotAt,
+		nodes:      nodes,
+	}
+}
+
 // SetPriority stores the auto-routing priority order (highest first) and returns
 // the number of ids stored. The list is kept verbatim — unknown ids are retained
 // (a node may appear in discovery later) and only consulted at request time. An
@@ -2553,6 +2587,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 		return len(p.priority)
 	}
 	p.appliedPriorityGeneration = priority.Generation
+	p.prioritySnapshotAt = time.Now()
 	p.priority = cleaned
 	p.priorityPending = pending
 	p.priorityGPUPressure = gpuPressure
