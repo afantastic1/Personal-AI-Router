@@ -7,28 +7,30 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Goal
 
-Change only automatic model selection so the Gateway ranks available deployed
-models using current official Scheduler resource snapshots. NVIDIA Proxy keeps
-node placement, pending-work balancing, GPU-pressure balancing, reservations,
-and same-model failover. No task classification, cross-model retry, Broker,
-Scheduler, or telemetry changes are included. Explicit local model routing and
-Cloud Provider routing retain their current behavior.
+Change automatic model selection so the Gateway ranks available deployed
+models using official Scheduler resource snapshots and current Proxy
+reservations. NVIDIA Proxy keeps node placement, pending-work balancing,
+GPU-pressure balancing, reservations, and same-model failover. No task
+classification or cross-model retry is included. Explicit local model routing
+and Cloud Provider routing retain their current behavior.
 
 ## Data flow
 
 For each enabled engine, Gateway inventory retains one candidate per advertised
 `(engine, model, node)` deployment. Each candidate receives the node ID and
 whether that model is loaded there. Gateway obtains an immutable value snapshot
-of Proxy's per-node pending and GPU-pressure maps through a method guarded by
-`priorityMu`; it never reads those maps directly. The snapshot carries its
-generation and receipt time. A bounded freshness window makes delayed snapshots
-unknown rather than falsely idle.
+of Proxy's per-node pending, GPU-pressure freshness, and in-flight reservation
+maps through a method guarded by `priorityMu`; it never reads those maps
+directly. Scheduler's `gpuPressureKnown` flag applies the existing 10-second
+telemetry freshness rule. Gateway does not age the event-driven rank snapshot
+itself.
 
 Resource fields stay semantically separate: scheduler `GPUPressure` affects a
 GPU-pressure score only and is never interpreted as memory pressure or free
-memory. Missing or expired pending/pressure signals use the selector's neutral
-unknown score. They are not synthesized as zero. Per-node scores are never
-averaged together.
+memory. Missing pending data and pressure marked stale by Scheduler use the
+selector's neutral unknown score. They are not synthesized as zero. Current
+Proxy reservations contribute to pending load even if the latest Scheduler
+snapshot has no pending count. Per-node scores are never averaged together.
 
 The selector first applies existing availability, compatibility, and capability
 filters. It scores each deployment, then compares models using their strongest
@@ -50,6 +52,8 @@ deterministic tie breaks remain.
   cross-node average.
 - Each request reads a fresh locked copy of current Proxy state, so later
   scheduler snapshots affect subsequent model rankings.
+- A telemetry freshness transition changes `gpuPressureKnown`, so Scheduler
+  emits it even when the neutral pressure stays numerically `1`.
 - The snapshot accessor copies maps while holding a read lock; callers cannot
   mutate shared Proxy state.
 - Unknown or stale resource data does not receive a zero-load advantage.
@@ -58,12 +62,18 @@ deterministic tie breaks remain.
   paths without invoking automatic scoring.
 - No reservation is created during model selection. Resource state can change
   between selection and dispatch; this is an optimization, not a guarantee.
+- The model-ranked node remains advisory. Proxy can choose another owner using
+  newer pending work, reservations, or an explicit node selection.
+- Runtime inventory currently has no TTFT, token-rate, or network-cost source;
+  those score inputs retain their neutral defaults.
 
 ## Validation scope
 
 Regression coverage will include: the 32B busy PC-A versus 8B on busy PC-A and
 idle PC-B versus 4B low-pressure Android acceptance case; same-model multi-node
 best-node aggregation; changed snapshots changing subsequent selections;
-unknown and expired resource values; GPU-pressure semantic separation; safe
-concurrent snapshot reads and writes; explicit local and cloud routing; and
-unchanged official same-model failover behavior.
+unknown values and stale pressure transitions; GPU-pressure semantic separation;
+safe concurrent snapshot reads and writes; overlapping requests that shift
+subsequent model choices; advisory model-ranked nodes versus Proxy's actual
+node selection; explicit local and cloud routing; and unchanged official
+same-model failover behavior.

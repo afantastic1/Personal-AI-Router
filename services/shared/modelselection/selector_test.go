@@ -118,13 +118,15 @@ func TestAutoBalancedPrefersLargerModelOnLessLoadedDeployment(t *testing.T) {
 	large.NodeID = "pc-a"
 	large.PendingRequests = 4
 	large.GPUPressure = 3
-	large.ResourcesKnown = true
+	large.PendingKnown = true
+	large.GPUPressureKnown = true
 
 	mediumBusy := runtimeModel("model-8b", "ollama", 8_000_000_000, true, 300, 30, nil)
 	mediumBusy.NodeID = "pc-a"
 	mediumBusy.PendingRequests = 4
 	mediumBusy.GPUPressure = 3
-	mediumBusy.ResourcesKnown = true
+	mediumBusy.PendingKnown = true
+	mediumBusy.GPUPressureKnown = true
 	mediumIdle := mediumBusy
 	mediumIdle.NodeID = "pc-b"
 	mediumIdle.PendingRequests = 0
@@ -134,7 +136,8 @@ func TestAutoBalancedPrefersLargerModelOnLessLoadedDeployment(t *testing.T) {
 	small.NodeID = "android"
 	small.PendingRequests = 0
 	small.GPUPressure = 0
-	small.ResourcesKnown = true
+	small.PendingKnown = true
+	small.GPUPressureKnown = true
 
 	selection := (AutoModelSelector{}).Select(AutoBalancedAlias, Requirements{}, []RuntimeModel{large, mediumBusy, mediumIdle, small})
 	if selection == nil || selection.Model.EngineModelID != "model-8b" || selection.NodeID != "pc-b" {
@@ -146,11 +149,13 @@ func TestAutoBestKeepsQualityAheadOfResourcePressure(t *testing.T) {
 	large := runtimeModel("model-32b", "ollama", 32_000_000_000, false, 500, 20, nil)
 	large.PendingRequests = 8
 	large.GPUPressure = 3
-	large.ResourcesKnown = true
+	large.PendingKnown = true
+	large.GPUPressureKnown = true
 	small := runtimeModel("model-8b", "ollama", 8_000_000_000, false, 500, 20, nil)
 	small.PendingRequests = 0
 	small.GPUPressure = 0
-	small.ResourcesKnown = true
+	small.PendingKnown = true
+	small.GPUPressureKnown = true
 
 	selection := (AutoModelSelector{}).Select(AutoBestAlias, Requirements{}, []RuntimeModel{small, large})
 	if selection == nil || selection.Model.EngineModelID != large.Model.EngineModelID {
@@ -163,7 +168,8 @@ func TestAutoFastUsesFreshResourcesToChooseAmongModelDeployments(t *testing.T) {
 	busy.NodeID = "pc-a"
 	busy.PendingRequests = 3
 	busy.GPUPressure = 3
-	busy.ResourcesKnown = true
+	busy.PendingKnown = true
+	busy.GPUPressureKnown = true
 	idle := busy
 	idle.NodeID = "pc-b"
 	idle.PendingRequests = 0
@@ -175,9 +181,27 @@ func TestAutoFastUsesFreshResourcesToChooseAmongModelDeployments(t *testing.T) {
 	}
 }
 
+func TestAutoBalancedAccountsForCurrentProxyReservations(t *testing.T) {
+	reserved := runtimeModel("model-8b", "ollama", 8_000_000_000, true, 300, 30, nil)
+	reserved.NodeID = "pc-a"
+	reserved.PendingRequests = 0
+	reserved.GPUPressure = 0
+	reserved.GPUPressureKnown = true
+	reserved.InFlightReservations = 3
+	idle := reserved
+	idle.NodeID = "pc-b"
+	idle.InFlightReservations = 0
+
+	selection := (AutoModelSelector{}).Select(AutoBalancedAlias, Requirements{}, []RuntimeModel{reserved, idle})
+	if selection == nil || selection.NodeID != "pc-b" {
+		t.Fatalf("selection = %+v, want unreserved pc-b deployment", selection)
+	}
+}
+
 func TestGPUPressureDoesNotActAsMemoryPressureOrCapacity(t *testing.T) {
 	candidate := runtimeModel("gpu-busy", "ollama", 8_000_000_000, false, 0, 0, nil)
-	candidate.ResourcesKnown = true
+	candidate.PendingKnown = true
+	candidate.GPUPressureKnown = true
 	candidate.GPUPressure = 3
 	candidate.MemoryPressure = 0
 	candidate.AvailableMemoryBytes = candidate.Model.EstimatedMemoryBytes

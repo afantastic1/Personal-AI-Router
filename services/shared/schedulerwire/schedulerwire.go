@@ -15,10 +15,11 @@ const (
 // NodeRank is one node's position in a node-wide workload and GPU-pressure
 // ranking.
 type NodeRank struct {
-	ID          string `json:"id"`
-	Pending     int    `json:"pending"`
-	GPUPressure int    `json:"gpuPressure"`
-	Rank        int    `json:"rank"`
+	ID               string `json:"id"`
+	Pending          int    `json:"pending"`
+	GPUPressure      int    `json:"gpuPressure"`
+	GPUPressureKnown bool   `json:"gpuPressureKnown,omitempty"`
+	Rank             int    `json:"rank"`
 }
 
 // Priority is the payload accepted by a proxy's node/set-priority method.

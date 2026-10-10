@@ -30,12 +30,15 @@ func TestPrioritySnapshotReturnsDetachedResourceMap(t *testing.T) {
 	proxy := NewProxy(nil)
 	applySnapshot(proxy, schedulerwire.Priority{
 		Nodes: []string{"node-a"},
-		Ranks: []schedulerwire.NodeRank{{ID: "node-a", Pending: 2, GPUPressure: 1}},
+		Ranks: []schedulerwire.NodeRank{{ID: "node-a", Pending: 2, GPUPressure: 1, GPUPressureKnown: true}},
 	})
 
 	snapshot := proxy.prioritySnapshot()
 	snapshot.nodes["node-a"] = priorityNodeSnapshot{pending: 99, gpuPressure: 99}
-	if got := proxy.prioritySnapshot().nodes["node-a"]; got.pending != 2 || got.gpuPressure != 1 {
+	proxy.priorityMu.Lock()
+	proxy.priorityReservations["node-a"] = 4
+	proxy.priorityMu.Unlock()
+	if got := proxy.prioritySnapshot().nodes["node-a"]; got.pending != 2 || got.gpuPressure != 1 || !got.gpuPressureKnown || got.reservations != 4 {
 		t.Fatalf("mutating returned snapshot changed Proxy state: %+v", got)
 	}
 }
@@ -51,7 +54,7 @@ func TestPrioritySnapshotReadsRemainConsistentDuringUpdates(t *testing.T) {
 			proxy.SetPrioritySnapshot(schedulerwire.Priority{
 				Generation: generation,
 				Nodes:      []string{"node-a"},
-				Ranks:      []schedulerwire.NodeRank{{ID: "node-a", Pending: pending, GPUPressure: pending % (schedulerwire.MaxGPUPressure + 1)}},
+				Ranks:      []schedulerwire.NodeRank{{ID: "node-a", Pending: pending, GPUPressure: pending % (schedulerwire.MaxGPUPressure + 1), GPUPressureKnown: true}},
 			})
 		}
 	}()

@@ -120,7 +120,7 @@ proxy ordering. Personal AI Router leaves proxies in automatic mode.
 enabled engines with a smoothed 0–3 GPU-pressure signal. The backend scanner and
 manual node worker provide maximum-GPU utilization, while invalid, missing, or
 older-than-10-second samples receive neutral pressure. The scheduler emits
-order, pending count, and pressure; the broker forwards each `schedule:priority`
+order, pending count, pressure, and pressure freshness; the broker forwards each `schedule:priority`
 snapshot to the matching facade through `node/set-priority`. Each facade adds
 local reservations, so its estimate is
 `pending + gpuPressure + localReservations` during concurrent bursts.

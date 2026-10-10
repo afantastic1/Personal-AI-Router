@@ -62,7 +62,11 @@ one facade affects every other facade's ordering.
 
 Rankings are recomputed when the node set, catalog, or effective pressure
 changes, and reconciled on the interval timer. A ranking is only emitted when
-the order, pending counts, or pressure actually changed.
+the order, pending counts, pressure, or pressure freshness actually changed.
+`gpuPressureKnown` distinguishes a fresh pressure band of `1` from the neutral
+`1` used when telemetry is missing, invalid, or stale. The known flag changes
+when telemetry crosses its freshness limit, even when the numeric band stays
+the same.
 
 ## Output
 
@@ -77,8 +81,8 @@ One `schedule:priority` notification per engine (`ollama`, `lmstudio`,
     "engine": "ollama",
     "nodes": ["node-a-uuid", "node-b-uuid"],
     "ranks": [
-      { "id": "node-a-uuid", "pending": 0, "gpuPressure": 0, "rank": 0 },
-      { "id": "node-b-uuid", "pending": 3, "gpuPressure": 2, "rank": 1 }
+      { "id": "node-a-uuid", "pending": 0, "gpuPressure": 0, "gpuPressureKnown": true, "rank": 0 },
+      { "id": "node-b-uuid", "pending": 3, "gpuPressure": 2, "gpuPressureKnown": true, "rank": 1 }
     ]
   }
 }

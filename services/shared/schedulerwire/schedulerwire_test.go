@@ -36,8 +36,8 @@ func TestEnginePriorityRoundTripsGPUAwareRanks(t *testing.T) {
 		Engine: "ollama",
 		Nodes:  []string{"b", "a"},
 		Ranks: []NodeRank{
-			{ID: "b", Pending: 1, GPUPressure: 0, Rank: 0},
-			{ID: "a", Pending: 4, GPUPressure: 3, Rank: 1},
+			{ID: "b", Pending: 1, GPUPressure: 0, GPUPressureKnown: true, Rank: 0},
+			{ID: "a", Pending: 4, GPUPressure: 3, GPUPressureKnown: true, Rank: 1},
 		},
 	}
 	encoded, err := json.Marshal(want)
@@ -46,6 +46,9 @@ func TestEnginePriorityRoundTripsGPUAwareRanks(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), `"gpuPressure":3`) {
 		t.Fatalf("encoded priority omitted gpuPressure: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"gpuPressureKnown":true`) {
+		t.Fatalf("encoded priority omitted GPU pressure freshness: %s", encoded)
 	}
 
 	var got EnginePriority

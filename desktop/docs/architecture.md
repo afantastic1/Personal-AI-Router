@@ -241,7 +241,8 @@ engines with a smoothed 0–3 pressure derived from the busiest GPU. Missing,
 invalid, or older-than-10-second telemetry has neutral pressure. It emits the
 order, pending count, and pressure, reranking on meaningful workload, discovery,
 or pressure changes with a periodic reconciliation fallback. Each proxy chooses
-with `pending + gpuPressure + localReservations`, so concurrent bursts spread
+with `pending + gpuPressure + localReservations`; a separate freshness flag
+keeps stale telemetry neutral, so concurrent bursts spread
 across eligible owners before workload feedback arrives. An upstream `404`
 remains retryable among advertised owners because an inventory snapshot can
 become stale. Electron's richer renderer metrics are display-only; Electron does

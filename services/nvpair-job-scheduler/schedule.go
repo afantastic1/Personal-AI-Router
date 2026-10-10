@@ -100,10 +100,12 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 	ranks := make([]NodeRank, 0, len(m.nodes))
 	for id := range m.nodes {
 		state, ok := m.telemetry[id]
+		pressureKnown := telemetryFreshAt(state, now)
 		ranks = append(ranks, NodeRank{
-			ID:          id,
-			Pending:     pending[id],
-			GPUPressure: effectiveGPUPressure(state, ok, now),
+			ID:               id,
+			Pending:          pending[id],
+			GPUPressure:      effectiveGPUPressure(state, ok, now),
+			GPUPressureKnown: pressureKnown,
 		})
 	}
 	m.mu.Unlock()

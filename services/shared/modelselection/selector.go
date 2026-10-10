@@ -43,8 +43,10 @@ type RuntimeModel struct {
 	AvailableMemoryBytes   int64
 	NetworkCost            float64
 	PendingRequests        int
+	PendingKnown           bool
+	InFlightReservations   int
 	GPUPressure            int
-	ResourcesKnown         bool
+	GPUPressureKnown       bool
 }
 
 type Requirements struct {
@@ -142,8 +144,14 @@ func scoreCandidate(policy string, candidate RuntimeModel) float64 {
 	}
 	pending := unknownSignalScore
 	gpuPressure := unknownSignalScore
-	if candidate.ResourcesKnown {
-		pending = 1 / (1 + float64(max(candidate.PendingRequests, 0)))
+	if candidate.PendingKnown || candidate.InFlightReservations > 0 {
+		pendingCount := max(candidate.InFlightReservations, 0)
+		if candidate.PendingKnown {
+			pendingCount += max(candidate.PendingRequests, 0)
+		}
+		pending = 1 / (1 + float64(pendingCount))
+	}
+	if candidate.GPUPressureKnown {
 		gpuPressure = 1 - clamp(float64(candidate.GPUPressure)/3)
 	}
 	network := unknownSignalScore

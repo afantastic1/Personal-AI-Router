@@ -131,8 +131,8 @@ reserved for inference clients.
 `nvpair-job-scheduler` combines queued and running work across all engines with
 a smoothed 0–3 pressure from the busiest GPU. Invalid, missing, or
 older-than-10-second telemetry receives neutral pressure. It emits
-`schedule:priority` with order, pending count, and pressure; the broker applies
-each snapshot to the matching proxy through `node/set-priority`
+`schedule:priority` with order, pending count, pressure, and a pressure freshness
+flag; the broker applies each snapshot to the matching proxy through `node/set-priority`
 (generation-ordered so a stale async call cannot overwrite a newer snapshot,
 and re-pushed when a proxy respawns). Each proxy atomically minimizes
 `pending + gpuPressure + localReservations`, so simultaneous requests account

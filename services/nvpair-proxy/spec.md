@@ -553,7 +553,10 @@ approve. See README.md for the complete forwarding and intersection rules.
 
 A reservation is one in-flight dispatch this process has made since the last
 scheduler snapshot. Estimated load for a node is
-`pending + gpuPressure + reservations`, the first two from the scheduler.
+`pending + gpuPressure + reservations`, the first two from the scheduler. The
+scheduler reports whether GPU pressure reflects fresh telemetry separately
+from its numeric neutral value; consumers must not infer freshness from the
+pressure band alone.
 
 - **Taken** when a candidate is chosen, unless an eligible manual pin applies,
   and re-taken through the same path on each retry round (§5.1).

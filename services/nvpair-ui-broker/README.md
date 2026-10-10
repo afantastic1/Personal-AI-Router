@@ -162,8 +162,10 @@ telemetry, and discovery snapshot. It smooths fresh utilization into pressure
 and orders by `pending + gpuPressure`, then pressure, then stable UUID. Load is
 node-wide across Ollama, LM Studio, and llama.cpp because they normally contend
 for the same resources. Each engine-specific `schedule:priority` carries
-`{engine,nodes,ranks}` and refreshes when order, pending counts, or pressure
-changes. The broker caches, generation-orders, and replays the full
+`{engine,nodes,ranks}` and refreshes when order, pending counts, pressure, or
+pressure freshness changes. `gpuPressureKnown` distinguishes fresh pressure 1
+from the neutral 1 used when telemetry is missing or stale. The broker caches,
+generation-orders, and replays the full
 `{nodes,ranks}` snapshot to the matching facade, where a newly delivered
 snapshot resets optimistic reservation deltas. On scheduler spawn/restart the
 broker replays active workloads and telemetry before discovery, then resumes all

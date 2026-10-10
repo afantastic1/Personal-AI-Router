@@ -407,12 +407,12 @@ type Proxy struct {
 	// reads priority to form the failover list; reserveCandidate atomically adds
 	// local dispatches before forwarding so a concurrent burst cannot repeatedly
 	// choose from the same stale scheduler state.
-	priorityMu           sync.RWMutex
-	priority             []string
-	priorityPending      map[string]int
-	priorityGPUPressure  map[string]int
-	priorityReservations map[string]int
-	prioritySnapshotAt   time.Time
+	priorityMu               sync.RWMutex
+	priority                 []string
+	priorityPending          map[string]int
+	priorityGPUPressure      map[string]int
+	priorityGPUPressureKnown map[string]bool
+	priorityReservations     map[string]int
 
 	// appliedPriorityGeneration is the newest snapshot generation applied, so a
 	// redelivered or superseded one cannot clear reservations twice. See
@@ -2477,14 +2477,15 @@ func (p *Proxy) PriorityList() []string {
 }
 
 type priorityNodeSnapshot struct {
-	pending     int
-	gpuPressure int
+	pending          int
+	pendingKnown     bool
+	gpuPressure      int
+	gpuPressureKnown bool
+	reservations     int
 }
 
 type priorityStateSnapshot struct {
-	generation uint64
-	receivedAt time.Time
-	nodes      map[string]priorityNodeSnapshot
+	nodes map[string]priorityNodeSnapshot
 }
 
 // prioritySnapshot returns a detached, read-only view of scheduler resource
@@ -2494,19 +2495,25 @@ func (p *Proxy) prioritySnapshot() priorityStateSnapshot {
 	p.priorityMu.RLock()
 	defer p.priorityMu.RUnlock()
 
-	nodes := make(map[string]priorityNodeSnapshot, len(p.priorityPending))
+	nodes := make(map[string]priorityNodeSnapshot, len(p.priorityPending)+len(p.priorityReservations))
 	for id, pending := range p.priorityPending {
-		pressure, ok := p.priorityGPUPressure[id]
-		if !ok {
-			continue
-		}
-		nodes[id] = priorityNodeSnapshot{pending: pending, gpuPressure: pressure}
+		node := nodes[id]
+		node.pending = pending
+		node.pendingKnown = true
+		nodes[id] = node
 	}
-	return priorityStateSnapshot{
-		generation: p.appliedPriorityGeneration,
-		receivedAt: p.prioritySnapshotAt,
-		nodes:      nodes,
+	for id, pressure := range p.priorityGPUPressure {
+		node := nodes[id]
+		node.gpuPressure = pressure
+		node.gpuPressureKnown = p.priorityGPUPressureKnown[id]
+		nodes[id] = node
 	}
+	for id, reservations := range p.priorityReservations {
+		node := nodes[id]
+		node.reservations = reservations
+		nodes[id] = node
+	}
+	return priorityStateSnapshot{nodes: nodes}
 }
 
 // SetPriority stores the auto-routing priority order (highest first) and returns
@@ -2559,6 +2566,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 	cleaned := append([]string(nil), priority.Nodes...)
 	pending := make(map[string]int, len(priority.Ranks))
 	gpuPressure := make(map[string]int, len(priority.Ranks))
+	gpuPressureKnown := make(map[string]bool, len(priority.Ranks))
 	for _, rank := range priority.Ranks {
 		if rank.ID == "" {
 			continue
@@ -2573,6 +2581,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 		}
 		pending[rank.ID] = rank.Pending
 		gpuPressure[rank.ID] = rank.GPUPressure
+		gpuPressureKnown[rank.ID] = rank.GPUPressureKnown
 	}
 
 	// Unconditional, with no escape hatch for an unversioned snapshot. One used
@@ -2587,10 +2596,10 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 		return len(p.priority)
 	}
 	p.appliedPriorityGeneration = priority.Generation
-	p.prioritySnapshotAt = time.Now()
 	p.priority = cleaned
 	p.priorityPending = pending
 	p.priorityGPUPressure = gpuPressure
+	p.priorityGPUPressureKnown = gpuPressureKnown
 	p.priorityReservations = make(map[string]int)
 	return len(cleaned)
 }

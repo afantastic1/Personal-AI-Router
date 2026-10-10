@@ -5,14 +5,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"nvpair-shared/modelselection"
 	"nvpair-shared/schedulerwire"
@@ -129,8 +130,8 @@ func TestGatewayInventoryRetainsEveryModelDeploymentAndFreshNodeResources(t *tes
 		Generation: 1,
 		Nodes:      []string{"pc-b", "pc-a"},
 		Ranks: []schedulerwire.NodeRank{
-			{ID: "pc-a", Pending: 2, GPUPressure: 3},
-			{ID: "pc-b", Pending: 0, GPUPressure: 0},
+			{ID: "pc-a", Pending: 2, GPUPressure: 3, GPUPressureKnown: true},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
 		},
 	})
 
@@ -142,11 +143,11 @@ func TestGatewayInventoryRetainsEveryModelDeploymentAndFreshNodeResources(t *tes
 	for _, candidate := range inventory {
 		byNode[candidate.NodeID] = candidate
 	}
-	if byNode["pc-a"].PendingRequests != 2 || byNode["pc-a"].GPUPressure != 3 || !byNode["pc-a"].ResourcesKnown ||
+	if byNode["pc-a"].PendingRequests != 2 || !byNode["pc-a"].PendingKnown || byNode["pc-a"].GPUPressure != 3 || !byNode["pc-a"].GPUPressureKnown ||
 		byNode["pc-a"].MemoryPressure != 0 || byNode["pc-a"].AvailableMemoryBytes != 0 {
 		t.Errorf("pc-a resource signals = %+v, want pending=2 GPU pressure=3 and unknown memory", byNode["pc-a"])
 	}
-	if byNode["pc-b"].PendingRequests != 0 || byNode["pc-b"].GPUPressure != 0 || !byNode["pc-b"].ResourcesKnown {
+	if byNode["pc-b"].PendingRequests != 0 || !byNode["pc-b"].PendingKnown || byNode["pc-b"].GPUPressure != 0 || !byNode["pc-b"].GPUPressureKnown {
 		t.Errorf("pc-b resource signals = %+v, want known idle values", byNode["pc-b"])
 	}
 }
@@ -159,12 +160,12 @@ func TestGatewayInventoryTreatsMissingPriorityRankAsUnknown(t *testing.T) {
 	proxy.SetPrioritySnapshot(schedulerwire.Priority{Generation: 1, Nodes: []string{"pc"}})
 
 	inventory := proxy.gatewayInventory()
-	if len(inventory) != 1 || inventory[0].ResourcesKnown {
+	if len(inventory) != 1 || inventory[0].PendingKnown || inventory[0].GPUPressureKnown {
 		t.Fatalf("inventory = %+v, want one deployment with unknown resources", inventory)
 	}
 }
 
-func TestGatewayInventoryTreatsExpiredPrioritySnapshotAsUnknown(t *testing.T) {
+func TestGatewayInventoryUsesSchedulerTelemetryFreshness(t *testing.T) {
 	proxy := NewProxy(nil)
 	ollama, _ := profileFor("ollama")
 	proxy.facades = map[string]*facade{"ollama": newFacade(proxy, ollama, NewDiscovery(), 11435)}
@@ -172,15 +173,12 @@ func TestGatewayInventoryTreatsExpiredPrioritySnapshotAsUnknown(t *testing.T) {
 	proxy.SetPrioritySnapshot(schedulerwire.Priority{
 		Generation: 1,
 		Nodes:      []string{"pc"},
-		Ranks:      []schedulerwire.NodeRank{{ID: "pc", Pending: 0, GPUPressure: 0}},
+		Ranks:      []schedulerwire.NodeRank{{ID: "pc", Pending: 0, GPUPressure: 1, GPUPressureKnown: false}},
 	})
-	proxy.priorityMu.Lock()
-	proxy.prioritySnapshotAt = time.Now().Add(-gatewayPrioritySnapshotMaxAge - time.Second)
-	proxy.priorityMu.Unlock()
 
 	inventory := proxy.gatewayInventory()
-	if len(inventory) != 1 || inventory[0].ResourcesKnown {
-		t.Fatalf("inventory = %+v, want one deployment with expired resources unknown", inventory)
+	if len(inventory) != 1 || !inventory[0].PendingKnown || inventory[0].GPUPressureKnown || inventory[0].GPUPressure != 1 {
+		t.Fatalf("inventory = %+v, want current pending and scheduler-marked stale pressure unknown", inventory)
 	}
 }
 
@@ -200,8 +198,8 @@ func TestGatewayModelRankingTracksUpdatedPrioritySnapshots(t *testing.T) {
 		Generation: 1,
 		Nodes:      []string{"pc-b", "pc-a"},
 		Ranks: []schedulerwire.NodeRank{
-			{ID: "pc-a", Pending: 4, GPUPressure: 3},
-			{ID: "pc-b", Pending: 0, GPUPressure: 0},
+			{ID: "pc-a", Pending: 4, GPUPressure: 3, GPUPressureKnown: true},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
 		},
 	})
 	first := selectionFor()
@@ -213,13 +211,144 @@ func TestGatewayModelRankingTracksUpdatedPrioritySnapshots(t *testing.T) {
 		Generation: 2,
 		Nodes:      []string{"pc-a", "pc-b"},
 		Ranks: []schedulerwire.NodeRank{
-			{ID: "pc-a", Pending: 0, GPUPressure: 0},
-			{ID: "pc-b", Pending: 4, GPUPressure: 3},
+			{ID: "pc-a", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
+			{ID: "pc-b", Pending: 4, GPUPressure: 3, GPUPressureKnown: true},
 		},
 	})
 	second := selectionFor()
 	if second == nil || second.Model.EngineModelID != "model-32b" || second.NodeID != "pc-a" {
 		t.Fatalf("selection from updated snapshot = %+v, want 32B on pc-a", second)
+	}
+}
+
+func TestGatewayModelChoiceDoesNotPinTheRatedNode(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	discovery := NewDiscovery()
+	serverA := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer serverB.Close()
+	discovery.AddManual(nodeForModel(t, "pc-a", serverA.URL, "qwen3-8b"))
+	discovery.AddManual(nodeForModel(t, "pc-b", serverB.URL, "qwen3-8b"))
+	f := newFacade(proxy, ollama, discovery, 11435)
+	proxy.facades = map[string]*facade{"ollama": f}
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 1,
+		Nodes:      []string{"pc-b", "pc-a"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "pc-a", Pending: 1, GPUPressure: 0, GPUPressureKnown: true},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
+		},
+	})
+
+	route, dispatchErr := proxy.gatewayDispatcher.resolveLocalAuto(AUTO_BALANCED_ALIAS, gatewayRequestTraits{
+		model: AUTO_BALANCED_ALIAS, capabilities: map[string]bool{"chat": true},
+	}, nil)
+	if dispatchErr != nil {
+		t.Fatalf("resolve auto route: %+v", dispatchErr)
+	}
+	if route.facade != f || route.upstreamModel != "qwen3-8b" || route.remoteNode != nil {
+		t.Fatalf("route = %+v, want model route without a pinned node", route)
+	}
+	bestDeployment := proxy.gatewayInventory()
+	selected := (modelselection.AutoModelSelector{}).Select(AUTO_BALANCED_ALIAS, modelselection.Requirements{}, bestDeployment)
+	if selected == nil || selected.NodeID != "pc-b" {
+		t.Fatalf("rated deployment = %+v, want pc-b", selected)
+	}
+
+	// Simulate an overlapping request that has already reserved pc-b after the
+	// Gateway scored it. Proxy scheduling must use the live reservation instead.
+	firstReservations := []reservation{
+		reservedOn(t, proxy, f, "pc-b"),
+		reservedOn(t, proxy, f, "pc-b"),
+	}
+	candidates := f.resolveCandidates(route.upstreamModel)
+	ordered, secondReservation := proxy.reserveCandidate(f, candidates)
+	defer func() {
+		for _, held := range firstReservations {
+			proxy.releaseReservation(held)
+		}
+	}()
+	defer proxy.releaseReservation(secondReservation)
+	if len(ordered) == 0 || ordered[0].id != "pc-a" {
+		t.Fatalf("Proxy order after pc-b reservation = %+v, want pc-a first", ordered)
+	}
+}
+
+func reservedOn(t *testing.T, proxy *Proxy, f *facade, nodeID string) reservation {
+	t.Helper()
+	_, held := proxy.reserveCandidate(f, reservationCandidates(nodeID))
+	if !held.held {
+		t.Fatalf("no reservation was created for %s", nodeID)
+	}
+	return held
+}
+
+func TestGatewayBurstModelSelectionUsesInFlightProxyReservations(t *testing.T) {
+	proxy := NewProxy(nil)
+	ollama, _ := profileFor("ollama")
+	discovery := NewDiscovery()
+	serverA := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer serverA.Close()
+	serverB := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer serverB.Close()
+	discovery.AddManual(nodeForModel(t, "pc-a", serverA.URL, "qwen3-8b"))
+	discovery.AddManual(nodeForModel(t, "pc-b", serverB.URL, "llama3-8b"))
+	f := newFacade(proxy, ollama, discovery, 11435)
+	proxy.facades = map[string]*facade{"ollama": f}
+	proxy.SetPrioritySnapshot(schedulerwire.Priority{
+		Generation: 1,
+		Nodes:      []string{"pc-a", "pc-b"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "pc-a", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
+			{ID: "pc-b", Pending: 0, GPUPressure: 0, GPUPressureKnown: true},
+		},
+	})
+
+	traits := gatewayRequestTraits{model: AUTO_BALANCED_ALIAS, capabilities: map[string]bool{"chat": true}}
+	type burstResult struct {
+		model string
+		err   error
+	}
+	start := make(chan struct{})
+	finish := make(chan struct{})
+	results := make(chan burstResult, 4)
+	var workers sync.WaitGroup
+	defer func() {
+		close(finish)
+		workers.Wait()
+	}()
+	selectedModels := make(map[string]int)
+	for request := 0; request < 4; request++ {
+		workers.Add(1)
+		go func(requestID int) {
+			defer workers.Done()
+			<-start
+			route, dispatchErr := proxy.gatewayDispatcher.resolveLocalAuto(AUTO_BALANCED_ALIAS, traits, nil)
+			if dispatchErr != nil {
+				results <- burstResult{err: fmt.Errorf("request %d resolve auto route: %+v", requestID, dispatchErr)}
+				return
+			}
+			candidates := route.facade.resolveCandidates(route.upstreamModel)
+			ordered, held := proxy.reserveCandidate(route.facade, candidates)
+			if len(ordered) != 1 || !held.held {
+				results <- burstResult{err: fmt.Errorf("request %d candidate order = %+v, reservation=%+v", requestID, ordered, held)}
+				return
+			}
+			results <- burstResult{model: route.upstreamModel}
+			<-finish // hold the Proxy reservation until the burst has selected every request
+			proxy.releaseReservation(held)
+		}(request)
+		start <- struct{}{}
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		selectedModels[result.model]++
+	}
+	if selectedModels["qwen3-8b"] != 2 || selectedModels["llama3-8b"] != 2 {
+		t.Fatalf("model distribution during overlapping burst = %v, want 2 requests per model", selectedModels)
 	}
 }
 

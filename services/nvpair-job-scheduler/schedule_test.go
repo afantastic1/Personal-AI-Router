@@ -207,6 +207,9 @@ func TestRank_CombinesPendingAndGPUPressure(t *testing.T) {
 		if got := pressureOf(ranks, id); got != want {
 			t.Fatalf("gpuPressure[%s] = %d, want %d; ranks=%+v", id, got, want, ranks)
 		}
+		if !knownPressureOf(ranks, id) {
+			t.Fatalf("gpuPressureKnown[%s] = false, want true; ranks=%+v", id, ranks)
+		}
 	}
 }
 
@@ -230,6 +233,35 @@ func TestRank_UnknownAndStaleTelemetryUseNeutralPressure(t *testing.T) {
 		pressureOf(ranks, "b") != unknownGPUPressure ||
 		pressureOf(ranks, "c") != unknownGPUPressure {
 		t.Fatalf("unexpected neutral-pressure ranking: %+v", ranks)
+	}
+	if !knownPressureOf(ranks, "a") || knownPressureOf(ranks, "b") || knownPressureOf(ranks, "c") {
+		t.Fatalf("unexpected GPU-pressure freshness flags: %+v", ranks)
+	}
+}
+
+func TestEmit_TelemetryFreshnessChangeEmitsWhenPressureValueStaysNeutral(t *testing.T) {
+	rec := &capRW{}
+	m := mgrWith(rec, []string{"node-a"})
+	now := time.Now()
+	m.applyTelemetryAt(noderec.NodeTelemetry{
+		HostUUID:          "node-a",
+		GPUUtilizationPct: 50,
+		TelemetryValid:    true,
+	}, now)
+
+	order, freshRanks := m.rankAt(now)
+	if pressureOf(freshRanks, "node-a") != pressureBand(50) || !knownPressureOf(freshRanks, "node-a") {
+		t.Fatalf("fresh rank = %+v, want known pressure band 1", freshRanks)
+	}
+	m.emitIfChanged("ollama", order, freshRanks, false)
+
+	order, staleRanks := m.rankAt(now.Add(gpuTelemetryFreshness + time.Millisecond))
+	if pressureOf(staleRanks, "node-a") != unknownGPUPressure || knownPressureOf(staleRanks, "node-a") {
+		t.Fatalf("stale rank = %+v, want unknown neutral pressure", staleRanks)
+	}
+	m.emitIfChanged("ollama", order, staleRanks, false)
+	if got := len(rec.priorities("ollama")); got != 2 {
+		t.Fatalf("priority snapshots = %d, want fresh and stale transition snapshots", got)
 	}
 }
 
@@ -349,6 +381,15 @@ func pressureOf(ranks []NodeRank, id string) int {
 		}
 	}
 	return -1
+}
+
+func knownPressureOf(ranks []NodeRank, id string) bool {
+	for _, rank := range ranks {
+		if rank.ID == id {
+			return rank.GPUPressureKnown
+		}
+	}
+	return false
 }
 
 // TestApplyUpsert_CrossEngineSameIDDistinct: Ollama and LM Studio each mint id

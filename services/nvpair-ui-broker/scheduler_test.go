@@ -216,7 +216,10 @@ func TestDuplicatePerEngineEmissionDoesNotMintAGeneration(t *testing.T) {
 	b := &Broker{}
 	ranking := schedulerwire.Priority{
 		Nodes: []string{"b", "a"},
-		Ranks: []schedulerwire.NodeRank{{ID: "b", Pending: 1}, {ID: "a", Pending: 4}},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "b", Pending: 1, GPUPressure: 1, GPUPressureKnown: true},
+			{ID: "a", Pending: 4, GPUPressure: 1, GPUPressureKnown: true},
+		},
 	}
 
 	first, fresh := b.cachePrioritySnapshot(ranking)
@@ -230,6 +233,19 @@ func TestDuplicatePerEngineEmissionDoesNotMintAGeneration(t *testing.T) {
 	}
 	if second != first {
 		t.Fatalf("duplicate emission moved the generation from %d to %d", first, second)
+	}
+
+	// Fresh-to-stale telemetry can keep the neutral numeric pressure at 1. The
+	// freshness flag alone still makes this a changed scheduler snapshot.
+	stale, fresh := b.cachePrioritySnapshot(schedulerwire.Priority{
+		Nodes: []string{"b", "a"},
+		Ranks: []schedulerwire.NodeRank{
+			{ID: "b", Pending: 1, GPUPressure: 1},
+			{ID: "a", Pending: 4, GPUPressure: 1},
+		},
+	})
+	if !fresh || stale <= first {
+		t.Fatalf("telemetry freshness transition = generation %d fresh %v, want a newer snapshot", stale, fresh)
 	}
 
 	// A genuinely changed ranking still advances, so the dedupe is not just
@@ -272,8 +288,8 @@ func TestRepushPriorityDeliversCompleteSnapshotToReplacementProxy(t *testing.T) 
 	want := schedulerwire.Priority{
 		Nodes: []string{"b", "a"},
 		Ranks: []schedulerwire.NodeRank{
-			{ID: "b", Pending: 1, Rank: 0},
-			{ID: "a", Pending: 4, Rank: 1},
+			{ID: "b", Pending: 1, GPUPressure: 1, GPUPressureKnown: true, Rank: 0},
+			{ID: "a", Pending: 4, GPUPressure: 1, GPUPressureKnown: true, Rank: 1},
 		},
 	}
 	b.cachePrioritySnapshot(want)

@@ -19,8 +19,6 @@ import (
 
 const gatewayAddress = "127.0.0.1:14326"
 
-const gatewayPrioritySnapshotMaxAge = 10 * time.Second
-
 const (
 	gatewayReadHeaderTimeout = 5 * time.Second
 	gatewayIdleTimeout       = 60 * time.Second
@@ -56,7 +54,6 @@ func (p *Proxy) gatewayModels() []gatewayModel {
 // 收集所有可用的运行时模型
 func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 	priority := p.prioritySnapshot()
-	priorityFresh := !priority.receivedAt.IsZero() && time.Since(priority.receivedAt) <= gatewayPrioritySnapshotMaxAge
 	candidates := make(map[string]modelselection.RuntimeModel)
 	for _, f := range p.enabledFacades() {
 		engine := f.profile.Name
@@ -81,12 +78,12 @@ func (p *Proxy) gatewayInventory() []modelselection.RuntimeModel {
 						break
 					}
 				}
-				if priorityFresh {
-					if resource, ok := priority.nodes[node.ID]; ok {
-						candidate.PendingRequests = resource.pending
-						candidate.GPUPressure = resource.gpuPressure
-						candidate.ResourcesKnown = true
-					}
+				if resource, ok := priority.nodes[node.ID]; ok {
+					candidate.PendingRequests = resource.pending
+					candidate.PendingKnown = resource.pendingKnown
+					candidate.GPUPressure = resource.gpuPressure
+					candidate.GPUPressureKnown = resource.gpuPressureKnown
+					candidate.InFlightReservations = resource.reservations
 				}
 				candidates[key] = candidate
 			}

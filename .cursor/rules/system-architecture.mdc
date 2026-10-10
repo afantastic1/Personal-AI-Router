@@ -172,7 +172,8 @@ only through other advertised owners.
 PAIR does not call `node/select` and must not implement a TypeScript router.
 The broker relays pending workload and source-aware GPU telemetry. The scheduler
 uses EWMA-smoothed fresh utilization to derive pressure 0–3, with neutral
-pressure 1 for invalid, missing, or stale data, then ranks by
+pressure 1 for invalid, missing, or stale data and reports freshness separately,
+then ranks by
 `pending + gpuPressure`, pressure, and UUID. Each proxy minimizes
 `pending + gpuPressure + localReservations` for capable nodes.
 

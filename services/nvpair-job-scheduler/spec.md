@@ -92,7 +92,8 @@ capacity, model locality, latency, and affinity can grow later behind the same
   utilization across a node's GPUs. The scheduler uses a 0.35 EWMA, pressure bands
   0/1/2/3 at 40%/70%/85%, downward hysteresis at 35%/65%/80%, and a 10-second
   freshness limit. Invalid, missing, and stale telemetry contributes neutral
-  pressure 1. A fresh stream after a gap starts a new EWMA.
+  pressure 1. `gpuPressureKnown` distinguishes fresh pressure 1 from neutral 1.
+  A fresh stream after a gap starts a new EWMA.
 - **Cold-start / tie-break (decided — pressure then stable identity).** Rank by
   `pending + gpuPressure`, then lower pressure, then `hostUuid`. A fixed final key
   makes equal-load nodes deterministic; nodes with no telemetry all receive the
@@ -180,6 +181,7 @@ only `hostUuid` from each discovered node
   id: string          // stable node hostUuid
   pending: number     // queued+running workloads scheduledOn this node, all engines
   gpuPressure: number // coarse 0–3 pressure; unknown/stale is neutral 1
+  gpuPressureKnown: boolean // false when pressure is unknown or stale
   rank: number        // 0-based position (0 = highest priority)
 }
 ```
@@ -189,7 +191,7 @@ notification per engine when its rank snapshot changes; `errors:report` /
 `errors:clear`. No inference traffic and no requests addressed to other workers.
 
 ```json
-{"jsonrpc":"2.0","method":"schedule:priority","params":{"engine":"ollama","nodes":["MY-PC","LAB-DESK-B","GPU-RIG"],"ranks":[{"id":"MY-PC","pending":0,"gpuPressure":0,"rank":0},{"id":"LAB-DESK-B","pending":1,"gpuPressure":1,"rank":1},{"id":"GPU-RIG","pending":3,"gpuPressure":3,"rank":2}]}}
+{"jsonrpc":"2.0","method":"schedule:priority","params":{"engine":"ollama","nodes":["MY-PC","LAB-DESK-B","GPU-RIG"],"ranks":[{"id":"MY-PC","pending":0,"gpuPressure":0,"gpuPressureKnown":true,"rank":0},{"id":"LAB-DESK-B","pending":1,"gpuPressure":1,"gpuPressureKnown":true,"rank":1},{"id":"GPU-RIG","pending":3,"gpuPressure":3,"gpuPressureKnown":true,"rank":2}]}}
 ```
 
 ## 7. API / Interface Contract
@@ -238,7 +240,7 @@ proxy-side, §4). The scheduler never calls it — it only emits `schedule:prior
 
 - **Params**: `{ generation: uint64, nodes: [string], ranks?: [NodeRank] }` —
   a monotonic delivery generation, ordered node ids, and their authoritative
-  pending counts and GPU pressure. The Broker mints `generation` (always ≥ 1);
+  pending counts, GPU pressure, and pressure freshness. The Broker mints `generation` (always ≥ 1);
   the scheduler does not send it. **Required**: omitted or `0` is rejected with
   `-32602`, because a snapshot that cleared the proxy's reservations without
   advancing its applied epoch would let one taken before it release one taken
@@ -283,7 +285,7 @@ Let `D` = current discovered-node `hostUuid`s:
    `gpuPressure[id]`, then `id`.
 4. **Publish** the shared snapshot through
    `schedule:priority {engine, nodes, ranks}` for each supported engine. Emit only
-   when its order, pending counts, or pressure differ from the last emission (a
+   when its order, pending counts, pressure, or pressure freshness differ from the last emission (a
    forced tick re-emits). Delivery, liveness, and restart-resync are the Broker's
    (§7.4).
 

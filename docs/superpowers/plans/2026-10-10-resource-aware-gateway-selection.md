@@ -9,20 +9,20 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Commit 1: Preserve deployments and expose safe resource snapshots
 
-1. Add a read-only priority snapshot method in `services/nvpair-proxy/proxy.go`,
-   copying scheduler pending and GPU-pressure data plus generation and receipt
-   time while holding `priorityMu.RLock`.
-2. Record snapshot receipt time when a newer scheduler generation is applied.
-3. Update `gatewayInventory` in `gateway.go` to retain each engine/model/node
-   deployment and attach only fresh per-node resource signals from the copied
-   snapshot. Do not change existing resolver or selector behavior in this
-   commit.
-4. Run focused Go tests for `nvpair-proxy` and `shared/modelselection`.
+1. Extend shared `schedulerwire.NodeRank` with `GPUPressureKnown`; Scheduler
+   derives it from the existing telemetry freshness rule and includes freshness
+   changes in emitted-rank equality.
+2. Preserve the flag through the Broker's typed snapshot clone and Proxy's
+   copied priority snapshot. Copy pending, pressure freshness, and current
+   reservations while holding `priorityMu.RLock`.
+3. Retain every engine/model/node deployment in `gatewayInventory`; do not age
+   event-driven scheduler snapshots at the Gateway.
+4. Run focused Scheduler, Broker, Proxy, and shared-wire tests.
 
 ## Commit 2: Score model deployments using resources
 
-1. Add selector resource inputs that keep pending work and GPU pressure separate
-   from memory pressure, with explicit unknown/freshness handling.
+1. Add selector inputs with independent pending-known, GPU-pressure-known, and
+   in-flight reservation values, separate from memory pressure.
 2. Adjust `AutoModelSelector` to score deployment candidates and compare each
    model by its strongest eligible deployment. Keep capability filters,
    deterministic engine/model/node ordering, and explicit routing unchanged.
@@ -33,21 +33,26 @@ SPDX-License-Identifier: Apache-2.0
 ## Commit 3: Regression coverage and contract review
 
 1. Add regression cases for the acceptance cluster, same-model multi-node
-   selection, changed resource snapshots, unknown/expired signals, and pressure
-   semantic separation.
-2. Add concurrent snapshot update/read coverage and verify the existing explicit
-   local, cloud, and same-model failover tests continue to pass.
-3. Run `go test ./...` from `services/nvpair-proxy` and
-   `services/shared/modelselection` (or its containing module), plus race-enabled
-   focused tests if supported by the module setup.
-4. Review the diff against `.cursor/rules/proxy-inference-routing.mdc`; no
-   Scheduler, Broker, telemetry, or desktop changes are expected.
+   selection, changed snapshots, stale pressure with an unchanged numeric value,
+   overlapping requests, unknown values, and pressure semantic separation.
+2. Prove the Gateway's rated node is advisory by creating newer Proxy
+   reservations after model scoring and asserting the Proxy chooses another
+   eligible owner.
+3. Verify existing explicit local, cloud, and same-model failover tests pass.
+4. Run `go test ./...` for Scheduler, Broker, Proxy, and shared, plus focused
+   race-enabled concurrency tests. Physical two-device validation is reported
+   separately and requires available controlled devices.
+5. Review the diff against `.cursor/rules/proxy-inference-routing.mdc` and the
+   service contract propagation rules.
 
 ## Review focus
 
-- No score path treats missing or expired metrics as zero load.
+- No score path treats missing or stale metrics as zero load.
 - A node's GPU pressure cannot populate `MemoryPressure` or available memory.
 - Candidate aggregation does not collapse multiple owners before scoring.
 - Snapshot reads return copies and never expose mutable Proxy maps.
+- Scheduler emits freshness changes even when pressure remains numerically 1.
+- Gateway scoring observes current Proxy reservations during an overlapping
+  request burst.
 - Current per-request snapshots update the ranking after scheduler changes.
 - Automatic model choice does not pin node dispatch or alter Proxy failover.
