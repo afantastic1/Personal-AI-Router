@@ -46,109 +46,72 @@ const (
 	autoAdvertiseInterval = 5 * time.Second
 )
 
-// runHostedEngineAdvertisements starts hosted engines immediately because
-// their availability does not depend on Ollama or LM Studio port ownership.
-func (b *Broker) runHostedEngineAdvertisements(ctx context.Context) {
-	b.runEngineAdvertisements(ctx, engineProxyProfilesForOwnership(hostedEngine))
-}
-
-// runNonHostedEngineAdvertisements keeps port-gated engine reconciliation in
-// its existing lifecycle while hosted engines continue on their independent
-// loop.
-func (b *Broker) runNonHostedEngineAdvertisements(ctx context.Context) {
-	b.runEngineAdvertisements(ctx, engineProxyProfilesExceptOwnership(hostedEngine))
-}
-
-func engineProxyProfilesForOwnership(ownership engineOwnership) []engineProxyProfile {
-	profiles := make([]engineProxyProfile, 0, len(engineProxyProfiles))
-	for _, profile := range engineProxyProfiles {
-		if profile.Ownership == ownership {
-			profiles = append(profiles, profile)
-		}
-	}
-	return profiles
-}
-
-func engineProxyProfilesExceptOwnership(ownership engineOwnership) []engineProxyProfile {
-	profiles := make([]engineProxyProfile, 0, len(engineProxyProfiles))
-	for _, profile := range engineProxyProfiles {
-		if profile.Ownership != ownership {
-			profiles = append(profiles, profile)
-		}
-	}
-	return profiles
-}
-
-func (b *Broker) runEngineAdvertisements(ctx context.Context, profiles []engineProxyProfile) {
+// runAutoAdvertise is the broker's ollama engine-registration loop. It polls
+// the local ollama server on a fixed cadence and reconciles this node's ol
+// service registration in the discovery daemon against it: register (with the
+// served model list) when ollama is up, unregister when it goes away. The
+// daemon folds the registration into this node's single _nvpair-node record, so
+// peers discover the engine through the shared channel. Runs until ctx is
+// cancelled (broker shutdown).
+//
+// (Pre-cutover this loop also spawned a nvpair-advertiser subprocess to publish an
+// _nvpair-ollama record; that per-service advertisement was retired when the
+// discovery consolidation landed and the binary was deleted.)
+func (b *Broker) runAutoAdvertise(ctx context.Context) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(autoAdvertiseInterval)
 	defer ticker.Stop()
 
-	b.reconcileEngineAdvertisements(client, profiles)
+	b.reconcileAdvertise(client)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b.reconcileEngineAdvertisements(client, profiles)
+			b.reconcileAdvertise(client)
 		}
 	}
 }
 
-// reconcileEngineAdvertisement checks one local engine and brings its discovery
-// registration into line with the backend and facade health gates. The
-// advertised endpoint is the facade port; the engine's real (loopback) port is
-// a private detail handed only to the local proxy via node/set-local-backend.
+// reconcileAdvertise checks local ollama and brings this node's ol registration
+// into line with it. Post-secure-inference the advertised ol endpoint is the
+// promoted PROXY port, never the engine port: peers dial the proxy over cluster
+// mTLS and it forwards to the loopback engine. The engine's real (loopback) port
+// is a private detail handed only to the local proxy via node/set-local-backend.
 //
-//   - engine healthy + proxy up -> register {service, facade port} + set-local-backend{enginePort, healthy}
-//   - otherwise                  -> unregister service + clear the proxy's local backend
+//   - engine healthy + proxy up -> register {ol, PROXY port} + set-local-backend{enginePort, healthy}
+//   - otherwise                  -> unregister ol + clear the proxy's local backend
 //
 // The model list is not carried here — it lives on engine-manager's em
 // /v1/models endpoint (registered separately), which peers fetch during
 // enrichment.
-func (b *Broker) reconcileEngineAdvertisements(client *http.Client, profiles []engineProxyProfile) {
-	for _, profile := range profiles {
-		b.reconcileEngineAdvertisement(profile, client)
-	}
-}
-
-func (b *Broker) reconcileEngineAdvertisement(profile engineProxyProfile, client *http.Client) {
+func (b *Broker) reconcileAdvertise(client *http.Client) {
 	b.engineConfigMu.Lock()
 	defer b.engineConfigMu.Unlock()
-	if profile.Name == ollamaProxyProfile.Name && b.ollamaFacadeIsPendingBackend() {
-		b.unregisterService(profile.DiscoveryService)
-		b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, 0, false)
+	// During the managed bind -> backend-move transition, engine:status would
+	// probe :11434 and could mistake the proxy (or a remote response forwarded
+	// through it) for an externally started Ollama. Do not query liveness until
+	// the backend has moved or managed setup has safely fallen back.
+	if b.ollamaFacadeIsPendingBackend() {
+		b.unregisterService(noderec.ServiceOllama)
+		b.setProxyLocalBackend(b.getProxy(), "ollama", 0, false)
 		return
 	}
-	if client == nil {
-		client = &http.Client{Timeout: 2 * time.Second}
-	}
-	fallbackPort := profile.FacadePort
-	if profile.Ownership == hostedEngine {
-		fallbackPort = profile.EnginePortBase
-	}
-	enginePort, probe := b.localEnginePort(profile.Name, fallbackPort)
-	facadePort := b.engineProxyListenPort(profile)
-	if facadePort > 0 && enginePort == facadePort {
-		if confirmed := int(b.engineProxy(profile).backendPort.Load()); confirmed > 0 && confirmed != facadePort {
-			enginePort, probe = confirmed, true
-		} else {
-			enginePort, probe = 0, false
-		}
-	}
-	backendHealthy := probe && enginePort > 0 && enginePort != facadePort && checkEngineHealth(profile, client, enginePort)
-	facadeReady := facadePort > 0
-	if shouldAdvertiseEngine(profile, backendHealthy, facadeReady, enginePort, facadePort) {
-		b.registerService(noderec.RegisterParams{Service: profile.DiscoveryService, Port: facadePort})
+	enginePort, probe := b.localEnginePort("ollama", defaultOllamaPort)
+	proxyPort := b.proxyListenPort()
+	// Advertise only when the engine is healthy AND the proxy is up AND the two
+	// ports differ. Equal ports mean we can't tell the engine from the proxy
+	// (or there is no separate engine), and setting the local backend to the
+	// proxy's own port would make the ingress forward to itself.
+	up := probe && proxyPort != 0 && enginePort != proxyPort && checkEngineHealth(ollamaProxyProfile, client, enginePort)
+	if up {
+		b.registerService(noderec.RegisterParams{Service: noderec.ServiceOllama, Port: proxyPort})
+		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, true)
 	} else {
-		b.unregisterService(profile.DiscoveryService)
+		b.unregisterService(noderec.ServiceOllama)
+		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, false)
 	}
-	b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, enginePort, backendHealthy)
-}
-
-func shouldAdvertiseEngine(profile engineProxyProfile, backendHealthy, facadeReady bool, backendPort, facadePort int) bool {
-	return backendHealthy && facadeReady && backendPort > 0 && facadePort > 0 && backendPort != facadePort && profile.DiscoveryService != ""
 }
 
 func (b *Broker) ollamaFacadeIsPendingBackend() bool {
@@ -162,6 +125,104 @@ func (b *Broker) ollamaFacadeIsPendingBackend() bool {
 	// from :11434. Keep probes gated through that interval (and indefinitely if
 	// the rebind fails) so the proxy can never be adopted as Ollama.
 	return b.ollamaState().managedFacade.Load() || b.proxyListenPort() == managedOllamaFacadePort
+}
+
+// runAutoAdvertiseLMStudio is the LM Studio sibling of runAutoAdvertise: it
+// polls the local LM Studio server and reconciles this node's lm service
+// registration against it, so an LM Studio host appears on the cluster the same
+// way an Ollama host does. Kept parallel to the Ollama path rather than folded
+// into it: the two are a deliberate temporary pair, to be unified when the
+// proxies are.
+func (b *Broker) runAutoAdvertiseLMStudio(ctx context.Context) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(autoAdvertiseInterval)
+	defer ticker.Stop()
+
+	b.reconcileAdvertiseLMStudio(client)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.reconcileAdvertiseLMStudio(client)
+		}
+	}
+}
+
+// reconcileAdvertiseLMStudio brings this node's lm registration into line with
+// the local LM Studio server, mirroring reconcileAdvertise: it advertises the
+// promoted proxy port (never the engine) and hands the engine's loopback port to
+// the LM Studio proxy via node/set-local-backend.
+func (b *Broker) reconcileAdvertiseLMStudio(client *http.Client) {
+	b.engineConfigMu.Lock()
+	defer b.engineConfigMu.Unlock()
+	enginePort, probe := b.localEnginePort("lmstudio", defaultLMStudioPort)
+	proxyPort := b.lmstudioProxyListenPort()
+	if proxyPort != 0 && enginePort == proxyPort {
+		// engine-manager may be temporarily unavailable after managed setup.
+		// Prefer the last confirmed backend, but never hand the proxy its own
+		// listener as a local destination.
+		if cached := int(b.lmstudioState().backendPort.Load()); cached > 0 && cached != proxyPort {
+			enginePort = cached
+		} else {
+			enginePort = 0
+			probe = false
+		}
+	}
+	// enginePort may be a stock-port fallback: localEnginePort returns one when
+	// engine-manager is unavailable, and it is indistinguishable from a real
+	// status here. Use it to advertise this tick only; never write it to
+	// lmstudioBackendPort. That cache's authoritative owners are the managed
+	// facade setup and live engine:status. Promoting the fallback poisons the
+	// cache while the proxy and engine restart together (as on the first invite),
+	// which later makes the compatibility proxy on the facade port look like the
+	// backend and wrongly disables managed mode.
+	up := probe && proxyPort != 0 && enginePort != proxyPort && checkEngineHealth(lmstudioProxyProfile, client, enginePort)
+	if up {
+		b.registerService(noderec.RegisterParams{Service: noderec.ServiceLMStudio, Port: proxyPort})
+		b.setProxyLocalBackend(b.getLMStudioProxy(), "lmstudio", enginePort, true)
+	} else {
+		b.unregisterService(noderec.ServiceLMStudio)
+		b.setProxyLocalBackend(b.getLMStudioProxy(), "lmstudio", enginePort, false)
+	}
+}
+
+// runAutoAdvertiseEngine reconciles an engine using the configured port
+// recorded in its runtime profile, without compatibility-port reconciliation.
+func (b *Broker) runAutoAdvertiseEngine(ctx context.Context, profile engineProxyProfile) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(autoAdvertiseInterval)
+	defer ticker.Stop()
+
+	b.reconcileAdvertiseEngine(profile, client)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.reconcileAdvertiseEngine(profile, client)
+		}
+	}
+}
+
+func (b *Broker) reconcileAdvertiseEngine(profile engineProxyProfile, client *http.Client) {
+	b.engineConfigMu.Lock()
+	defer b.engineConfigMu.Unlock()
+
+	enginePort := int(b.engineProxy(profile).backendPort.Load())
+	proxyPort := b.engineProxyListenPort(profile)
+	up := enginePort > 0 &&
+		proxyPort > 0 &&
+		enginePort != proxyPort &&
+		checkEngineHealth(profile, client, enginePort)
+	if up {
+		b.registerService(noderec.RegisterParams{Service: profile.DiscoveryService, Port: proxyPort})
+		b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, enginePort, true)
+		return
+	}
+	b.unregisterService(profile.DiscoveryService)
+	b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, enginePort, false)
 }
 
 // proxyLocalBackend is the node/set-local-backend payload: the loopback engine
@@ -206,13 +267,7 @@ func (b *Broker) localEnginePort(engine string, fallback int) (int, bool) {
 	if err != nil || rpcErr != nil {
 		return fallback, true
 	}
-	port, running := runningEnginePort(result)
-	if running {
-		if profile, ok := engineProxyProfileFor(engine); ok {
-			b.engineProxy(profile).backendPort.Store(int32(port))
-		}
-	}
-	return port, running
+	return runningEnginePort(result)
 }
 
 func runningEnginePort(result json.RawMessage) (int, bool) {

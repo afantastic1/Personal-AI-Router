@@ -185,7 +185,7 @@ func (b *Broker) finishEngineProxyStartup(profile engineProxyProfile) {
 	case lmstudioProxyProfile.Name:
 		b.finishLMStudioProxyTerminal()
 	default:
-		slog.Warn("no startup-gate finisher for engine", "engine", profile.Name)
+		// Other engines have no compatibility-port startup gate.
 	}
 }
 

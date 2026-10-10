@@ -19,16 +19,10 @@ listener; the broker asks for each engine's facade with `facade/enable`, which
 carries that engine's port and alias addresses. A flag cannot express this,
 because the broker plans a different port for each engine.
 
-The Android MNN facade is enabled at `:14324` and fronts the parent-owned MNN
-runtime at `:14325`. Desktop PAIR hosts the same MNN routing facade so clients
-can reach an Android runtime through discovery and cluster mTLS. The facade
-serves only `GET /v1/models` and `POST /v1/chat/completions`; only Android
-advertises a hosted MNN runtime under service key `mn`.
-
 They share a process on purpose. Between scheduler snapshots a facade takes
 short-lived reservations for work it has dispatched, and those live in the
 process — a process per engine split that picture, so simultaneous bursts on
-both engines could pick the same node believing it idle.
+different engines could pick the same node believing it idle.
 
 The cost is shared fate for the **process**: a crash takes every facade down and
 the supervisor restarts them together. Smaller failures are contained to one
@@ -63,52 +57,10 @@ bound — enable is a request, and the child's persisted-port restore can overri
 the port asked for. Enabling an engine that is already up is an idempotent
 success, so a redelivered enable never tears down a working listener.
 
-The broker also enables the process-scoped OpenAI gateway once per proxy
-incarnation, including when no local engine facade is enabled:
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"gateway/enable","params":{"port":14326}}
-```
-
-It binds only `127.0.0.1:14326` and serves `GET /v1/models` plus
-`POST /v1/chat/completions`. Local models use `local/<engine>/<model>` IDs; a
-bare model ID appears only when it is unique across enabled facades. Chat
-requests enter the selected facade's existing routing handler, preserving
-scheduler selection, cancellation, streaming, and workload attribution. The
-gateway is not an engine facade or a LAN-advertised service.
-
-The directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
-`auto-best`. These aliases select an eligible model and engine from current
-runtime inventory; `auto` uses the balanced policy. The shared model selector
-scores model metadata and runtime signals, then sends the selected model through
-the same facade handler and its existing node scheduler. Catalog entries absent
-from runtime inventory are never candidates. The gateway does not provide
-catalog search or download operations.
-Before scoring, eligibility intersects model-name capability heuristics with
-known engine protocol support. MNN supports chat and streaming, but is excluded
-for tools, vision, and embeddings requirements, regardless of model ID hints.
-
-Provider configuration arrives over the broker's control plane. `gateway/configure`
-atomically replaces the non-secret registry and routing/budget settings;
-`gateway/credential/set` changes one in-memory credential by its configured
-`auth_ref`; and `gateway/provider/test` sends an explicit authenticated
-`GET /v1/models` request without running inference. The provider key is never
-returned by these methods. The broker restores saved non-secret settings and
-process-scoped credentials when it restarts this worker.
-
-Paired-node Cloud execution uses a separate terminal mTLS protocol. The host
-exposes `GET /v1/pair/cloud/models` with public model IDs and capability names
-only, and `POST /v1/pair/cloud/chat/completions` for one explicitly named
-`cloud/<provider>/<model>`. The POST requires a live cluster pin and a paid-use
-grant matching both the caller UUID and exact pinned certificate fingerprint.
-It cannot route local models or `auto`, and it never receives a Provider key
-from the caller. The host owns the budget reservation, Provider call, workload,
-and `requesterId` attribution. Requests are not retried.
-
 ### Flags
 
 Only process-scoped settings are flags. Anything per-engine is a `facade/enable`
-parameter, because one flag cannot carry two engines' plans.
+parameter, because one flag cannot carry multiple engines' plans.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -121,7 +73,7 @@ parameter, because one flag cannot carry two engines' plans.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `engine` | *(required)* | Which engine to front: `ollama`, `lmstudio`, or hosted `mnn`. An unknown name is rejected with the accepted values. |
+| `engine` | *(required)* | Which engine to front: `ollama`, `lmstudio`, or `llamacpp`. An unknown name is rejected with the accepted values. |
 | `port` | per engine, see below | HTTP listen port for request forwarding. Must be 1–65535, or omitted for the engine's standalone default. `0` means "the default" rather than "pick an ephemeral port", and any other out-of-range value is rejected, because the facade announces the requested port in its `ready` notification and the broker would be told `0`. |
 | `aliasAddresses` | *(empty)* | Optional secondary `host:port` values for the same routing handler, one per loopback family so `localhost` resolves either way. Only literal loopback addresses are accepted; the broker uses this for a safe inherited local `OLLAMA_HOST`, and the aliases are not advertised to peers. Accepted only for an engine with an inherited host variable — today Ollama alone — and rejected for any other. |
 | `ignorePersistedPort` | `false` | Use `port` even when a saved port exists (used by broker-managed startup) |
@@ -131,10 +83,10 @@ parameter, because one flag cannot carry two engines' plans.
 Everything engine-specific is one entry in `engines.go`, plus the shared
 identity in `nvpair-shared/engines`.
 
-| | `"engine":"ollama"` | `"engine":"lmstudio"` |
-|---|---|---|
-| Facade id — error-ID prefix, broker relay namespace, TUI proxies-view tab | `ollama-proxy` | `lmstudio-proxy` |
-| Discovery service key | `ol` | `lm` |
+| | `"engine":"ollama"` | `"engine":"lmstudio"` | `"engine":"llamacpp"` |
+|---|---|---|---|
+| Facade id — error-ID prefix and broker relay namespace | `ollama-proxy` | `lmstudio-proxy` | `llamacpp-proxy` |
+| Discovery service key | `ol` | `lm` | `lc` |
 
 The **log component, supervisor label, and TUI health crash key are not in that
 table**: they name the process (`nvpair-proxy`), not a facade, because one
@@ -143,25 +95,31 @@ Facade-scoped log records carry an `engine` field instead. The supervisor label
 and the health crash key are matched against each other, so they move together
 — see `nvpair-shared/engines` and `spec.md` §9.
 
-| | `"engine":"ollama"` | `"engine":"lmstudio"` |
-|---|---|---|
-| Engine's own client-facing port | 11434 | 1234 |
-| Where PAIR relocates the engine | 11435 | 1235 |
-| Standalone port, used when `port` is omitted | 11435 | 1234 |
-| Persisted-port file (declared, not derived) | `proxy-port.json` | `lmstudio-proxy-port.json` |
-| Model-list routes | `GET /api/tags` (native), `GET /v1/models` (OpenAI) | `GET /v1/models` (OpenAI) |
-| Inference routes | `/api/generate`, `/api/chat`, `/api/embeddings`, `/api/embed`, plus the OpenAI and Anthropic Messages sets | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages` |
-| Model naming | untagged means `:latest`, so `llama3` and `llama3:latest` are one model | identifiers compared byte for byte |
+| | `"engine":"ollama"` | `"engine":"lmstudio"` | `"engine":"llamacpp"` |
+|---|---|---|---|
+| Engine's own client-facing port | 11434 | 1234 | 8080 |
+| Where PAIR relocates the engine | 11435 | 1235 | 8081 |
+| Standalone port, used when `port` is omitted | 11435 | 1234 | 8080 |
+| Persisted-port file (declared, not derived) | `proxy-port.json` | `lmstudio-proxy-port.json` | `llamacpp-proxy-port.json` |
+| Model-list routes | `GET /api/tags` (native), `GET /v1/models` (OpenAI) | `GET /v1/models` (OpenAI) | `GET /models`, `GET /v1/models` (OpenAI; both query upstream `/models`) |
+| Inference routes | `/api/generate`, `/api/chat`, `/api/embeddings`, `/api/embed`, plus the OpenAI and Anthropic Messages sets | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages` | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` |
+| Model naming | untagged means `:latest`, so `llama3` and `llama3:latest` are one model | identifiers compared byte for byte | identifiers compared byte for byte |
 
 The route table is a **classifier, not an allowlist**. An unlisted path is
 forwarded verbatim, which is how `/api/show`, `/api/pull`, `/api/ps`,
 `/api/version` and `OPTIONS` preflights keep working.
+
+The broker enables all three facades by default. Local llama.cpp-compatible
+clients use `8080`, while the managed `llama-server` stays on `8081`.
+`--proxy-engines` can restrict a standalone broker or TUI to a subset.
 
 ### HTTP Reverse Proxy
 
 A facade listens on its enabled port and forwards incoming requests to the
 currently active node — except the model-list routes, which are queried across
 every candidate node concurrently and merged into one de-duplicated inventory.
+On the llama.cpp facade, `GET /models` and `GET /v1/models` return the same
+fleet inventory across llama.cpp candidates, even when a node is selected.
 Point your client at the proxy and it handles routing.
 
 When the broker supplies `aliasAddresses`, the facade reserves that
@@ -174,14 +132,11 @@ actionable warning while the primary listener stays available.
 **Cluster ingress.** The listener carries two personalities, demultiplexed by
 each connection's first byte. Plaintext HTTP is accepted only from loopback; a
 LAN caller is refused. When `--cluster-dir` shows this node is a cluster member,
-the same listener also terminates cluster mTLS. Engine-compatible requests from
-a pinned peer are forwarded to the local engine reported by
-`node/set-local-backend`, and are never re-routed onward. The two
-`/v1/pair/cloud/*` paths are terminal exceptions: model discovery returns only
-public model IDs/capabilities, while inference requires a separate paid-use
-grant bound to the caller UUID and exact pinned certificate fingerprint.
-Membership and pins are re-derived per request, so removal and re-pairing
-immediately invalidate an old grant without a proxy restart.
+the same listener also terminates cluster mTLS: a peer whose client certificate
+matches one of this node's pins is forwarded straight to the local engine
+reported by `node/set-local-backend`, and is never re-routed onward to another
+node. Membership and pins are re-derived per request, so joining or leaving a
+cluster needs no restart.
 
 **Persisted port.** A port chosen at runtime via `set-port` is saved to the
 per-user data dir (`%LocalAppData%\Nvidia Corporation\Personal AI Router` on
@@ -203,7 +158,7 @@ A browser preflight (OPTIONS with Origin and Access-Control-Request-Method) quer
 
 Combined model lists forward the caller's origin and end-to-end headers, excluding Authorization and Cookie so credentials are not shared across engines. Multi-target preflights apply the same credential filtering. With an Origin header, every responding engine must return a valid list and permit sharing: one denial returns 403 and one invalid list returns 502, without partial inventory. An invalid-list error retains the combined CORS permissions when every responding engine allows the origin. Unavailable engines are skipped, with 502 returned when none can answer. Successful lists combine origin/credential permissions and Vary requirements. Requests without Origin retain partial aggregation when some inventories are unavailable. Engines without CORS support remain unavailable to cross-origin browser clients through PAIR.
 
-Both engine facades use nvpair-shared/cors. Neither facade reads engine environment variables or parses launch commands to determine CORS policy.
+Every engine facade uses nvpair-shared/cors. No facade reads engine environment variables or parses launch commands to determine CORS policy.
 
 One limit is outside the proxy's control: current Chromium-based browsers gate a request from a public origin to a local or loopback address behind the user's [Local Network Access](https://chromestatus.com/feature/5152728072060928) permission, which replaced the old server-side opt-in header. No header the proxy sends can grant that. A hosted page needs the permission plus a `fetch(url, { targetAddressSpace: 'loopback' })` annotation; a page served from the local machine is unaffected.
 

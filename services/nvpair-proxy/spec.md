@@ -94,65 +94,21 @@ is a genuine limitation, not a safety margin (§5.6).
 
 ## 3. Process model
 
-The process starts with **no engine and no listener**. The broker sends one
-`facade/enable` per selected engine, carrying that engine's port and any alias
-addresses, then sends process-scoped `gateway/enable` with port `14326` whether
-or not any local facade was enabled. The gateway binds only `127.0.0.1`, is not
-a facade or discovery service, and serves the OpenAI model-list and chat
-completion routes. A cloud-only installation can therefore serve the gateway
-without starting a local engine listener. Local models have stable
-`local/<engine>/<model>` IDs; an unqualified ID is listed only when unique
-across local engines. Explicit local requests delegate to that facade's
-existing request handler. Node scheduling remains owned by the existing
-facade path.
-
-The model directory also advertises `auto`, `auto-fast`, `auto-balanced`, and
-`auto-best`. `auto` resolves to `auto-balanced`. These aliases choose a model
-and engine from enabled runtime inventory only; catalog entries do not become
-candidates until an engine reports them as available. The shared model
-selector applies capability eligibility and policy scoring, then delegates
-through the selected facade so node placement remains unchanged. The gateway
-does not browse catalogs or install models.
-
-### 3.1 Cloud provider control plane
-
-The broker stores the versioned provider registry and Gateway policy without
-secret values. `gateway/configure` validates and atomically applies that
-configuration. Provider credentials arrive separately through
-`gateway/credential/set`, keyed by the configured opaque `auth_ref`; they live
-only in process memory and are pruned when a provider is removed. The explicit
-`gateway/provider/test` operation checks a provider with `GET /v1/models`,
-without sending chat content or starting inference. The provider key is never
-returned in RPC responses, model listings, logs, or Workload events.
-
-Paired nodes use terminal `GET /v1/pair/cloud/models` and
-`POST /v1/pair/cloud/chat/completions` endpoints over the existing mTLS ingress.
-The public directory contains only enabled model IDs and capabilities. A chat
-request must name a configured `cloud/...` model and pass the separate allowlist
-bound to both caller UUID and the exact pinned certificate fingerprint; local
-models and automatic aliases are rejected. The execution host performs budget
-reservation and Provider I/O, and records the mTLS caller UUID as workload
-`requesterId`. The caller key and Provider URL never cross the link. Requests
-have no retry path, and pin removal or re-pairing invalidates the saved grant.
-
-Eligibility intersects model-name capability heuristics with known engine
-protocol support before scoring. MNN supports chat and streaming; it cannot
-satisfy tools, vision, or embeddings requirements even when its model ID
-contains those capability hints. Unknown engine capabilities remain unknown
-and do not gain fabricated support from a model name.
+The process starts with **no engine and no listener**. The broker then sends one
+`facade/enable` per engine, carrying that engine's port and any alias addresses.
 
 A flag cannot express this. The broker plans a different port for each engine —
-Ollama's managed facade wants `:11434` while LM Studio's wants `:1234`, and
-either may be absent so the child keeps its own persisted port — and a
-single-valued flag carries only one plan.
+Ollama's managed facade wants `:11434`, LM Studio's wants `:1234`, and
+llama.cpp's managed facade wants `:8080`; any may be absent so the child keeps
+its own persisted port — and a single-valued flag carries only one plan.
 
 ### 3.1 Why one process
 
 Between scheduler snapshots a facade takes short-lived **reservations** for work
 it has dispatched but that the scheduler has not yet observed. Those live in the
 process, and every facade shares them. If each engine had its own proxy
-process, neither could see the other's reservations, so simultaneous bursts of
-Ollama and LM Studio requests could both select the same node, each incorrectly
+process, none could see the others' reservations, so simultaneous bursts across
+Ollama, LM Studio, and llama.cpp could select the same node, each incorrectly
 believing it was idle.
 Sharing the map is the reason the engines share a process.
 
@@ -207,8 +163,8 @@ For a model-bearing inference request:
 
 1. Filter a request-local discovery snapshot to nodes whose per-engine inventory
    advertises the requested model. Ollama normalizes the implicit `:latest` tag;
-   LM Studio ids match exactly. An empty owner set returns a local `502` without
-   contacting an engine.
+   LM Studio and llama.cpp ids match exactly. An empty owner set returns a local
+   `502` without contacting an engine.
 2. Order the eligible owners: explicit `node/select` pin, then the scheduler's
    priority list, then deterministic default ordering.
 3. Reserve the least estimated-loaded scheduler-listed candidate and move it to
@@ -221,6 +177,12 @@ For a model-bearing inference request:
 
 An ineligible manual selection cannot override the capability gate, and failover
 never broadens to an excluded node.
+
+The llama.cpp facade exposes `GET /models` and `GET /v1/models` as aliases for
+the fleet's llama.cpp inventory. Both query every candidate's `GET /models`
+concurrently and merge duplicate model ids into an OpenAI list envelope
+(`{"object":"list","data":[...]}`). A selected node affects candidate ordering,
+not inventory scope. Its inference routes remain `/v1/*`.
 
 ### 5.1 Retry bounds
 
@@ -513,9 +475,9 @@ here.
 
 ### 5.7 Accepted behavior
 
-**An abandoned attempt may still run inside the engine.** Neither engine PAIR
-supports today exposes a way to withdraw a request it has accepted, and both
-queue internally, so a retried job can have more than one copy generating while
+**An abandoned attempt may still run inside the engine.** None of the engines
+PAIR supports today exposes a way to withdraw a request it has accepted, and all
+of them queue internally, so a retried job can have more than one copy generating while
 the abandoned copy keeps its node busy.
 
 Whether closing the connection cancels anything upstream is **unverified** —
@@ -593,19 +555,12 @@ untouched, the primary listener stays up, and a warning is reported.
 
 ## 8. Ports
 
-| | Ollama | LM Studio | MNN (Android) |
+| | Ollama | LM Studio | llama.cpp |
 | --- | --- | --- | --- |
-| Engine's own client-facing port | 11434 | 1234 | 14325 |
-| Where PAIR relocates the engine | 11435 | 1235 | parent-owned |
-| Standalone port, when `port` is omitted | 11435 | 1234 | 14324 |
-| Persisted-port file | `proxy-port.json` | `lmstudio-proxy-port.json` | `mnn-proxy-port.json` |
-
-MNN is a hosted Android runtime. The broker owns its facade at `:14324`, while
-the Android application owns the engine at `:14325`; the proxy never moves or
-stops that runtime. Desktop brokers may also host an MNN routing facade at
-`:14324` to reach a remote Android owner. Only Android advertises a hosted MNN
-runtime. Its health path is `/healthz`, and its OpenAI-compatible routes are
-`GET /v1/models` and `POST /v1/chat/completions`.
+| Engine's own client-facing port | 11434 | 1234 | 8080 |
+| Where PAIR relocates the engine | 11435 | 1235 | 8081 |
+| Standalone port, when `port` is omitted | 11435 | 1234 | 8080 |
+| Persisted-port file | `proxy-port.json` | `lmstudio-proxy-port.json` | `llamacpp-proxy-port.json` |
 
 A port chosen at runtime via `set-port` is persisted per engine and restored
 when that facade is enabled, taking precedence over the requested port, so the

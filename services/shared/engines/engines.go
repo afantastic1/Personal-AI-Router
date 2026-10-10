@@ -92,8 +92,8 @@ type Engine struct {
 	// claims in managed mode.
 	FacadePort int
 
-	// EnginePortBase is where PAIR relocates the engine so the proxy can take
-	// FacadePort, and the base of the next-free-port search.
+	// EnginePortBase is where PAIR runs or relocates the engine so the proxy can
+	// take FacadePort, and the base of any next-free-port search.
 	EnginePortBase int
 
 	// PortFile is the per-user file this engine's proxy persists its chosen
@@ -104,16 +104,6 @@ type Engine struct {
 	// broker reads it when reserving ports away from the OLLAMA_HOST alias,
 	// so the two must agree — which is why it lives here.
 	PortFile string
-
-	// Platform, when set, limits the engine runtime to one Go platform identifier
-	// such as android/arm64. An empty value means the runtime is platform-neutral.
-	Platform string
-
-	// ProxyPlatform, when set, limits the proxy facade to one Go platform.
-	// Runtime and proxy platforms differ for hosted engines such as MNN: the
-	// runtime is Android-only, while a facade on a PC routes to that Android node.
-	// Empty means the facade can run on every platform supported by PAIR.
-	ProxyPlatform string
 }
 
 // ProxyComponent is the proxy *process* identity, as distinct from the
@@ -135,10 +125,18 @@ const ProxyComponent = "nvpair-proxy"
 // it either; see PortFile.
 func (e Engine) ComponentName() string { return e.Name + "-proxy" }
 
+// The engine ids, for a caller that has to treat one engine differently from
+// another. Each is the Name of its entry below.
+const (
+	NameOllama   = "ollama"
+	NameLMStudio = "lmstudio"
+	NameLlamaCPP = "llamacpp"
+)
+
 // all is the ordered engine set. Ollama is first; see the package comment.
 var all = []Engine{
 	{
-		Name:             "ollama",
+		Name:             NameOllama,
 		DisplayName:      "Ollama",
 		DiscoveryService: noderec.ServiceOllama,
 		FacadePort:       11434,
@@ -146,7 +144,7 @@ var all = []Engine{
 		PortFile:         "proxy-port.json",
 	},
 	{
-		Name:             "lmstudio",
+		Name:             NameLMStudio,
 		DisplayName:      "LM Studio",
 		DiscoveryService: noderec.ServiceLMStudio,
 		FacadePort:       1234,
@@ -154,24 +152,13 @@ var all = []Engine{
 		PortFile:         "lmstudio-proxy-port.json",
 	},
 	{
-		Name:             "mnn",
-		DisplayName:      "MNN",
-		DiscoveryService: noderec.ServiceMNN,
-		FacadePort:       14324,
-		EnginePortBase:   14325,
-		PortFile:         "mnn-proxy-port.json",
-		Platform:         "android/arm64",
+		Name:             NameLlamaCPP,
+		DisplayName:      "llama.cpp",
+		DiscoveryService: noderec.ServiceLlamaCPP,
+		FacadePort:       8080,
+		EnginePortBase:   8081,
+		PortFile:         "llamacpp-proxy-port.json",
 	},
-}
-
-// SupportsPlatform reports whether the engine runtime can run on platform.
-func (e Engine) SupportsPlatform(platform string) bool {
-	return e.Platform == "" || e.Platform == platform
-}
-
-// SupportsProxyPlatform reports whether the routing facade can run on platform.
-func (e Engine) SupportsProxyPlatform(platform string) bool {
-	return e.ProxyPlatform == "" || e.ProxyPlatform == platform
 }
 
 // All returns the engine set in preparation order. The result is a copy, so a

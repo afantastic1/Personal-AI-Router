@@ -78,8 +78,12 @@ const (
 
 // route is one classified request path.
 type route struct {
+	// Path is the client-facing path matched on the facade.
 	Path string
-	Role routeRole
+
+	// UpstreamPath optionally rewrites Path for the engine; empty preserves it.
+	UpstreamPath string
+	Role         routeRole
 }
 
 // engineProfile is everything the proxy needs to front one engine.
@@ -134,6 +138,13 @@ var lmStudioBaseRoutes = []route{
 	{Path: "/v1/models", Role: roleModelListOpenAIGET},
 }
 
+// llamaCPPBaseRoutes serves both model-list paths through the fleet inventory,
+// querying llama.cpp's router endpoint. Its response uses the OpenAI envelope.
+var llamaCPPBaseRoutes = []route{
+	{Path: "/models", Role: roleModelListOpenAIGET},
+	{Path: "/v1/models", UpstreamPath: "/models", Role: roleModelListOpenAIGET},
+}
+
 // openAIInferenceRoutes is the OpenAI-compatible inference surface.
 var openAIInferenceRoutes = []route{
 	{Path: "/v1/chat/completions", Role: roleInferencePOST},
@@ -151,13 +162,10 @@ var profiles = buildProfiles()
 func buildProfiles() []engineProfile {
 	ollama, _ := engines.ByName("ollama")
 	lmstudio, _ := engines.ByName("lmstudio")
-	mnn, _ := engines.ByName("mnn")
+	llamacpp, _ := engines.ByName("llamacpp")
 	ollamaRoutes := slices.Concat(ollamaBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
 	lmStudioRoutes := slices.Concat(lmStudioBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
-	mnnRoutes := []route{
-		{Path: "/v1/models", Role: roleModelListOpenAIGET},
-		{Path: "/v1/chat/completions", Role: roleInferencePOST},
-	}
+	llamaCPPRoutes := slices.Concat(llamaCPPBaseRoutes, openAIInferenceRoutes)
 
 	return []engineProfile{
 		{
@@ -179,11 +187,11 @@ func buildProfiles() []engineProfile {
 			ReservedPersistedPort: 1235,
 		},
 		{
-			Engine:                mnn,
-			StandalonePort:        mnn.FacadePort,
-			Routes:                mnnRoutes,
+			Engine:                llamacpp,
+			StandalonePort:        8080,
+			Routes:                llamaCPPRoutes,
 			ModelNaming:           exactID,
-			ReservedPersistedPort: mnn.EnginePortBase,
+			ReservedPersistedPort: 8081,
 		},
 	}
 }
@@ -207,9 +215,9 @@ func engineNames() string {
 	return strings.Join(names, ", ")
 }
 
-// roleFor classifies a request. The bool reports whether the path is one this
+// routeFor classifies a request. The bool reports whether the path is one this
 // engine handles specially; false means forward it verbatim.
-func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
+func (p engineProfile) routeFor(method, path string) (route, bool) {
 	for _, r := range p.Routes {
 		// Keep scanning on a method mismatch rather than bailing: a path may
 		// legitimately appear twice under different methods, and returning
@@ -218,9 +226,21 @@ func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
 		if r.Path != path || r.Role.method() != method {
 			continue
 		}
-		return r.Role, true
+		return r, true
 	}
-	return 0, false
+	return route{}, false
+}
+
+func (p engineProfile) roleFor(method, path string) (routeRole, bool) {
+	r, ok := p.routeFor(method, path)
+	return r.Role, ok
+}
+
+func (r route) upstreamPath() string {
+	if r.UpstreamPath != "" {
+		return r.UpstreamPath
+	}
+	return r.Path
 }
 
 // method is the HTTP method a role applies to.

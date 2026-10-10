@@ -23,46 +23,13 @@ func TestOllamaIsPreparedFirst(t *testing.T) {
 
 func TestNames(t *testing.T) {
 	got := Names()
-	want := []string{"ollama", "lmstudio", "mnn"}
+	want := []string{"ollama", "lmstudio", "llamacpp"}
 	if len(got) != len(want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("Names() = %v, want %v", got, want)
-		}
-	}
-}
-
-func TestMNNIdentity(t *testing.T) {
-	mnn, ok := ByName("mnn")
-	if !ok {
-		t.Fatal("mnn engine identity missing")
-	}
-	if mnn.DisplayName != "MNN" || mnn.DiscoveryService != noderec.ServiceMNN || mnn.FacadePort != 14324 || mnn.EnginePortBase != 14325 || mnn.Platform != "android/arm64" {
-		t.Fatalf("MNN identity = %+v, want display=MNN, service=mn, facade=14324, backend=14325, platform=android/arm64", mnn)
-	}
-	if !mnn.SupportsPlatform("android/arm64") || mnn.SupportsPlatform("windows/amd64") {
-		t.Fatal("MNN facade platform support does not match its manifest platform")
-	}
-}
-
-func TestMNNRuntimeIsAndroidOnlyButRemoteProxyFacadeIsPortable(t *testing.T) {
-	mnn, ok := ByName("mnn")
-	if !ok {
-		t.Fatal("mnn engine identity missing")
-	}
-	if !mnn.SupportsPlatform("android/arm64") || mnn.SupportsPlatform("windows/amd64") {
-		t.Fatal("MNN runtime support must remain Android arm64 only")
-	}
-	for _, platform := range []string{
-		"windows/amd64", "windows/arm64",
-		"linux/amd64", "linux/arm64",
-		"darwin/amd64", "darwin/arm64",
-		"android/arm64",
-	} {
-		if !mnn.SupportsProxyPlatform(platform) {
-			t.Errorf("MNN proxy facade is unavailable on %s; it must route to remote Android runtimes", platform)
 		}
 	}
 }
