@@ -1,0 +1,10 @@
+{
+  "sourceFingerprint": "a60a3d25e47438f9a6e9c49eb39c5cc54f465cf33eecf28368118572efea169b",
+  "version": "0.1.9",
+  "platform": "win32",
+  "arch": "x64",
+  "fileName": "inference-dispatcher.exe",
+  "size": 7001600,
+  "sha256": "235ae21333f032495dfa9caaba1f54d7ccc35cc09c0db298371df9983cb723b8",
+  "builtAt": "2026-10-05T12:02:49.028Z"
+}

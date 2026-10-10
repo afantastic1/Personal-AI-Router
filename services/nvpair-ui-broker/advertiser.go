@@ -46,72 +46,109 @@ const (
 	autoAdvertiseInterval = 5 * time.Second
 )
 
-// runAutoAdvertise is the broker's ollama engine-registration loop. It polls
-// the local ollama server on a fixed cadence and reconciles this node's ol
-// service registration in the discovery daemon against it: register (with the
-// served model list) when ollama is up, unregister when it goes away. The
-// daemon folds the registration into this node's single _nvpair-node record, so
-// peers discover the engine through the shared channel. Runs until ctx is
-// cancelled (broker shutdown).
-//
-// (Pre-cutover this loop also spawned a nvpair-advertiser subprocess to publish an
-// _nvpair-ollama record; that per-service advertisement was retired when the
-// discovery consolidation landed and the binary was deleted.)
-func (b *Broker) runAutoAdvertise(ctx context.Context) {
+// runHostedEngineAdvertisements starts hosted engines immediately because
+// their availability does not depend on Ollama or LM Studio port ownership.
+func (b *Broker) runHostedEngineAdvertisements(ctx context.Context) {
+	b.runEngineAdvertisements(ctx, engineProxyProfilesForOwnership(hostedEngine))
+}
+
+// runNonHostedEngineAdvertisements keeps port-gated engine reconciliation in
+// its existing lifecycle while hosted engines continue on their independent
+// loop.
+func (b *Broker) runNonHostedEngineAdvertisements(ctx context.Context) {
+	b.runEngineAdvertisements(ctx, engineProxyProfilesExceptOwnership(hostedEngine))
+}
+
+func engineProxyProfilesForOwnership(ownership engineOwnership) []engineProxyProfile {
+	profiles := make([]engineProxyProfile, 0, len(engineProxyProfiles))
+	for _, profile := range engineProxyProfiles {
+		if profile.Ownership == ownership {
+			profiles = append(profiles, profile)
+		}
+	}
+	return profiles
+}
+
+func engineProxyProfilesExceptOwnership(ownership engineOwnership) []engineProxyProfile {
+	profiles := make([]engineProxyProfile, 0, len(engineProxyProfiles))
+	for _, profile := range engineProxyProfiles {
+		if profile.Ownership != ownership {
+			profiles = append(profiles, profile)
+		}
+	}
+	return profiles
+}
+
+func (b *Broker) runEngineAdvertisements(ctx context.Context, profiles []engineProxyProfile) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(autoAdvertiseInterval)
 	defer ticker.Stop()
 
-	b.reconcileAdvertise(client)
+	b.reconcileEngineAdvertisements(client, profiles)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b.reconcileAdvertise(client)
+			b.reconcileEngineAdvertisements(client, profiles)
 		}
 	}
 }
 
-// reconcileAdvertise checks local ollama and brings this node's ol registration
-// into line with it. Post-secure-inference the advertised ol endpoint is the
-// promoted PROXY port, never the engine port: peers dial the proxy over cluster
-// mTLS and it forwards to the loopback engine. The engine's real (loopback) port
-// is a private detail handed only to the local proxy via node/set-local-backend.
+// reconcileEngineAdvertisement checks one local engine and brings its discovery
+// registration into line with the backend and facade health gates. The
+// advertised endpoint is the facade port; the engine's real (loopback) port is
+// a private detail handed only to the local proxy via node/set-local-backend.
 //
-//   - engine healthy + proxy up -> register {ol, PROXY port} + set-local-backend{enginePort, healthy}
-//   - otherwise                  -> unregister ol + clear the proxy's local backend
+//   - engine healthy + proxy up -> register {service, facade port} + set-local-backend{enginePort, healthy}
+//   - otherwise                  -> unregister service + clear the proxy's local backend
 //
 // The model list is not carried here — it lives on engine-manager's em
 // /v1/models endpoint (registered separately), which peers fetch during
 // enrichment.
-func (b *Broker) reconcileAdvertise(client *http.Client) {
+func (b *Broker) reconcileEngineAdvertisements(client *http.Client, profiles []engineProxyProfile) {
+	for _, profile := range profiles {
+		b.reconcileEngineAdvertisement(profile, client)
+	}
+}
+
+func (b *Broker) reconcileEngineAdvertisement(profile engineProxyProfile, client *http.Client) {
 	b.engineConfigMu.Lock()
 	defer b.engineConfigMu.Unlock()
-	// During the managed bind -> backend-move transition, engine:status would
-	// probe :11434 and could mistake the proxy (or a remote response forwarded
-	// through it) for an externally started Ollama. Do not query liveness until
-	// the backend has moved or managed setup has safely fallen back.
-	if b.ollamaFacadeIsPendingBackend() {
-		b.unregisterService(noderec.ServiceOllama)
-		b.setProxyLocalBackend(b.getProxy(), "ollama", 0, false)
+	if profile.Name == ollamaProxyProfile.Name && b.ollamaFacadeIsPendingBackend() {
+		b.unregisterService(profile.DiscoveryService)
+		b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, 0, false)
 		return
 	}
-	enginePort, probe := b.localEnginePort("ollama", defaultOllamaPort)
-	proxyPort := b.proxyListenPort()
-	// Advertise only when the engine is healthy AND the proxy is up AND the two
-	// ports differ. Equal ports mean we can't tell the engine from the proxy
-	// (or there is no separate engine), and setting the local backend to the
-	// proxy's own port would make the ingress forward to itself.
-	up := probe && proxyPort != 0 && enginePort != proxyPort && checkEngineHealth(ollamaProxyProfile, client, enginePort)
-	if up {
-		b.registerService(noderec.RegisterParams{Service: noderec.ServiceOllama, Port: proxyPort})
-		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, true)
-	} else {
-		b.unregisterService(noderec.ServiceOllama)
-		b.setProxyLocalBackend(b.getProxy(), "ollama", enginePort, false)
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Second}
 	}
+	fallbackPort := profile.FacadePort
+	if profile.Ownership == hostedEngine {
+		fallbackPort = profile.EnginePortBase
+	}
+	enginePort, probe := b.localEnginePort(profile.Name, fallbackPort)
+	facadePort := b.engineProxyListenPort(profile)
+	if facadePort > 0 && enginePort == facadePort {
+		if confirmed := int(b.engineProxy(profile).backendPort.Load()); confirmed > 0 && confirmed != facadePort {
+			enginePort, probe = confirmed, true
+		} else {
+			enginePort, probe = 0, false
+		}
+	}
+	backendHealthy := probe && enginePort > 0 && enginePort != facadePort && checkEngineHealth(profile, client, enginePort)
+	facadeReady := facadePort > 0
+	if shouldAdvertiseEngine(profile, backendHealthy, facadeReady, enginePort, facadePort) {
+		b.registerService(noderec.RegisterParams{Service: profile.DiscoveryService, Port: facadePort})
+	} else {
+		b.unregisterService(profile.DiscoveryService)
+	}
+	b.setProxyLocalBackend(b.engineProxyHandle(profile), profile.Name, enginePort, backendHealthy)
+}
+
+func shouldAdvertiseEngine(profile engineProxyProfile, backendHealthy, facadeReady bool, backendPort, facadePort int) bool {
+	return backendHealthy && facadeReady && backendPort > 0 && facadePort > 0 && backendPort != facadePort && profile.DiscoveryService != ""
 }
 
 func (b *Broker) ollamaFacadeIsPendingBackend() bool {
@@ -267,7 +304,13 @@ func (b *Broker) localEnginePort(engine string, fallback int) (int, bool) {
 	if err != nil || rpcErr != nil {
 		return fallback, true
 	}
-	return runningEnginePort(result)
+	port, running := runningEnginePort(result)
+	if running {
+		if profile, ok := engineProxyProfileFor(engine); ok {
+			b.engineProxy(profile).backendPort.Store(int32(port))
+		}
+	}
+	return port, running
 }
 
 func runningEnginePort(result json.RawMessage) (int, bool) {

@@ -80,7 +80,10 @@ Defined in [`workload.go`](workload.go):
 | Field | Notes |
 | --- | --- |
 | `id` | Stable workload identifier |
-| `model`, `engine` | What was requested and by which engine |
+| `model`, `engine` | What was requested and by which engine; cloud workloads omit `engine` |
+| `kind` | Optional `local` or `cloud`; legacy events without it are local |
+| `providerId`, `publicModelId` | Cloud workload attribution; no credential reference or URL |
+| `usage`, `costEstimate` | Optional aggregate token counts and known cost estimate; omitted when unknown |
 | `runId` | Producing process's nonce, minted at proxy startup. Part of the dedup key: `id` is a per-facade counter that every engine facade starts at 1 and that resets on restart, so `runId` keeps a reused id from colliding with an older workload |
 | `state` | `queued`, `running`, `completed`, `failed`, or `cancelled` |
 | `originatedFrom` | Node the request entered the cluster on |
@@ -95,6 +98,10 @@ inventing zero values.
 
 Prompts, messages, and response bodies are **not** part of this contract and must
 never be added to it.
+
+Cloud workloads require `kind: "cloud"`, `providerId`, and `publicModelId` and
+must omit `engine` and `scheduledOn`. Local workloads continue to require
+`engine`; the validator accepts legacy local payloads without `kind`.
 
 ## Output to the broker
 

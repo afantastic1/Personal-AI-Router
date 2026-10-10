@@ -46,6 +46,7 @@ func TestEngineHealthProbePaths(t *testing.T) {
 	}{
 		{"ollama", "/"},
 		{"lmstudio", "/v1/models"},
+		{"mnn", "/healthz"},
 		{"llamacpp", "/health"},
 	} {
 		p, ok := engineProxyProfileFor(tc.engine)
@@ -103,6 +104,7 @@ func TestEngineOwnershipAssignments(t *testing.T) {
 	}{
 		{"ollama", adoptedEngine},
 		{"lmstudio", managedEngine},
+		{"mnn", hostedEngine},
 		{"llamacpp", managedEngine},
 	} {
 		p, ok := engineProxyProfileFor(tc.engine)
@@ -161,6 +163,25 @@ func TestOwnershipDecidesTheOccupiedFacadeOutcome(t *testing.T) {
 	}
 }
 
+func TestHostedEnginePortPlanLeavesParentOwnedBackendUntouched(t *testing.T) {
+	p, ok := engineProxyProfileFor("mnn")
+	if !ok {
+		t.Fatal("no profile for mnn")
+	}
+	got := planManagedEnginePorts(p, true, ollamaPortStatus{Running: true, Port: p.EnginePortBase}, func(port int) bool {
+		return port == p.FacadePort
+	})
+	if want := (managedPortPlan{Enabled: true}); got != want {
+		t.Fatalf("hosted plan = %+v, want %+v", got, want)
+	}
+	blocked := planManagedEnginePorts(p, true, ollamaPortStatus{}, func(port int) bool {
+		return port != p.FacadePort
+	})
+	if blocked.Blocked == "" || blocked.BackendPort != 0 {
+		t.Fatalf("occupied hosted facade plan = %+v, want a block without backend movement", blocked)
+	}
+}
+
 // --proxy-engines selects which engines the one binary is started for.
 func TestParseProxyEngines(t *testing.T) {
 	for _, tc := range []struct {
@@ -215,6 +236,20 @@ func TestProxyEnabledHonorsSelectionAndBinary(t *testing.T) {
 	b = &Broker{proxyEngines: []string{"ollama", "lmstudio"}}
 	if b.proxyEnabled(ollamaProxyProfile) {
 		t.Error("no proxy binary resolved, but the engine is enabled")
+	}
+}
+
+func TestMNNProxyCanRouteToRemoteAndroidRuntime(t *testing.T) {
+	b := &Broker{proxyPath: "/path/to/nvpair-proxy", proxyEngines: []string{"mnn"}}
+	mnn, ok := engineProxyProfileFor("mnn")
+	if !ok {
+		t.Fatal("MNN proxy profile is missing")
+	}
+	if !b.proxyEnabled(mnn) {
+		t.Fatal("the MNN proxy facade must run on desktop hosts to route to Android runtimes")
+	}
+	if mnn.SupportsPlatform("windows/amd64") {
+		t.Fatal("MNN runtime support must remain Android-only")
 	}
 }
 

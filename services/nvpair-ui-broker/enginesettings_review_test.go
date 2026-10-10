@@ -24,9 +24,14 @@ func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 		t.Run(profile.Name, func(t *testing.T) {
 			h := newSettingsHarness(t)
 			p := h.b.getProxy()
-			before := make(map[string]int, len(engineProxyProfiles))
+			type facadeStatus struct {
+				ready bool
+				port  int
+			}
+			before := make(map[string]facadeStatus, len(engineProxyProfiles))
 			for _, candidate := range engineProxyProfiles {
-				_, before[candidate.Name] = p.Status(candidate.Name)
+				ready, port := p.Status(candidate.Name)
+				before[candidate.Name] = facadeStatus{ready: ready, port: port}
 			}
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
@@ -37,11 +42,16 @@ func TestSettingsRebindAddressesOnlyRequestedFacade(t *testing.T) {
 			if err := h.b.rebindSettingsProxy(profile.Name, port); err != nil {
 				t.Fatal(err)
 			}
-			before[profile.Name] = port
 			for engine, want := range before {
 				ready, got := p.Status(engine)
-				if !ready || got != want {
-					t.Fatalf("%s ready=%v port=%d, want %d", engine, ready, got, want)
+				if engine == profile.Name {
+					if !ready || got != port {
+						t.Fatalf("requested facade %s ready=%v port=%d, want ready on port %d", engine, ready, got, port)
+					}
+					continue
+				}
+				if ready != want.ready || got != want.port {
+					t.Fatalf("unrequested facade %s changed to ready=%v port=%d, want ready=%v port=%d", engine, ready, got, want.ready, want.port)
 				}
 			}
 		})

@@ -23,7 +23,7 @@ namespace:
 | --- | --- | --- |
 | `nvpair-node-scanner` | Discovery daemon: advertises this host's one `_nvpair-node._tcp` record and browses the LAN | `discovery:*` |
 | `nvpair-node-info` | Local GPU / CPU / memory inventory over HTTP at `/v1/node-info` | — (HTTP only) |
-| `nvpair-proxy` | One process hosting an inference proxy and router facade per enabled engine | `ollama-proxy:*`, `lmstudio-proxy:*`, `llamacpp-proxy:*` |
+| `nvpair-proxy` | One process hosting an inference proxy and router facade per enabled engine | `ollama-proxy:*`, `lmstudio-proxy:*`, `llamacpp-proxy:*`, `mnn-proxy:*` on Android |
 | `nvpair-engine-manager` | Local engine and model control plane; also serves `GET /v1/models` to peers | `engine:*` |
 | `nvpair-cluster-manager` | Node identity, trusted-node store, PIN pairing | `cluster:*`, `nodes:*` |
 | `nvpair-workload-manager` | Cluster workload relay between this node and peers | `workloads:*` |
@@ -74,7 +74,7 @@ Bidirectional newline-delimited JSON-RPC 2.0 — same conventions as every other
 | `--scanner-path <path>` | `./nvpair-node-scanner[.exe]` in the CWD | Explicit path to the `nvpair-node-scanner` binary the broker should spawn |
 | `--node-info-path <path>` | `./nvpair-node-info[.exe]` in the CWD | Explicit path to the `nvpair-node-info` binary the broker should spawn. When omitted and no default sibling exists, the broker runs without the local inventory server (non-fatal); when set to an invalid path, the broker exits with an error |
 | `--proxy-path <path>` | `./nvpair-proxy[.exe]` in the CWD | Explicit path to the `nvpair-proxy` binary. One process fronts every engine: the broker spawns it once and then sends a `facade/enable` per entry in `--proxy-engines`. Same optional semantics as `--node-info-path`: an absent default sibling means no local proxies (non-fatal); an invalid explicit path exits with an error |
-| `--proxy-engines <csv>` | `ollama,lmstudio,llamacpp` | Which engines to front with a proxy. An unrecognized name exits with an error rather than being skipped, so a typo cannot look like it worked. An engine left out is not started **and not prepared** — the broker will not relocate an engine whose facade nothing is going to claim |
+| `--proxy-engines <csv>` | every engine in `nvpair-shared/engines` | Which platform-supported engines to front with a proxy. An unrecognized name exits with an error rather than being skipped, so a typo cannot look like it worked. An engine left out is not started **and not prepared** — the broker will not relocate an engine whose facade nothing is going to claim |
 | `--workload-manager-path <path>` | `./nvpair-workload-manager[.exe]` in the CWD | Explicit path to the `nvpair-workload-manager` binary the broker spawns for the cluster workload relay. Same optional semantics as `--node-info-path`: an absent default sibling means no workload relay (non-fatal); an invalid explicit path exits with an error |
 | `--errors-path <path>` | `./nvpair-errors[.exe]` in the CWD | Explicit path to the `nvpair-errors` binary the broker spawns (with `--peer-sync`) for the service-error pipeline. Same optional semantics as `--node-info-path`: an absent default sibling means the error pipeline is disabled — producers' errors are dropped (non-fatal); an invalid explicit path exits with an error |
 | `--engine-manager-path <path>` | `./nvpair-engine-manager[.exe]` in the CWD | Explicit path to the `nvpair-engine-manager` binary the broker spawns for engine management. Same optional semantics as `--node-info-path` |
@@ -107,7 +107,7 @@ with the scanner daemon:
 
 The daemon folds those registrations into this host's single `_nvpair-node` record, so a peer discovers the engine through the shared channel. The model list is not part of that registration — it's served over HTTP by `nvpair-engine-manager` (the `em` service, `GET /v1/models`) and enriched onto each node by the peer's daemon. There is no separate advertiser subprocess and no manual-advertise RPC.
 
-**`nvpair-proxy`** is one process that fronts every enabled engine. It starts with no engine and no listener; the broker then sends it a `facade/enable` per engine, carrying that engine's port and any alias addresses. A flag could not express this, because the broker plans a different port for each engine. Each facade forwards inference to a node it discovers on the network and speaks its own engine's dialect.
+**`nvpair-proxy`** is one process that fronts every enabled engine and hosts the loopback OpenAI gateway. It starts with no listeners; the broker sends it a `facade/enable` per enabled engine, carrying that engine's port and any alias addresses, then enables the gateway even when no local engine is enabled. A flag could not express the per-engine ports, because the broker plans a different port for each engine. Each facade forwards inference to a node it discovers on the network and speaks its own engine's dialect.
 
 One process for all of them is deliberate. Between scheduler snapshots a facade
 takes short-lived reservations for work it has dispatched, and those live in
@@ -182,6 +182,27 @@ Shared lifecycle for all workers:
 - **Auto-restart with crash surfacing** for every supervised worker (see [Supervision & recovery](#supervision--recovery)): a crash is reported as `supervisor:subprocess-crashed:<name>` and the worker is restarted with backoff, clearing the entry once it's healthy again and leaving it up if the restart budget is exhausted.
 
 ## JSON-RPC Surface
+
+### Cloud provider control
+
+The broker owns the persisted, non-secret cloud provider settings in
+`cloud-providers.json`. These methods are explicit commands; reading the
+settings never returns provider keys:
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `cloudproviders:get` | none | versioned provider config and Gateway settings |
+| `cloudproviders:save` | the same settings object, including `{ "authorizedNodes": [{ "nodeUuid": string, "certFingerprint": string }] }` | `{"saved":true}` after Proxy validation and durable save |
+| `cloudproviders:credential:set` | `{ "authRef": string, "credential": string }` | configured status only; the credential is relayed to Proxy memory and retained only in Electron's encrypted vault for restart recovery |
+| `cloudproviders:test` | `{ "providerId": string }` | `{"connected":true}` after an explicit `GET /v1/models` |
+
+Credential commands and their responses are never logged. Removing a provider
+prunes its credential from the active Proxy configuration; Electron also
+removes its encrypted vault entry. Connection testing never submits chat
+content and is not triggered by saving settings.
+Node authorizations are bound to the paired node's current certificate
+fingerprint. Re-pairing the same UUID with a new certificate does not inherit
+the previous paid-use grant.
 
 ### Notifications (broker → caller)
 
@@ -326,7 +347,7 @@ Field-by-field:
 | `trusted` | bool | whether this node is a paired cluster peer (the daemon holds a pin for its `cluster-uuid`); false for non-cluster/unknown nodes. |
 | `clustered` | bool | whether this node belongs to some cluster (it advertises a `cluster-uuid`), independent of whether we're paired with it (`trusted`). A client uses it to suppress a cluster invite that an already-clustered peer would reject. Omitted (false) for standalone/unknown nodes. |
 | `models` | string[] | the node's available model names, enriched by the daemon from the node's engine-manager `em` endpoint (`GET /v1/models`). Omitted when the node advertises no engine-manager or no engine is running. |
-| `modelsByEngine` | object | the same models attributed to the engine that serves each (keyed by engine name, e.g. `ollama` / `lmstudio`). Additive alongside the flat `models` union. A present engine key with `[]` means its inventory was successfully queried and is empty; a missing key means it was not running/queryable. Omitted when no engine inventory was successfully reported. |
+| `modelsByEngine` | object | the same models attributed to the engine that serves each (keyed by engine name, e.g. `ollama`, `lmstudio`, or `mnn`). Additive alongside the flat `models` union. A present engine key with `[]` means its inventory was successfully queried and is empty; a missing key means it was not running/queryable. Omitted when no engine inventory was successfully reported. |
 | `loadedByEngine` | object | the models currently **loaded in memory** for each engine (normally a subset of `modelsByEngine`), keyed by engine name. Enriched from the peer's `loadedByEngine`. An engine key with an empty list means "running, nothing loaded"; a missing key means loaded state wasn't reported. Omitted when no engine reports loaded state. |
 
 A node that the scanner reports as removed is deleted from the snapshot; `lastSeen` is not preserved for removed nodes. The response is wrapped in `{nodes: [...]}` (rather than a bare array) so we can grow summary fields later without breaking clients. An empty list is a normal early-startup state, not an error.
@@ -616,11 +637,7 @@ Attach to a pre-existing endpoint:
 
 ## What this version intentionally does NOT do (yet)
 
-- **Engine-advertise control surface.** Engine registration is auto-driven only:
-  the broker tracks local Ollama, LM Studio, and llama.cpp and registers `ol`,
-  `lm`, or `lc` with the daemon while each is up. There's no manual-advertise
-  RPC (custom service, port, name, or TXT), and no way to advertise anything
-  other than the detected engines.
+- **Engine-advertise control surface.** Engine registration is auto-driven only: the broker tracks platform-supported engines on their fixed coordinates and registers `ol` / `lm` / `mn` with the daemon while up. There's no manual-advertise RPC (custom service, port, name, or TXT), and no way to advertise anything other than the detected engines.
 - **node-info control surface.** node-info is spawned and torn down with the broker, and the broker pushes it only two things over stdin: the log level, and this node's cluster principal (`nodeinfo:set-cluster-identity`, sent on spawn and on every membership or pin-set change, because node-info holds no cluster dir and so cannot read membership itself). Otherwise it's hands-off: the broker registers its port with the daemon (which enriches over plain HTTP) but doesn't pass through TLS material (`--cert` / `--key` / `--client-ca`) or a custom `--port`, and exposes no RPC to query or reconfigure it. It runs with its own defaults plus those two pushes.
 - **Manual-node persistence across restarts.** `nvpair-manual-nodes` keeps its entries only in memory and the broker holds no authoritative copy, so a manual-nodes crash-and-restart loses the user's manual nodes (the broker evicts the orphaned entries from the snapshot; clients must re-add them).
 - **Per-event push semantics.** `discovery:nodes-changed` always carries the full current snapshot, not a delta. For small N this is fine and lets the client treat the payload as authoritative without state reconciliation. `errors:update` is likewise a full snapshot.

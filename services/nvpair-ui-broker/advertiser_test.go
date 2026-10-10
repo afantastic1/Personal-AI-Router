@@ -78,8 +78,14 @@ func TestHostedMNNAdvertisementRequiresHealthyBackendAndReadyFacade(t *testing.T
 
 func TestPostPortGateAdvertisementProfilesExcludeHostedEngines(t *testing.T) {
 	profiles := engineProxyProfilesExceptOwnership(hostedEngine)
-	if len(profiles) != 2 {
-		t.Fatalf("post-gate profiles count = %d, want 2", len(profiles))
+	wantCount := 0
+	for _, profile := range engineProxyProfiles {
+		if profile.Ownership != hostedEngine {
+			wantCount++
+		}
+	}
+	if len(profiles) != wantCount {
+		t.Fatalf("post-gate profiles count = %d, want %d", len(profiles), wantCount)
 	}
 	for _, profile := range profiles {
 		if profile.Ownership == hostedEngine {

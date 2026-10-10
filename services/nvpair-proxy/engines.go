@@ -162,9 +162,14 @@ var profiles = buildProfiles()
 func buildProfiles() []engineProfile {
 	ollama, _ := engines.ByName("ollama")
 	lmstudio, _ := engines.ByName("lmstudio")
+	mnn, _ := engines.ByName("mnn")
 	llamacpp, _ := engines.ByName("llamacpp")
 	ollamaRoutes := slices.Concat(ollamaBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
 	lmStudioRoutes := slices.Concat(lmStudioBaseRoutes, openAIInferenceRoutes, anthropicInferenceRoutes)
+	mnnRoutes := []route{
+		{Path: "/v1/models", Role: roleModelListOpenAIGET},
+		{Path: "/v1/chat/completions", Role: roleInferencePOST},
+	}
 	llamaCPPRoutes := slices.Concat(llamaCPPBaseRoutes, openAIInferenceRoutes)
 
 	return []engineProfile{
@@ -185,6 +190,13 @@ func buildProfiles() []engineProfile {
 			// proxy that restored it would sit on the engine's own port. The
 			// stored value predates the current default of 1234.
 			ReservedPersistedPort: 1235,
+		},
+		{
+			Engine:                mnn,
+			StandalonePort:        mnn.FacadePort,
+			Routes:                mnnRoutes,
+			ModelNaming:           exactID,
+			ReservedPersistedPort: mnn.EnginePortBase,
 		},
 		{
 			Engine:                llamacpp,

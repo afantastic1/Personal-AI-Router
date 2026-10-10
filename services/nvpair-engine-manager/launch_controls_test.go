@@ -134,7 +134,7 @@ func TestBundledLlamaCPPDisablesCORSByDefault(t *testing.T) {
 func TestBundledNetworkingControls(t *testing.T) {
 	reg := loadWithOverrides(t, t.TempDir())
 	// Adding a bundled engine requires an explicit networking review and cases.
-	wantEngines := []string{"llamacpp", "lmstudio", "ollama"}
+	wantEngines := []string{"llamacpp", "lmstudio", "mnn", "ollama"}
 	names := reg.Names()
 	slices.Sort(names)
 	if !slices.Equal(names, wantEngines) {
@@ -144,6 +144,12 @@ func TestBundledNetworkingControls(t *testing.T) {
 		manifest, _ := reg.Get(name)
 		for platform, config := range manifest.Platforms {
 			t.Run(name+"/"+platform, func(t *testing.T) {
+				if config.Runtime.modeOrDefault() == "hosted" {
+					if config.Runtime.EditableLaunch != nil || config.Runtime.LaunchArgs != nil || config.Runtime.LaunchEnv != nil {
+						t.Fatal("hosted engine must not receive PAIR-managed networking controls")
+					}
+					return
+				}
 				e := settingsExecutor(t, config.Runtime.modeOrDefault() == "command")
 				graftPlatform(t, e, config)
 				policy := config.Runtime.EditableLaunch

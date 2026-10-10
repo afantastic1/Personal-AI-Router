@@ -104,6 +104,16 @@ type Engine struct {
 	// broker reads it when reserving ports away from the OLLAMA_HOST alias,
 	// so the two must agree — which is why it lives here.
 	PortFile string
+
+	// Platform, when set, limits the engine runtime to one Go platform identifier
+	// such as android/arm64. An empty value means the runtime is platform-neutral.
+	Platform string
+
+	// ProxyPlatform, when set, limits the proxy facade to one Go platform.
+	// Runtime and proxy platforms differ for hosted engines such as MNN: the
+	// runtime is Android-only, while a facade on a PC routes to that Android node.
+	// Empty means the facade can run on every platform supported by PAIR.
+	ProxyPlatform string
 }
 
 // ProxyComponent is the proxy *process* identity, as distinct from the
@@ -152,6 +162,15 @@ var all = []Engine{
 		PortFile:         "lmstudio-proxy-port.json",
 	},
 	{
+		Name:             "mnn",
+		DisplayName:      "MNN",
+		DiscoveryService: noderec.ServiceMNN,
+		FacadePort:       14324,
+		EnginePortBase:   14325,
+		PortFile:         "mnn-proxy-port.json",
+		Platform:         "android/arm64",
+	},
+	{
 		Name:             NameLlamaCPP,
 		DisplayName:      "llama.cpp",
 		DiscoveryService: noderec.ServiceLlamaCPP,
@@ -159,6 +178,16 @@ var all = []Engine{
 		EnginePortBase:   8081,
 		PortFile:         "llamacpp-proxy-port.json",
 	},
+}
+
+// SupportsPlatform reports whether the engine runtime can run on platform.
+func (e Engine) SupportsPlatform(platform string) bool {
+	return e.Platform == "" || e.Platform == platform
+}
+
+// SupportsProxyPlatform reports whether the routing facade can run on platform.
+func (e Engine) SupportsProxyPlatform(platform string) bool {
+	return e.ProxyPlatform == "" || e.ProxyPlatform == platform
 }
 
 // All returns the engine set in preparation order. The result is a copy, so a

@@ -147,6 +147,8 @@ type ProxyStatusResult struct {
 // client connection in listen mode so future per-session caches (auth
 // tokens, watched-resource cursors, etc.) don't bleed across clients.
 type Broker struct {
+	cloudCredentialMu sync.RWMutex
+	cloudCredentials  map[string]string
 	// settingsApplyMu serializes engine settings applies end to end, including
 	// the engine stop and restart. engineConfigMu guards only the journal and
 	// is released while an engine restarts, so this is what keeps two applies —
@@ -230,6 +232,7 @@ type Broker struct {
 	serveCtx    context.Context
 	scanner     *scannerProcess
 	nodeInfo    *nodeInfoProcess
+	proxyProc   *proxyProcess
 	workloadMgr *workloadManagerProcess
 	errorsProc  *errorsProcess
 	engineMgr   *rpcWorker
@@ -479,6 +482,18 @@ func (b *Broker) getProxy() *proxyProcess {
 	return b.engineProxyHandle(ollamaProxyProfile)
 }
 
+func (b *Broker) setProxyProcess(proxy *proxyProcess) {
+	b.workersMu.Lock()
+	b.proxyProc = proxy
+	b.workersMu.Unlock()
+}
+
+func (b *Broker) getProxyProcess() *proxyProcess {
+	b.workersMu.Lock()
+	defer b.workersMu.Unlock()
+	return b.proxyProc
+}
+
 func (b *Broker) setWorkloadMgr(m *workloadManagerProcess) {
 	b.workersMu.Lock()
 	b.workloadMgr = m
@@ -542,11 +557,7 @@ func (b *Broker) runEngineAvailabilityAfterPortGates(
 	if !b.restoreEnabledEnginesAfterPortGate(ctx) {
 		return false
 	}
-	for index, run := range runners {
-		if index == len(runners)-1 {
-			run(ctx)
-			break
-		}
+	for _, run := range runners {
 		go run(ctx)
 	}
 	return true
@@ -774,6 +785,9 @@ func (b *Broker) enableEngineFacadeWithPortCheck(
 		return b.enableProxyFacadeWithFallback(ctx, pp, b.ollamaFacadeSpec(alias), b.ollamaFallbackPort)
 	case lmstudioProxyProfile.Name:
 		return b.enableProxyFacadeWithFallback(ctx, pp, b.lmstudioFacadeSpec(), b.lmstudioFallbackPort)
+	case "mnn":
+		spec := enableFacadeRequest{Engine: profile.Name, Port: profile.FacadePort}
+		return b.enableProxyFacade(ctx, pp, spec)
 	default:
 		return b.enableProxyFacadeWithFallback(
 			ctx,
@@ -876,9 +890,9 @@ func (b *Broker) ollamaFallbackPort(failed int) int {
 // simultaneous bursts to the same node believing it idle.
 //
 // A facade that fails to come up is logged and skipped, not fatal. The spawn
-// only fails if no engine came up at all, because a process with no listener
-// serves nobody and should be retried by the supervisor rather than left
-// running.
+// only fails when neither a facade nor the loopback Gateway comes up, because
+// a process with no listener serves nobody and should be retried by the
+// supervisor rather than left running.
 func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	// Both generations are captured before the spawn and advance together: they
 	// are per-incarnation stale-notification filters, and with one process the
@@ -899,6 +913,7 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 	if err != nil {
 		return nil, err
 	}
+	b.setProxyProcess(pp)
 	// Published for every engine before any facade is enabled, so a facade's
 	// own ready notification finds the handle it belongs to.
 	for _, profile := range engineProxyProfiles {
@@ -934,7 +949,28 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 			failed = append(failed, profile)
 		}
 	}
-	if enabled == 0 {
+	params, _ := json.Marshal(map[string]int{"port": 14326})
+	_, gatewayRPCError, gatewayCallError := pp.Call(bringUp, "gateway/enable", params)
+	if gatewayCallError == nil && gatewayRPCError != nil {
+		gatewayCallError = fmt.Errorf("proxy rejected gateway/enable: %s", gatewayRPCError.Message)
+	}
+	if gatewayCallError != nil {
+		slog.Warn("local OpenAI gateway failed to start", "err", gatewayCallError)
+	} else {
+		cloudSettings, settingsErr := loadCloudProvidersSettings()
+		if settingsErr != nil {
+			slog.Warn("stored cloud provider settings are unavailable; gateway remains local-only")
+		} else {
+			configParams, _ := json.Marshal(gatewaySettingsRPCParams(cloudSettings))
+			_, configureRPCError, configureCallError := pp.Call(bringUp, "gateway/configure", configParams)
+			if configureCallError != nil || configureRPCError != nil {
+				slog.Warn("stored cloud provider settings were not applied; gateway remains local-only")
+			} else {
+				b.restoreCloudCredentials(pp)
+			}
+		}
+	}
+	if enabled == 0 && gatewayCallError != nil {
 		// The whole spawn failed, so the supervisor will retry it. Leave every
 		// engine's managed claim and its OLLAMA_HOST alias reservation exactly
 		// as they are: the retry needs them, and releasing the alias here would
@@ -944,6 +980,7 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 		// A first-spawn failure and an exhausted restart budget are the paths
 		// that give up for good, and the supervisor owns both.
 		pp.Stop()
+		b.setProxyProcess(nil)
 		for _, profile := range engineProxyProfiles {
 			b.setEngineProxyHandle(profile, nil)
 		}
@@ -957,10 +994,10 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 		// exists to prevent. A later successful spawn re-derives the real state.
 		b.markOllamaPortReady()
 		b.markLMStudioPortReady()
-		return nil, fmt.Errorf("no engine facade could be brought up in %s", b.proxyPath)
+		return nil, fmt.Errorf("no proxy listener could be brought up in %s", b.proxyPath)
 	}
 
-	// At least one facade is serving, so this process incarnation is staying
+	// At least one listener is serving, so this process incarnation is staying
 	// and will not be retried. Only now is a failed engine terminal for it.
 	for _, profile := range failed {
 		b.setEngineProxyHandle(profile, nil)
@@ -1009,6 +1046,15 @@ func (b *Broker) forwardProxyProcessNotification(
 		}
 		slog.Warn("proxy addressed a notification without a handler",
 			"engine", engine, "method", bare, "known", known)
+		profile, ok := engineProxyProfileFor(engine)
+		if !ok {
+			slog.Warn("proxy addressed a notification to an unknown engine", "engine", engine, "method", bare)
+			return
+		}
+		if b.dispatchErrorsNotif(profile.ComponentName(), bare, params) {
+			return
+		}
+		b.forwardEngineProxyNotification(profile, bare, params)
 	}
 }
 
@@ -2182,7 +2228,7 @@ func (b *Broker) Serve(ctx context.Context) error {
 	// reservations of all facades in one place, which is the point of the
 	// unified proxy; the cost is shared fate, so a crash takes every engine's
 	// facade down and the supervisor brings them all back together.
-	anyProxyEnabled := false
+	anyProxyEnabled := b.proxyPath != ""
 	for _, profile := range engineProxyProfiles {
 		if b.proxyEnabled(profile) {
 			anyProxyEnabled = true
@@ -2226,7 +2272,12 @@ func (b *Broker) Serve(ctx context.Context) error {
 	// startup attempts have established either readiness or a terminal outcome.
 	// This prevents a restored engine from taking a persisted proxy port before
 	// the broker can resolve ownership.
-	availabilityRunners := []func(context.Context){b.runAutoAdvertise, b.runAutoAdvertiseLMStudio}
+	availabilityRunners := []func(context.Context){
+		func(ctx context.Context) { b.runAutoAdvertiseEngine(ctx, ollamaProxyProfile) },
+		b.runAutoAdvertiseLMStudio,
+		b.runHostedEngineAdvertisements,
+		b.runNonHostedEngineAdvertisements,
+	}
 	for _, profile := range engineProxyProfiles {
 		if !b.proxyEnabled(profile) {
 			continue
@@ -2320,6 +2371,7 @@ func (b *Broker) shutdownInferenceStack() {
 	// each facade before releasing the shared transport pool.
 	if b.proxySup != nil {
 		b.proxySup.Stop()
+		b.setProxyProcess(nil)
 		for _, profile := range engineProxyProfiles {
 			b.setEngineProxyHandle(profile, nil)
 		}
@@ -3189,6 +3241,9 @@ func (b *Broker) handleMessage(msg *Message) {
 	}
 
 	switch msg.Method {
+	case "cloudproviders:get", "cloudproviders:save", "cloudproviders:credential:set", "cloudproviders:test":
+		go b.handleCloudProvidersRPC(msg)
+
 	case "engine:get-settings", "engine:preview-settings", "engine:apply-settings":
 		go b.handleEngineSettings(msg)
 	case "ping":
@@ -3331,6 +3386,13 @@ func (b *Broker) handleMessage(msg *Message) {
 		// The prefixes are the engines' ComponentName values, so this loop
 		// gains a new engine for free rather than needing another branch.
 		if profile, ok := engineProxyProfileForMethod(msg.Method); ok {
+			if b.handleEngineProxyLocalMethod(profile, msg) {
+				return
+			}
+			if strings.HasSuffix(msg.Method, ":set-port") && profile.Ownership == hostedEngine {
+				_ = b.codec.RespondError(msg.ID, -32601, "set-port is unsupported for hosted engine facades")
+				return
+			}
 			b.relayToEngineProxy(profile, msg)
 			return
 		}
@@ -3351,6 +3413,52 @@ func (b *Broker) handleMessage(msg *Message) {
 		if err := b.codec.RespondError(msg.ID, -32601, fmt.Sprintf("method not found: %s", msg.Method)); err != nil {
 			log.Printf("failed to send error response: %v", err)
 		}
+	}
+}
+
+func (b *Broker) handleEngineProxyLocalMethod(profile engineProxyProfile, msg *Message) bool {
+	prefix := profile.ComponentName() + ":"
+	if !strings.HasPrefix(msg.Method, prefix) {
+		return false
+	}
+	method := strings.TrimPrefix(msg.Method, prefix)
+	switch method {
+	case "get-status":
+		var result ProxyStatusResult
+		if proxy := b.engineProxyHandle(profile); proxy != nil {
+			result.Ready, result.Port = proxy.Status(profile.Name)
+		}
+		if err := b.codec.Respond(msg.ID, result); err != nil {
+			log.Printf("failed to respond to %s:get-status: %v", profile.ComponentName(), err)
+		}
+		return true
+	case "subscribe":
+		b.proxyMu.Lock()
+		wasSubscribed := b.setEngineProxySubscribed(profile, true)
+		b.proxyMu.Unlock()
+		if err := b.codec.Respond(msg.ID, SubscriptionResult{Subscribed: true}); err != nil {
+			log.Printf("failed to respond to %s:subscribe: %v", profile.ComponentName(), err)
+		}
+		if !wasSubscribed {
+			if proxy := b.engineProxyHandle(profile); proxy != nil {
+				if params := proxy.ReadyParams(profile.Name); params != nil {
+					if err := b.codec.Notify(profile.ComponentName()+":ready", params); err != nil {
+						slog.Warn("emit baseline proxy ready failed", "engine", profile.Name, "err", err)
+					}
+				}
+			}
+		}
+		return true
+	case "unsubscribe":
+		b.proxyMu.Lock()
+		b.setEngineProxySubscribed(profile, false)
+		b.proxyMu.Unlock()
+		if err := b.codec.Respond(msg.ID, SubscriptionResult{Subscribed: false}); err != nil {
+			log.Printf("failed to respond to %s:unsubscribe: %v", profile.ComponentName(), err)
+		}
+		return true
+	default:
+		return false
 	}
 }
 
